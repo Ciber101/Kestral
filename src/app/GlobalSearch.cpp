@@ -176,8 +176,9 @@ std::vector<App::SearchHit> App::globalSearch(const std::string& query) {
         if (sc > 0 && kind == 4) {
             // A setting whose own group matches the words too is the likelier one.
             std::string grp = lower(path.substr(path.rfind('>') == std::string::npos ? 0 : path.rfind('>') + 1));
-            for (auto& w : q) if (grp.find(w) != std::string::npos) sc += 15;
+            for (auto& w : q) if (grp.find(w) != std::string::npos) sc += 8;
         }
+        if (sc > 0 && kind == 0) sc += 10;   // a short word most often means a tool
         if (sc > 0) hits.push_back({kind, std::move(label), std::move(path), std::move(key), a, b, sc});
     };
     // Commands, with the toolbar group they live in.

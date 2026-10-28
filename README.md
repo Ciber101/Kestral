@@ -6,6 +6,16 @@ printer control, and an AI assistant that can do anything you can do in the prog
 Kestral is free and open source (GNU AGPL v3). It is made by one person and is still young: expect
 rough edges, and please report them.
 
+![The assistant working on a humanoid robot design](assets/screenshots/assistant.png)
+
+<table><tr>
+<td><img src="assets/screenshots/slice-plates.png" alt="Slice tab with seven plates of parts"></td>
+<td><img src="assets/screenshots/search.png" alt="Searching every command and setting"></td>
+</tr><tr>
+<td align="center">The Slice tab: plates, filaments and every OrcaSlicer setting</td>
+<td align="center">Search finds any command, setting or preference</td>
+</tr></table>
+
 ## What it does
 * **Design**: sketches with constraints, extrude, revolve, sweep, loft, fillets, chamfers, shells,
   holes, patterns, mirror, booleans, components and joints, a parametric timeline and user

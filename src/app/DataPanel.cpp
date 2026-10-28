@@ -198,7 +198,8 @@ void App::drawDataPanel() {
             if (!dir && toLower(pathToU8(e.path().extension())) != ".kst") return;
             long long mt = 0;
             auto t = e.last_write_time(ec);
-            if (!ec) mt = std::chrono::duration_cast<std::chrono::seconds>(t.time_since_epoch()).count();
+            // File times count from 1601 on Windows: convert to the system clock (1970) before showing a date.
+            if (!ec) mt = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::clock_cast<std::chrono::system_clock>(t).time_since_epoch()).count();
             DataItem it;
             it.name = dir ? name : pathToU8(e.path().stem());
             it.path = pathToU8(e.path());
