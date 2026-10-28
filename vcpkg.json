@@ -1,0 +1,20 @@
+{
+  "name": "kestral",
+  "version-string": "0.4.0",
+  "description": "Kestral CAD: fast parametric CAD",
+  "builtin-baseline": "e456309491fd875487bf02b8a0dca76c1b1b00cc",
+  "dependencies": [
+    "glfw3",
+    "glm",
+    "vulkan",
+    "vulkan-memory-allocator",
+    { "name": "imgui", "features": [ "glfw-binding", "vulkan-binding", "freetype" ] },
+    "opencascade",
+    "openssl",
+    "zlib"
+  ],
+  "overrides": [
+    { "name": "opencascade", "version": "7.9.3" },
+    { "name": "imgui", "version": "1.92.9" }
+  ]
+}

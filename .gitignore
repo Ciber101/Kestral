@@ -1,0 +1,14 @@
+bin/
+build/
+vcpkg/
+vcpkg_installed/
+designs/
+# Personal and local files never go in the repo
+docs/
+*.log
+*.kst
+*.3mf
+*.gcode
+*.tgz
+.vscode/
+tools/KestralExportAll/.vscode/

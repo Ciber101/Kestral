@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Kestral
+GenericName=Parametric CAD
+Comment=Fast parametric 3D CAD
+Exec=Kestral %F
+Icon=kestral
+Terminal=false
+Categories=Graphics;Engineering;3DGraphics;
+MimeType=model/step;model/stl;
+StartupWMClass=kestral

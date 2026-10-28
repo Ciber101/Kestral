@@ -1,0 +1,10 @@
+{
+	"autodeskProduct": "Fusion360",
+	"type": "script",
+	"author": "Kestral",
+	"description": {
+		"": "Exports every Fusion design (all projects, all folders) to STEP for Kestral, with a .f3d backup of each."
+	},
+	"supportedOS": "windows|mac",
+	"editEnabled": true
+}
