@@ -1,6 +1,7 @@
 // The data panel (Fusion's left side "Data Panel"): every design in Kestral Designs, by folder.
 // Double click a design to open it. Opens by itself after a Fusion library import.
 #include "app/App.h"
+#include "ui/UiItems.h"
 #include "app/Thumbnails.h"
 #include "core/Log.h"
 #include "platform/Platform.h"
@@ -159,6 +160,7 @@ namespace {
 bool iconButton(const char* id, ui::Icon icon, float size, bool enabled, const char* tip, bool active = false) {
     ImVec2 p = ImGui::GetCursorScreenPos();
     ImGui::InvisibleButton(id, ImVec2(size, size));
+    if (tip) { std::string t = tip; kst::uiitems::nameLast(t.substr(0, t.find('\n'))); }
     bool hov = ImGui::IsItemHovered();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     if (active) dl->AddRectFilled(p, ImVec2(p.x + size, p.y + size), ui::col::Active, 4.f);
@@ -382,6 +384,7 @@ void App::drawDataPanel() {
         ImVec2 p = ImGui::GetCursorScreenPos();
         float w = ImGui::GetContentRegionAvail().x, rh = 40 * S;
         ImGui::InvisibleButton("##item", ImVec2(w, rh));
+        uiitems::nameLast(it.name);
         bool hov = ImGui::IsItemHovered();
         dl->AddRectFilled(p, ImVec2(p.x + w, p.y + rh), hov ? col::Selected : col::Card, 8 * S);
         drawIcon(dl, ImVec2(p.x + 22 * S, p.y + rh * 0.5f), 22 * S, Icon::Folder, true);
@@ -416,6 +419,7 @@ void App::drawDataPanel() {
         ImTextureData* tex = nullptr;
         if (ImGui::IsRectVisible(p, ImVec2(p.x + cw, p.y + ch))) tex = thumbFor(it.path);
         ImGui::InvisibleButton("##item", ImVec2(cw, ch));
+        uiitems::nameLast(it.name);
         bool hov = ImGui::IsItemHovered();
         bool sel = dataSel_ == it.path;
         bool current = !doc_.path.empty() && doc_.path == it.path;

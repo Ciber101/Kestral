@@ -8,13 +8,12 @@
     "glm",
     "vulkan",
     "vulkan-memory-allocator",
-    { "name": "imgui", "features": [ "glfw-binding", "vulkan-binding", "freetype" ] },
+    "freetype",
     "opencascade",
     "openssl",
     "zlib"
   ],
   "overrides": [
-    { "name": "opencascade", "version": "7.9.3" },
-    { "name": "imgui", "version": "1.92.9" }
+    { "name": "opencascade", "version": "7.9.3" }
   ]
 }

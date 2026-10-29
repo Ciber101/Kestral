@@ -72,6 +72,11 @@ public:
     const PickResult& lastPick() const { return pick_; }
     bool pickInFlight() const;
     void requestResize() { resizeRequested_ = true; }
+    // A picture of the whole window (scene and interface) as the next frame presents it.
+    void requestCapture() { captureReq_ = true; }
+    bool canCapture() const;
+    // True once a requested picture is ready (then it is handed over and cleared). RGBA.
+    bool takeCapture(std::vector<uint8_t>& rgba, int& w, int& h);
 
     struct Stats { uint32_t meshes = 0, instances = 0, drawCalls = 0; uint64_t triangles = 0; } stats;
 
@@ -144,6 +149,10 @@ private:
     PickResult pick_;
     bool resizeRequested_ = false;
     bool imguiReady_ = false;
+    bool captureReq_ = false, captureReady_ = false;
+    std::vector<uint8_t> capture_;
+    int captureW_ = 0, captureH_ = 0;
+    GpuBuffer captureBuf_;
 };
 
 } // namespace kst

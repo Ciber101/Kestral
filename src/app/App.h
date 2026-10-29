@@ -15,6 +15,7 @@
 #include "render/VkContext.h"
 #include "app/SketchState.h"
 #include "app/Thumbnails.h"
+#include "app/Illustration.h"
 #include "sketch/Solver.h"
 #include "ui/Icons.h"
 #include "ui/Theme.h"
@@ -416,6 +417,22 @@ private:
     void flashItem(const std::string& key);
     void flashStart(const std::string& key);
     bool slicePrewarmed_ = false;
+    // ---- Illustration (IllustrationUI.cpp): pictures of the design for instructions and posts
+    struct IllusUi {
+        bool open = false, busy = false, dirty = true, saving = false, selectedOnly = false;
+        illus::Options opt;
+        int size = 0;               // index into the size list
+        ImTextureData* tex = nullptr;
+        int texW = 0, texH = 0, numbered = 0;
+        uint64_t sig = 0;
+        std::string status;
+    } illus_;
+    std::vector<illus::Part> illusParts(bool selectedOnly, const std::vector<std::string>& names) const;
+    illus::Options illusOptions(int w, int h) const;
+    void illusPreview();
+    void illusSave(bool svg);
+    void drawIllustration();
+    std::string illusTest_;   // developer check: save here once the design is built
     bool gsearchTest_ = false, gsearchTestGo_ = false;
     bool aiTestSend_ = false;
     bool aiFollow_ = true;          // the chat keeps the newest message in view (off while you read further up)
@@ -442,6 +459,44 @@ private:
     static bool aiIsPrintTool(const std::string& name);
     std::string aiPrintTool(const std::string& name, const std::string& argsJson, const PostFn& post,
                             const std::shared_ptr<std::atomic<bool>>& cancel);
+    // ---- Shared by the assistant and the MCP server (AssistantShared.cpp). Safe off the main thread.
+    bool designPicture(const std::string& argsJson, const PostFn& post, const std::shared_ptr<std::atomic<bool>>& cancel,
+                       AiImageBuilt& built, std::string& head, std::string& order, std::string& err);
+    // The printer's camera, the newest picture (starts the camera when it is off). Off the main thread.
+    bool cameraPicture(const PostFn& post, const std::shared_ptr<std::atomic<bool>>& cancel, AiImageBuilt& built, std::string& msg);
+    std::string illustrationTool(const std::string& argsJson, const PostFn& post, const std::shared_ptr<std::atomic<bool>>& cancel,
+                                 AiImageBuilt* outImg);
+    // ---- MCP server (McpServer.cpp): other AI apps use the assistant's tools. See app/Mcp.h.
+    struct McpServer;
+    struct McpCall { std::string text; std::vector<std::shared_ptr<const AiImage>> images; bool error = false; };
+    struct McpStatus { bool running = false; int port = 0; std::string error, client, tool; int calls = 0; double idleSecs = -1; };
+    void mcpStart();
+    void mcpStop();
+    void mcpRestart();
+    void mcpShutdown();
+    McpStatus mcpStatus() const;
+    void drawMcpPrefs();
+    void mcpServeConnection(std::shared_ptr<McpServer> srv, intptr_t sock);
+    McpCall mcpRunTool(const std::string& client, const std::string& name, const std::string& args,
+                       const std::shared_ptr<std::atomic<bool>>& cancel);
+    json::Value mcpToolList() const;            // Assistant.cpp: every tool, MCP style
+    static bool mcpKnownTool(const std::string& name);
+    static bool mcpReadOnlyTool(const std::string& name);   // safe for the read-only key
+    void mcpAudit(const std::string& client, const std::string& tool, const std::string& args, const McpCall& r, double ms, bool readOnly);
+    bool hiddenWindow_ = false;   // --hidden: no window on screen (batch jobs, a server)
+    std::shared_ptr<McpServer> mcp_;
+    // MCP's control of the whole window (McpUi.cpp): screenshots, mouse and keyboard, camera and more.
+    json::Value mcpUiToolList() const;
+    static bool mcpIsUiTool(const std::string& name);
+    McpCall mcpRunUiTool(const std::string& client, const std::string& name, const json::Value& args,
+                         const std::shared_ptr<std::atomic<bool>>& cancel);
+    struct McpInput { int kind = 0; float x = 0, y = 0; int button = 0; bool down = false; int key = 0; std::string text; float wheel = 0; double until = 0; int frames = 0; };
+    std::deque<McpInput> mcpInput_;     // main thread: fed to Dear ImGui a frame at a time
+    float mcpCurX_ = -1, mcpCurY_ = -1;  // MCP's mouse, window pixels
+    double mcpCursorT_ = -1e9, mcpHoldUntil_ = -1e9;
+    std::atomic<float> mcpShotScale_{1.f};   // window pixels per pixel of the last screenshot
+    void mcpFeedInput();
+    void mcpDrawCursor();
     struct PrintState {
         std::mutex m;                       // guards setup / last (worker and main thread)
         print::OrcaSetup setup;

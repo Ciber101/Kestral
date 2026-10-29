@@ -1,6 +1,7 @@
 // Start page: what Kestral shows when it opens without a design. New, Open, Recover and the recent
 // designs with their previews, on the dark studio background.
 #include "app/App.h"
+#include "ui/UiItems.h"
 #include "platform/Platform.h"
 #include "ui/Icons.h"
 #include "ui/Theme.h"
@@ -54,6 +55,7 @@ void App::drawStartPage() {
         ImGui::SetCursorScreenPos(ImVec2(L.x, y));
         ImGui::PushID(a.id);
         bool clicked = ImGui::InvisibleButton("##act", ImVec2(colW, 54 * S)) && enabled;
+        uiitems::nameLast(a.label);
         bool hov = ImGui::IsItemHovered() && enabled;
         ImGui::PopID();
         ImVec2 p0(L.x, y), p1(L.x + colW, y + 54 * S);
@@ -73,7 +75,9 @@ void App::drawStartPage() {
         y += 62 * S;
     }
     ImGui::SetCursorScreenPos(ImVec2(L.x, y + 10 * S));
-    if (ImGui::InvisibleButton("##prefs_sp", ImVec2(colW, 22 * S))) settingsOpen_ = true;
+    bool prefsClick = ImGui::InvisibleButton("##prefs_sp", ImVec2(colW, 22 * S));
+    uiitems::nameLast("Preferences");
+    if (prefsClick) settingsOpen_ = true;
     dl->AddText(ImVec2(L.x + 4 * S, y + 12 * S), ImGui::IsItemHovered() ? col::Accent : col::TextDim, "Preferences");
 
     // Right: recent designs as preview cards.
@@ -96,6 +100,7 @@ void App::drawStartPage() {
         ImGui::SetCursorScreenPos(p0);
         ImGui::PushID(i + 100);
         bool clicked = ImGui::InvisibleButton("##recent", ImVec2(cw, ch));
+        uiitems::nameLast(pathToU8(u8path(path).stem()));
         bool hov = ImGui::IsItemHovered();
         ImGui::PopID();
         if (hov) ImGui::SetTooltip("%s", path.c_str());

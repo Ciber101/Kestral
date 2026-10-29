@@ -1,4 +1,6 @@
 #include "app/App.h"
+#include "app/Mcp.h"
+#include "ui/UiItems.h"
 #include "core/Log.h"
 #include "core/SaveLoad.h"
 #include "kernel/Features.h"
@@ -67,6 +69,8 @@ LRESULT CALLBACK kstWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 #endif
 }
 
+const char* kestralVersion() { return kVersion; }
+
 void App::modalFrame() {
     if (inFrame_) return;
     wdBeatMs_.store(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -126,7 +130,10 @@ int App::run(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--model-test") modelTest_ = true;
         if (std::string(argv[i]) == "--ui-test") uiTest_ = true;
-        if (std::string(argv[i]) == "--run-tools" && i + 2 < argc) { toolScript_ = argv[i + 1]; toolScriptOut_ = argv[i + 2]; i += 2; }
+        // --run-tools / --batch <script.jsonl> <out.kst>: run tool calls from a file, save, quit.
+        if ((std::string(argv[i]) == "--run-tools" || std::string(argv[i]) == "--batch") && i + 2 < argc) { toolScript_ = argv[i + 1]; toolScriptOut_ = argv[i + 2]; i += 2; }
+        // --hidden: no window on screen. MCP apps (and --batch) drive it; Kestral otherwise works as usual.
+        if (std::string(argv[i]) == "--hidden") hiddenWindow_ = true;
     }
     std::string err;
     bool ok = false;
@@ -138,7 +145,7 @@ int App::run(int argc, char** argv) {
         return 1;
     }
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--run-tools") { i += 2; continue; }
+        if (std::string(argv[i]) == "--run-tools" || std::string(argv[i]) == "--batch") { i += 2; continue; }
         if (argv[i][0] != '-' || argv[i][1] != '-') importPath(argv[i]);
     }
     // No design on the command line: start on the Start page, like pro CAD apps.
@@ -185,6 +192,18 @@ int App::run(int argc, char** argv) {
             aiLiveStage_ = "Checking the graphics card";
         }
     }
+    // Developer check: KESTRAL_ILLUS_TEST=<file without extension> draws a small assembly and saves its illustration.
+    if (const char* it = std::getenv("KESTRAL_ILLUS_TEST")) {
+        aiRunTool("create_box", R"({"x":0,"y":0,"z":0,"width":60,"depth":40,"height":6,"name":"Base plate"})");
+        aiRunTool("create_box", R"({"x":-25,"y":0,"z":18,"width":6,"depth":40,"height":30,"name":"Upright"})");
+        aiRunTool("create_cylinder", R"({"x":12,"y":0,"z":6,"diameter":16,"height":20,"name":"Post"})");
+        aiRunTool("create_cylinder", R"({"x":12,"y":0,"z":26,"diameter":22,"height":4,"name":"Cap"})");
+        illusTest_ = it;
+        illus_.open = true;
+        illus_.opt.numbers = true;
+        illus_.opt.partsList = true;
+        illus_.opt.explode = 0.5f;
+    }
     // KESTRAL_SLICE_TEST=<printer>|<process>|<filament>: a 30 mm cube sliced from the Slice tab.
     if (const char* st = std::getenv("KESTRAL_SLICE_TEST")) {
         std::string v = st;
@@ -215,7 +234,7 @@ int App::run(int argc, char** argv) {
                 refreshHz = std::clamp(vm ? (double)vm->refreshRate : 60.0, 30.0, 360.0);
             }
             double fps = lively ? refreshHz : 15.0;
-            if (!glfwGetWindowAttrib(window_, GLFW_FOCUSED)) fps = std::min(fps, 15.0);
+            if (!glfwGetWindowAttrib(window_, GLFW_FOCUSED) && mcpInput_.empty()) fps = std::min(fps, 15.0);
             if (glfwGetWindowAttrib(window_, GLFW_ICONIFIED)) fps = 4.0;
             double deadline = lastPresentT_ + 1.0 / fps;
             glfwPollEvents();
@@ -297,7 +316,8 @@ bool App::init(std::string& err) {
     if (!glfwInit()) { err = "Could not initialize the window system"; return false; }
     if (!glfwVulkanSupported()) { err = "Vulkan is not available. Please update your graphics driver."; return false; }
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    glfwWindowHint(GLFW_MAXIMIZED, GLFW_TRUE);
+    glfwWindowHint(GLFW_MAXIMIZED, hiddenWindow_ ? GLFW_FALSE : GLFW_TRUE);
+    if (hiddenWindow_) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
 #ifndef _WIN32
     // Lets the desktop match the window to kestral.desktop (icon and name in the dock).
 #ifdef GLFW_WAYLAND_APP_ID
@@ -306,7 +326,8 @@ bool App::init(std::string& err) {
     glfwWindowHintString(GLFW_X11_CLASS_NAME, "kestral");
     glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "kestral");
 #endif
-    window_ = glfwCreateWindow(1600, 950, "Kestral", nullptr, nullptr);
+    // Hidden: a fixed 1920 x 1080 window, so screenshots are the same every time.
+    window_ = hiddenWindow_ ? glfwCreateWindow(1920, 1080, "Kestral", nullptr, nullptr) : glfwCreateWindow(1600, 950, "Kestral", nullptr, nullptr);
     if (!window_) { err = "Could not create the main window"; return false; }
     glfwSetCursorPosCallback(window_, cbCursor);
     glfwSetMouseButtonCallback(window_, cbButton);
@@ -339,6 +360,7 @@ bool App::init(std::string& err) {
     ui::applyTheme(uiScale_, settings_.darkMode ? settings_.darkness : 0.f);
     fonts_ = ui::loadFonts(uiScale_);
     ImGui_ImplGlfw_InitForVulkan(window_, true);
+    uiitems::install();   // every item by name, for MCP apps
     if (!renderer_.initImGui()) { err = "Could not initialize the UI renderer"; return false; }
 
     cam_.ortho = !settings_.perspective;
@@ -347,6 +369,7 @@ bool App::init(std::string& err) {
     log::info("Ready");
     checkRecovery();
     startWatchdog();
+    if (!modelTest_ && !uiTest_ && toolScript_.empty()) mcpStart();   // other AI apps (MCP)
     return true;
 }
 
@@ -366,6 +389,7 @@ void App::notifyAssistantDone(const std::string& reply) {
 }
 
 void App::shutdown() {
+    mcpShutdown();
     platform::notifyShutdown();
     stopWatchdog();
     // "Restart Kestral" (after a slicer engine update): the new Kestral starts as this one ends,
@@ -501,6 +525,8 @@ void App::frame() {
     double tUi0 = profile ? profNow() : 0;
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplGlfw_NewFrame();
+    mcpFeedInput();   // mouse and keyboard from an MCP app, after the real ones
+    uiitems::beginFrame();
     ImGui::NewFrame();
     if (modelTest_) modelTestStep();
     else if (uiTest_) uiTestStep();
@@ -543,6 +569,7 @@ void App::frame() {
             startSliceJob();
         }
     }
+    mcpDrawCursor();
     ImGui::Render();
     double tUi1 = profile ? profNow() : 0;
 
@@ -910,6 +937,9 @@ void App::registerTools() {
     // 3D PRINT
     int slicer = add("send_to_slicer", "Send to Slicer", "Ctrl+P", Icon::Slicer, 0, [this] { sendToSlicer(); },
                      "Export selected (or all visible) bodies and open them in your slicer");
+    int illusT = add("illustration", "Illustration", "", Icon::Illustration, 0, [this] { illus_.open = true; },
+                     "A clean picture of the design for instructions, posts or the README: isometric or any view, shaded, "
+                     "flat tones or line art, exploded, with numbered parts. Saves PNG or SVG.");
     int stl = add("export_stl", "Export STL", "", Icon::ExportStl, 0, [this] { exportStlDialog(); }, "Save visible or selected bodies as STL");
     int slicerSetup = add("slicer_setup", "Choose Slicer...", "", Icon::Gear, 0, [this] { settingsOpen_ = true; }, "Pick which slicer Send to Slicer opens");
     // Sketch tools
@@ -1044,6 +1074,7 @@ void App::registerTools() {
     };
     utilGroups_ = {
         {"MAKE", {findTool("slice_workspace"), slicer, stl, slicerSetup}, 2},
+        {"SHARE", {illusT}, 1},
         {"SETTINGS", {findTool("settings"), findTool("keyboard_shortcuts")}, 2},
         {"AI", {findTool("assistant")}, 1},
     };

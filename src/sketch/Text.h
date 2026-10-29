@@ -13,6 +13,10 @@ std::vector<uint32_t> addSketchText(Sketch& s, const std::string& text, Vec2 ori
 
 // Rewrites a stored text. The old outlines are replaced. Returns false if the id is missing or the
 // font produced nothing.
+// The outlines of text in a font (closed loops, baseline at y = 0, x from 0), or empty when the
+// font gives nothing. Used to write labels into pictures.
+std::vector<std::vector<Vec2>> textOutlines(const std::string& font, const std::string& text, double height);
+
 bool editSketchText(Sketch& s, uint32_t noteId, const std::string& text, double height, const std::string& font);
 
 }

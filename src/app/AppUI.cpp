@@ -1,6 +1,7 @@
 // Fusion style layout: app bar, toolbar with tabs and groups, floating browser on the left,
 // view cube top right, navigation bar bottom center, timeline along the bottom.
 #include "app/App.h"
+#include "ui/UiItems.h"
 #include "app/Materials.h"
 #include "core/Log.h"
 #include "core/SaveLoad.h"
@@ -31,6 +32,7 @@ constexpr ImGuiWindowFlags kPanel = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFla
 bool iconButton(const char* id, Icon icon, float size, bool enabled, const char* tip, bool active = false) {
     ImVec2 p = ImGui::GetCursorScreenPos();
     ImGui::InvisibleButton(id, ImVec2(size, size));
+    if (tip) { std::string t = tip; kst::uiitems::nameLast(t.substr(0, t.find('\n'))); }
     bool hov = ImGui::IsItemHovered();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     if (active) dl->AddRectFilled(p, ImVec2(p.x + size, p.y + size), col::Active, 4.f);
@@ -116,6 +118,7 @@ void App::drawUI() {
     drawKeysDialog();
     drawFusionMove();
     drawRobotWindow();
+    drawIllustration();
     drawAssistant();
     drawAppearance();
     drawSketchPalette();
@@ -201,6 +204,7 @@ void App::drawAppBar() {
         if (ImGui::MenuItem("Export STL...")) exportStlDialog();
         if (ImGui::MenuItem("Export STEP...")) exportStepDialog();
         if (ImGui::MenuItem("Export 3MF...")) export3mfDialog();
+        if (ImGui::MenuItem("Export Illustration (PNG / SVG)...")) illus_.open = true;
         if (ImGui::MenuItem("Export Robot (URDF / USD)...")) robotOpen_ = true;
         if (ImGui::MenuItem("Send to Slicer", "Ctrl+P")) sendToSlicer();
         if (ImGui::MenuItem("Slice in OrcaSlicer (inside Kestral)")) enterSliceWorkspace();
@@ -250,6 +254,7 @@ void App::drawAppBar() {
             ImGui::PushID(i + 9000);
             ImGui::SetCursorScreenPos(s0);
             bool clicked = ImGui::InvisibleButton("##designtab", ImVec2(widths[(size_t)i] - (startOpen_ ? 0 : 22 * S), h - 4 * S));
+            uiitems::nameLast(startOpen_ ? std::string("Home") : (act ? doc_.name : designTabs_[(size_t)i].doc.name));
             bool dh = ImGui::IsItemHovered();
             if (dh && act && !sliceWs_ && !doc_.path.empty()) ImGui::SetTooltip("Versions of this design");
             else if (dh && !act) ImGui::SetTooltip("%s", designTabs_[(size_t)i].doc.path.empty() ? titles[(size_t)i].c_str() : designTabs_[(size_t)i].doc.path.c_str());
@@ -257,6 +262,7 @@ void App::drawAppBar() {
             if (!startOpen_) {
                 ImGui::SetCursorScreenPos(ImVec2(s1.x - 22 * S, s0.y));
                 if (ImGui::InvisibleButton("##designx", ImVec2(20 * S, h - 4 * S))) closeD = i;
+                uiitems::nameLast("Close tab");
                 xh = ImGui::IsItemHovered();
                 if (xh) ImGui::SetTooltip("Close this design (unsaved work goes to the autosave)");
             }
@@ -287,6 +293,7 @@ void App::drawAppBar() {
             ImVec2 p0(x, t0.y), p1(x + 26 * S, t1.y);
             ImGui::SetCursorScreenPos(p0);
             if (ImGui::InvisibleButton("##newdesigntab", ImVec2(26 * S, h - 4 * S))) { if (sliceWs_) leaveSliceWorkspace(); newDesignTab(); }
+            uiitems::nameLast("New design tab");
             bool ph = ImGui::IsItemHovered();
             if (ph) ImGui::SetTooltip("New design (its own tab)");
             if (ph) dl->AddRectFilled(p0, p1, col::Hover, 5 * S, ImDrawFlags_RoundCornersTop);
@@ -354,6 +361,7 @@ void App::drawAppBar() {
             ImGui::PushID(i + 7000);
             ImGui::SetCursorScreenPos(s0);
             bool clicked = ImGui::InvisibleButton("##slicetab", ImVec2(sw - (isNew ? 0 : 20 * S), h - 4 * S));
+            uiitems::nameLast(isNew ? std::string("Slice") : "Slice: " + sliceDocs_[(size_t)i].name);
             bool sh = ImGui::IsItemHovered();
             // Drag a slice tab onto another: its parts join that tab's plate.
             if (!isNew && ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 8 * S)) sliceTabDrag_ = i;
@@ -441,6 +449,7 @@ void App::drawAppBar() {
         }
         ImGui::SetCursorScreenPos(ImVec2(x - 22 * S, y));
         ImGui::InvisibleButton("##darkmode", ImVec2(sw + 22 * S, sh));
+        uiitems::nameLast("Dark mode");
         bool hov = ImGui::IsItemHovered();
         if (hov) ImGui::SetTooltip(settings_.darkMode ? "Dark mode on. Click for light mode." : "Dark mode");
         if (ImGui::IsItemClicked()) {
@@ -490,6 +499,7 @@ bool App::toolButton(int ti, float size, bool) {
     if (!t.available()) tip += "\nComing in milestone M" + std::to_string(t.milestone);
     ImVec2 p = ImGui::GetCursorScreenPos();
     ImGui::InvisibleButton(id.c_str(), ImVec2(size, size));
+    uiitems::nameLast(t.label);
     bool hov = ImGui::IsItemHovered();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     bool active = sk_.active && !sk_.tool.empty() && (sk_.tool == t.id || (t.id == "sk_point" && sk_.tool == "point"));
@@ -541,6 +551,7 @@ void App::drawToolbar() {
     ImVec2 ws0(wp.x + 8 * S, wp.y + 8 * S), ws1(ws0.x + wsW, wp.y + h - 8 * S);
     ImGui::SetCursorScreenPos(ws0);
     ImGui::InvisibleButton("##workspace", ImVec2(wsW, ws1.y - ws0.y));
+    uiitems::nameLast("Workspace");
     bool wsHov = ImGui::IsItemHovered();
     dl->AddRectFilled(ws0, ws1, wsHov ? col::Selected : col::Chip, 6 * S);
     dl->AddRect(ws0, ws1, wsHov ? col::Accent : col::PanelBorder, 6 * S, 0, 1.f);
@@ -571,6 +582,7 @@ void App::drawToolbar() {
             ImVec2 p = ImGui::GetCursorScreenPos();
             float rw = ImGui::GetContentRegionAvail().x, rh = 52 * S;
             bool clicked = ImGui::InvisibleButton("##ws", ImVec2(rw, rh));
+            uiitems::nameLast(w.title);
             bool hov = ImGui::IsItemHovered() && w.state != 2;
             if (w.state == 0) pdl->AddRectFilled(p, ImVec2(p.x + rw, p.y + rh), col::Selected, 6 * S);
             else if (hov) pdl->AddRectFilled(p, ImVec2(p.x + rw, p.y + rh), col::Hover, 6 * S);
@@ -655,6 +667,7 @@ void App::drawToolbar() {
         ImGui::SetCursorScreenPos(ImVec2(gx + 2 * S, l0.y - 1 * S));
         std::string gid = "##grp" + std::to_string(inSk ? 9 : activeTab_) + "_" + std::to_string(gi);
         ImGui::InvisibleButton(gid.c_str(), ImVec2(gw - 4 * S, lsz.y + 3 * S));
+        uiitems::nameLast(glabel);
         bool lh = ImGui::IsItemHovered();
         if (lh) dl->AddRectFilled(ImVec2(gx + 2 * S, l0.y - 1 * S), ImVec2(gx + gw - 2 * S, l0.y + lsz.y + 2 * S), col::Hover, 3 * S);
         ImU32 lc = g.name == "3D PRINT" ? col::Print : (lh ? col::Text : col::TextDim);
@@ -880,6 +893,7 @@ void App::drawBrowser() {
             ImVec2 p = ImGui::GetCursorScreenPos();
             float w = ImGui::GetContentRegionAvail().x;
             ImGui::InvisibleButton("##row", ImVec2(w, rowH), ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
+            uiitems::nameLast(r.label);
             bool hov = ImGui::IsItemHovered();
             ImVec2 m = ImGui::GetIO().MousePos;
 
@@ -1335,6 +1349,7 @@ void App::drawTimeline() {
         ImGui::SetCursorScreenPos(p);
         ImGui::PushID(i);
         ImGui::InvisibleButton("##feat", ImVec2(cell, cell), ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
+        uiitems::nameLast("Timeline: " + f.name);
         bool hov = ImGui::IsItemHovered();
         bool active = i < doc_.markerPos && !f.suppressed;
         if (hov) { timelineHover_ = i; dl->AddRectFilled(p, ImVec2(p.x + cell, p.y + cell), col::Hover, 3 * S); }
@@ -1666,6 +1681,11 @@ void App::drawStatus() {
     std::snprintf(buf, sizeof buf, "   |   %.2fM tris", mt);
     s += buf;
     if (settings_.showFps) { std::snprintf(buf, sizeof buf, "   |   %.0f fps", fps_); s += buf; }
+    {
+        McpStatus ms = mcpStatus();
+        if (!ms.tool.empty()) s += "   |   " + ms.client + ": " + ms.tool;
+        else if (ms.idleSecs >= 0 && ms.idleSecs < 20) s += "   |   MCP: " + ms.client;
+    }
     if (doc_.section.on) {
         const char* plane = doc_.section.axis == 0 ? "YZ" : doc_.section.axis == 1 ? "XZ" : "XY";
         std::snprintf(buf, sizeof buf, "   |   Section %s %g%s", plane, doc_.section.offset, doc_.section.flip ? " flipped" : "");

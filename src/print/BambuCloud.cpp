@@ -37,82 +37,87 @@ using json::Value;
 namespace {
 
 // ===================================================================== the plugin's interface
-// Copied from OrcaSlicer (src/slic3r/Utils/bambu_networking.hpp, AGPL-3.0). The plugin is C++ and
-// takes these by value, so the layout must stay exactly like this.
+// Bambu's network plugin (bambu_networking.dll / libbambu_networking.so, installed by OrcaSlicer)
+// is a C++ library loaded at run time. Kestral calls a few of its exported functions. Their
+// arguments are passed by value, so the two job records below must match the plugin's binary
+// layout member for member: same types in the same order. The names here are Kestral's own.
 
-typedef std::function<void(std::string topic_str)> OnPrinterConnectedFn;
-typedef std::function<void(int return_code, int reason_code)> OnServerConnectedFn;
-typedef std::function<void(std::string dev_id, std::string msg)> OnMessageFn;
-typedef std::function<void(unsigned http_code, std::string http_body)> OnHttpErrorFn;
-typedef std::function<std::string()> GetCountryCodeFn;
-typedef std::function<void(int status, int code, std::string msg)> OnUpdateStatusFn;
-typedef std::function<bool()> WasCancelledFn;
-typedef std::function<bool(int status, std::string job_info)> OnWaitFn;
-typedef std::function<void(std::function<void()>)> QueueOnMainFn;
+// Callbacks Kestral hands to the plugin.
+using CbPrinterUp = std::function<void(std::string topic)>;
+using CbServerUp = std::function<void(int result, int reason)>;
+using CbMessage = std::function<void(std::string printerId, std::string json)>;
+using CbHttpError = std::function<void(unsigned status, std::string body)>;
+using CbCountry = std::function<std::string()>;
+using CbProgress = std::function<void(int stage, int code, std::string info)>;
+using CbCancelled = std::function<bool()>;
+using CbWait = std::function<bool(int stage, std::string info)>;
+using CbOnMain = std::function<void(std::function<void()>)>;
+using CbLocalUp = std::function<void(int status, std::string printerId, std::string info)>;
 
-struct PrintParams_Legacy {
-    std::string dev_id, task_name, project_name, preset_name, filename, config_filename;
-    int plate_index;
-    std::string ftp_folder, ftp_file, ftp_file_md5, ams_mapping, ams_mapping_info, connection_type, comments;
-    int origin_profile_id = 0;
-    int stl_design_id = 0;
-    std::string origin_model_id, print_type, dst_file, dev_name;
-    std::string dev_ip;
-    bool use_ssl_for_ftp;
-    bool use_ssl_for_mqtt;
-    std::string username, password;
-    bool task_bed_leveling, task_flow_cali, task_vibration_cali, task_layer_inspect, task_record_timelapse, task_use_ams;
-    std::string task_bed_type, extra_options;
+// A print job, as plugins from before the H2D (two nozzle) printers take it.
+struct JobV1 {
+    std::string printerId, taskName, projectName, presetName, file, configFile;
+    int plate;
+    std::string ftpFolder, ftpFile, ftpFileMd5, amsMap, amsMapInfo, connection, notes;
+    int profileId = 0;
+    int designId = 0;
+    std::string modelId, printType, destFile, printerName;
+    std::string printerIp;
+    bool ftpTls;
+    bool mqttTls;
+    std::string user, accessCode;
+    bool bedLevel, flowCal, vibrationCal, layerCheck, timelapse, useAms;
+    std::string bedType, extra;
 };
 
-struct PrintParams {
-    std::string dev_id, task_name, project_name, preset_name, filename, config_filename;
-    int plate_index;
-    std::string ftp_folder, ftp_file, ftp_file_md5, nozzle_mapping, ams_mapping, ams_mapping2, ams_mapping_info, nozzles_info,
-        connection_type, comments;
-    int origin_profile_id = 0;
-    int stl_design_id = 0;
-    std::string origin_model_id, print_type, dst_file, dev_name;
-    std::string dev_ip;
-    bool use_ssl_for_ftp;
-    bool use_ssl_for_mqtt;
-    std::string username, password;
-    bool task_bed_leveling, task_flow_cali, task_vibration_cali, task_layer_inspect, task_record_timelapse, task_use_ams;
-    std::string task_bed_type, extra_options;
-    int auto_bed_leveling{0};
-    int auto_flow_cali{0};
-    int auto_offset_cali{0};
-    bool task_ext_change_assist;
-    bool try_emmc_print;
+// The same job for newer plugins: nozzle and second AMS maps, and the automatic calibration flags.
+struct JobV2 {
+    std::string printerId, taskName, projectName, presetName, file, configFile;
+    int plate;
+    std::string ftpFolder, ftpFile, ftpFileMd5, nozzleMap, amsMap, amsMap2, amsMapInfo, nozzleInfo, connection, notes;
+    int profileId = 0;
+    int designId = 0;
+    std::string modelId, printType, destFile, printerName;
+    std::string printerIp;
+    bool ftpTls;
+    bool mqttTls;
+    std::string user, accessCode;
+    bool bedLevel, flowCal, vibrationCal, layerCheck, timelapse, useAms;
+    std::string bedType, extra;
+    int autoBedLevel{0};
+    int autoFlowCal{0};
+    int autoOffsetCal{0};
+    bool extChangeAssist;
+    bool emmcPrint;
 };
 
-typedef bool (*fn_check_debug_consistent)(bool);
-typedef std::string (*fn_get_version)();
-typedef void* (*fn_create_agent)(std::string);
-typedef int (*fn_destroy_agent)(void*);
-typedef int (*fn_agent)(void*);
-typedef int (*fn_agent_str)(void*, std::string);
-typedef int (*fn_set_cert_file)(void*, std::string, std::string);
-typedef int (*fn_set_server_connected)(void*, OnServerConnectedFn);
-typedef int (*fn_set_message)(void*, OnMessageFn);
-typedef int (*fn_set_http_error)(void*, OnHttpErrorFn);
-typedef int (*fn_set_country_fn)(void*, GetCountryCodeFn);
-typedef int (*fn_set_printer_connected)(void*, OnPrinterConnectedFn);
-typedef int (*fn_set_queue)(void*, QueueOnMainFn);
-typedef bool (*fn_bool_agent)(void*);
-typedef std::string (*fn_str_agent)(void*);
-typedef int (*fn_track_enable)(void*, bool);
-typedef int (*fn_set_headers)(void*, std::map<std::string, std::string>);
-typedef int (*fn_user_print_info)(void*, unsigned int*, std::string*);
-typedef int (*fn_start_print)(void*, PrintParams, OnUpdateStatusFn, WasCancelledFn, OnWaitFn);
-typedef int (*fn_start_print_legacy)(void*, PrintParams_Legacy, OnUpdateStatusFn, WasCancelledFn, OnWaitFn);
-typedef std::function<void(int status, std::string dev_id, std::string msg)> OnLocalConnectedFn;
-typedef int (*fn_send_msg)(void*, std::string, std::string, int, int);
-typedef int (*fn_send_msg_legacy)(void*, std::string, std::string, int);
-typedef int (*fn_set_local_connect)(void*, OnLocalConnectedFn);
-typedef int (*fn_connect_printer)(void*, std::string, std::string, std::string, std::string, bool);
-typedef int (*fn_start_local_print)(void*, PrintParams, OnUpdateStatusFn, WasCancelledFn);
-typedef int (*fn_start_local_print_legacy)(void*, PrintParams_Legacy, OnUpdateStatusFn, WasCancelledFn);
+// The exported functions Kestral looks up, by the shape of their arguments.
+using PlugDebugCheck = bool (*)(bool);
+using PlugVersion = std::string (*)();
+using PlugNewAgent = void* (*)(std::string);
+using PlugFreeAgent = int (*)(void*);
+using PlugCall = int (*)(void*);
+using PlugCallStr = int (*)(void*, std::string);
+using PlugCert = int (*)(void*, std::string, std::string);
+using PlugOnServer = int (*)(void*, CbServerUp);
+using PlugOnMessage = int (*)(void*, CbMessage);
+using PlugOnHttpError = int (*)(void*, CbHttpError);
+using PlugCountry = int (*)(void*, CbCountry);
+using PlugOnPrinter = int (*)(void*, CbPrinterUp);
+using PlugOnMain = int (*)(void*, CbOnMain);
+using PlugAsk = bool (*)(void*);
+using PlugText = std::string (*)(void*);
+using PlugTracking = int (*)(void*, bool);
+using PlugHeaders = int (*)(void*, std::map<std::string, std::string>);
+using PlugUserPrints = int (*)(void*, unsigned int*, std::string*);
+using PlugPrint = int (*)(void*, JobV2, CbProgress, CbCancelled, CbWait);
+using PlugPrintV1 = int (*)(void*, JobV1, CbProgress, CbCancelled, CbWait);
+using PlugSend = int (*)(void*, std::string, std::string, int, int);
+using PlugSendV1 = int (*)(void*, std::string, std::string, int);
+using PlugOnLocal = int (*)(void*, CbLocalUp);
+using PlugConnect = int (*)(void*, std::string, std::string, std::string, std::string, bool);
+using PlugLocalPrint = int (*)(void*, JobV2, CbProgress, CbCancelled);
+using PlugLocalPrintV1 = int (*)(void*, JobV1, CbProgress, CbCancelled);
 
 // ===================================================================== helpers
 
@@ -394,14 +399,14 @@ int runBambuAgent(int argc, char** argv) {
     Plugin p;
     std::string err;
     if (!loadPlugin(p, lib, err)) return fail(err);
-    if (auto check = p.fn<fn_check_debug_consistent>("bambu_network_check_debug_consistent"); check && !check(false))
+    if (auto check = p.fn<PlugDebugCheck>("bambu_network_check_debug_consistent"); check && !check(false))
         note("the plugin says this is not a matching release build");
     std::string loaded = version;
-    if (auto gv = p.fn<fn_get_version>("bambu_network_get_version")) loaded = gv();
+    if (auto gv = p.fn<PlugVersion>("bambu_network_get_version")) loaded = gv();
     out.set("plugin_version", Value(loaded));
     bool legacy = loaded.rfind("01.", 0) == 0;
 
-    auto create = p.fn<fn_create_agent>("bambu_network_create_agent");
+    auto create = p.fn<PlugNewAgent>("bambu_network_create_agent");
     if (!create) return fail("This Bambu plugin is not one Kestral knows");
     std::string dataDir = orcaDataDir();
     void* agent = create(dataDir);
@@ -410,40 +415,40 @@ int runBambuAgent(int argc, char** argv) {
     MainQueue mq;
     std::atomic<bool> serverUp{false};
     std::string cc = countryCode();
-    if (auto f = p.fn<fn_agent_str>("bambu_network_set_config_dir")) f(agent, dataDir);
-    if (auto f = p.fn<fn_agent>("bambu_network_init_log")) f(agent);
+    if (auto f = p.fn<PlugCallStr>("bambu_network_set_config_dir")) f(agent, dataDir);
+    if (auto f = p.fn<PlugCall>("bambu_network_init_log")) f(agent);
     std::string cert = certDir();
     if (cert.empty()) note("certificate folder not found (resources/cert)");
-    else if (auto f = p.fn<fn_set_cert_file>("bambu_network_set_cert_file")) f(agent, cert, "slicer_base64.cer");
-    if (auto f = p.fn<fn_agent_str>("bambu_network_set_country_code")) f(agent, cc);
-    if (auto f = p.fn<fn_set_server_connected>("bambu_network_set_on_server_connected_fn"))
+    else if (auto f = p.fn<PlugCert>("bambu_network_set_cert_file")) f(agent, cert, "slicer_base64.cer");
+    if (auto f = p.fn<PlugCallStr>("bambu_network_set_country_code")) f(agent, cc);
+    if (auto f = p.fn<PlugOnServer>("bambu_network_set_on_server_connected_fn"))
         f(agent, [&](int rc, int reason) {
             if (rc == 0) serverUp = true;
             mq.push([&, rc, reason] { note("server connection: " + std::to_string(rc) + " reason " + std::to_string(reason)); });
         });
-    if (auto f = p.fn<fn_set_http_error>("bambu_network_set_on_http_error_fn"))
+    if (auto f = p.fn<PlugOnHttpError>("bambu_network_set_on_http_error_fn"))
         f(agent, [&](unsigned code, std::string body) {
             std::string b = body.substr(0, 200);
             mq.push([&, code, b] { note("http error " + std::to_string(code) + ": " + b); });
         });
-    if (auto f = p.fn<fn_set_country_fn>("bambu_network_set_get_country_code_fn")) f(agent, [cc] { return cc; });
-    if (auto f = p.fn<fn_set_queue>("bambu_network_set_queue_on_main_fn")) f(agent, [&](std::function<void()> fn) { mq.push(std::move(fn)); });
+    if (auto f = p.fn<PlugCountry>("bambu_network_set_get_country_code_fn")) f(agent, [cc] { return cc; });
+    if (auto f = p.fn<PlugOnMain>("bambu_network_set_queue_on_main_fn")) f(agent, [&](std::function<void()> fn) { mq.push(std::move(fn)); });
     std::mutex msgM;
     std::map<std::string, std::string> lastMsg;   // printer -> its last report
-    if (auto f = p.fn<fn_set_message>("bambu_network_set_on_message_fn"))
+    if (auto f = p.fn<PlugOnMessage>("bambu_network_set_on_message_fn"))
         f(agent, [&](std::string dev, std::string msg) { std::lock_guard lk(msgM); lastMsg[dev] = msg; });
-    if (auto f = p.fn<fn_set_printer_connected>("bambu_network_set_on_printer_connected_fn")) f(agent, [](std::string) {});
+    if (auto f = p.fn<PlugOnPrinter>("bambu_network_set_on_printer_connected_fn")) f(agent, [](std::string) {});
     std::atomic<int> localState{-1};
     std::string localMsg;
     std::mutex localM;
-    if (auto f = p.fn<fn_set_local_connect>("bambu_network_set_on_local_connect_fn"))
+    if (auto f = p.fn<PlugOnLocal>("bambu_network_set_on_local_connect_fn"))
         f(agent, [&](int st, std::string, std::string msg) {
             { std::lock_guard lk(localM); localMsg = msg; }
             localState = st;
         });
     // No usage tracking (OrcaSlicer turns it off the same way).
-    if (auto f = p.fn<fn_track_enable>("bambu_network_track_enable")) f(agent, false);
-    if (auto f = p.fn<fn_agent>("bambu_network_track_remove_files")) f(agent);
+    if (auto f = p.fn<PlugTracking>("bambu_network_track_enable")) f(agent, false);
+    if (auto f = p.fn<PlugCall>("bambu_network_track_remove_files")) f(agent);
     {
         std::map<std::string, std::string> h;
         h["X-BBL-Client-Type"] = "slicer";
@@ -456,13 +461,13 @@ int runBambuAgent(int argc, char** argv) {
 #endif
         h["X-BBL-Device-ID"] = orcaConfString("slicer_uuid");
         h["X-BBL-Language"] = "en";
-        if (auto f = p.fn<fn_set_headers>("bambu_network_set_extra_http_header")) f(agent, h);
+        if (auto f = p.fn<PlugHeaders>("bambu_network_set_extra_http_header")) f(agent, h);
     }
-    if (auto f = p.fn<fn_agent>("bambu_network_start")) f(agent);
-    if (auto f = p.fn<fn_agent>("bambu_network_connect_server")) f(agent);
-    auto isUp = p.fn<fn_bool_agent>("bambu_network_is_server_connected");
+    if (auto f = p.fn<PlugCall>("bambu_network_start")) f(agent);
+    if (auto f = p.fn<PlugCall>("bambu_network_connect_server")) f(agent);
+    auto isUp = p.fn<PlugAsk>("bambu_network_is_server_connected");
     auto t0 = std::chrono::steady_clock::now();
-    auto isLogin = p.fn<fn_bool_agent>("bambu_network_is_user_login");
+    auto isLogin = p.fn<PlugAsk>("bambu_network_is_user_login");
     // The login comes back from the plugin's saved session right after start; the live connection to
     // Bambu's message server can take longer and is not needed to send a print (that goes over https).
     while (std::chrono::steady_clock::now() - t0 < std::chrono::seconds(cmd == "status" ? 25 : 12)) {
@@ -477,13 +482,13 @@ int runBambuAgent(int argc, char** argv) {
          ", message server: " + (connected ? "connected" : "not connected") + ", region " + cc + (cert.empty() ? ", no certificate" : ""));
     out.set("connected", Value(connected));
     out.set("logged_in", Value(login));
-    if (auto f = p.fn<fn_str_agent>("bambu_network_get_user_name"); f && login) out.set("user", Value(f(agent)));
+    if (auto f = p.fn<PlugText>("bambu_network_get_user_name"); f && login) out.set("user", Value(f(agent)));
 
     // Printers bound to the account (never their access codes).
     Value devices = Value::array();
     std::string modelOf;
     if (login) {
-        if (auto f = p.fn<fn_user_print_info>("bambu_network_get_user_print_info")) {
+        if (auto f = p.fn<PlugUserPrints>("bambu_network_get_user_print_info")) {
             unsigned code = 0;
             std::string body;
             f(agent, &code, &body);
@@ -509,7 +514,7 @@ int runBambuAgent(int argc, char** argv) {
             out.set("error", Value(std::string("Not signed in to a Bambu account. That is fine: like OrcaSlicer, Kestral then sends straight to the "
                                                "printer over the home network with its IP and access code (Preferences > Printer).")));
         out.set("ok", Value(true));
-        if (auto f = p.fn<fn_destroy_agent>("bambu_network_destroy_agent")) f(agent);
+        if (auto f = p.fn<PlugFreeAgent>("bambu_network_destroy_agent")) f(agent);
         return finish();
     }
 
@@ -535,7 +540,7 @@ int runBambuAgent(int argc, char** argv) {
             modelOf = conf["local_machines"][devId]["printer_type"].asString();
         }
         if (lan) {
-            auto conn = p.fn<fn_connect_printer>("bambu_network_connect_printer");
+            auto conn = p.fn<PlugConnect>("bambu_network_connect_printer");
             if (!conn) return fail("This Bambu plugin cannot connect to printers directly");
             conn(agent, devId, ip, "bblp", code, true);
             auto c0 = std::chrono::steady_clock::now();
@@ -585,41 +590,41 @@ int runBambuAgent(int argc, char** argv) {
         std::thread worker([&] {
             try {
                 if (legacy) {
-                    auto f = p.fn<fn_start_print_legacy>("bambu_network_start_print");
+                    auto f = p.fn<PlugPrintV1>("bambu_network_start_print");
                     if (!f) { result = -1; done = true; return; }
-                    PrintParams_Legacy pp{};
-                    pp.dev_id = devId; pp.task_name = name; pp.project_name = name; pp.preset_name = name + "_plate_1";
-                    pp.filename = printFile; pp.config_filename = configFile; pp.plate_index = 1;
-                    pp.ftp_folder = "sdcard/"; pp.ams_mapping = amsMap; pp.connection_type = lan ? "lan" : "cloud";
-                    pp.dev_ip = ip; pp.password = code;
-                    pp.print_type = "from_normal"; pp.username = "bblp"; pp.use_ssl_for_ftp = true; pp.use_ssl_for_mqtt = true;
-                    pp.task_bed_leveling = req["bed_leveling"].asBool(true); pp.task_flow_cali = req["flow_cali"].asBool(false);
-                    pp.task_vibration_cali = false; pp.task_layer_inspect = false; pp.task_record_timelapse = req["timelapse"].asBool(false);
-                    pp.task_use_ams = useAms; pp.task_bed_type = bedType.empty() ? "auto" : bedType;
+                    JobV1 pp{};
+                    pp.printerId = devId; pp.taskName = name; pp.projectName = name; pp.presetName = name + "_plate_1";
+                    pp.file = printFile; pp.configFile = configFile; pp.plate = 1;
+                    pp.ftpFolder = "sdcard/"; pp.amsMap = amsMap; pp.connection = lan ? "lan" : "cloud";
+                    pp.printerIp = ip; pp.accessCode = code;
+                    pp.printType = "from_normal"; pp.user = "bblp"; pp.ftpTls = true; pp.mqttTls = true;
+                    pp.bedLevel = req["bed_leveling"].asBool(true); pp.flowCal = req["flow_cali"].asBool(false);
+                    pp.vibrationCal = false; pp.layerCheck = false; pp.timelapse = req["timelapse"].asBool(false);
+                    pp.useAms = useAms; pp.bedType = bedType.empty() ? "auto" : bedType;
                     if (lan) {
-                        auto lf = p.fn<fn_start_local_print_legacy>("bambu_network_start_local_print");
+                        auto lf = p.fn<PlugLocalPrintV1>("bambu_network_start_local_print");
                         result = lf ? lf(agent, pp, update, cancelFn) : -1;
                     } else {
                         result = f(agent, pp, update, cancelFn, waitFn);
                     }
                 } else {
-                    auto f = p.fn<fn_start_print>("bambu_network_start_print");
+                    auto f = p.fn<PlugPrint>("bambu_network_start_print");
                     if (!f) { result = -1; done = true; return; }
-                    PrintParams pp{};
-                    pp.dev_id = devId; pp.task_name = name; pp.project_name = name; pp.preset_name = name + "_plate_1";
-                    pp.filename = printFile; pp.config_filename = configFile; pp.plate_index = 1;
-                    pp.ftp_folder = "sdcard/"; pp.ams_mapping = amsMap; pp.ams_mapping2 = amsMap2; pp.connection_type = lan ? "lan" : "cloud";
-                    pp.dev_ip = ip; pp.password = code;
-                    pp.print_type = "from_normal"; pp.username = "bblp"; pp.use_ssl_for_ftp = true; pp.use_ssl_for_mqtt = true;
-                    pp.task_bed_leveling = req["bed_leveling"].asBool(true); pp.task_flow_cali = req["flow_cali"].asBool(false);
-                    pp.task_vibration_cali = false; pp.task_layer_inspect = false; pp.task_record_timelapse = req["timelapse"].asBool(false);
-                    pp.task_use_ams = useAms; pp.task_bed_type = bedType.empty() ? "auto" : bedType;
-                    pp.auto_bed_leveling = pp.task_bed_leveling ? 1 : 0;
-                    pp.auto_flow_cali = pp.task_flow_cali ? 1 : 0;
-                    pp.task_ext_change_assist = false;
-                    pp.try_emmc_print = false;
+                    JobV2 pp{};
+                    pp.printerId = devId; pp.taskName = name; pp.projectName = name; pp.presetName = name + "_plate_1";
+                    pp.file = printFile; pp.configFile = configFile; pp.plate = 1;
+                    pp.ftpFolder = "sdcard/"; pp.amsMap = amsMap; pp.amsMap2 = amsMap2; pp.connection = lan ? "lan" : "cloud";
+                    pp.printerIp = ip; pp.accessCode = code;
+                    pp.printType = "from_normal"; pp.user = "bblp"; pp.ftpTls = true; pp.mqttTls = true;
+                    pp.bedLevel = req["bed_leveling"].asBool(true); pp.flowCal = req["flow_cali"].asBool(false);
+                    pp.vibrationCal = false; pp.layerCheck = false; pp.timelapse = req["timelapse"].asBool(false);
+                    pp.useAms = useAms; pp.bedType = bedType.empty() ? "auto" : bedType;
+                    pp.autoBedLevel = pp.bedLevel ? 1 : 0;
+                    pp.autoFlowCal = pp.flowCal ? 1 : 0;
+                    pp.extChangeAssist = false;
+                    pp.emmcPrint = false;
                     if (lan) {
-                        auto lf = p.fn<fn_start_local_print>("bambu_network_start_local_print");
+                        auto lf = p.fn<PlugLocalPrint>("bambu_network_start_local_print");
                         result = lf ? lf(agent, pp, update, cancelFn) : -1;
                     } else {
                         result = f(agent, pp, update, cancelFn, waitFn);
@@ -644,8 +649,8 @@ int runBambuAgent(int argc, char** argv) {
         out.set("ok", Value(r == 0));
         out.set("message", Value(r == 0 ? std::string(lan ? "Sent straight to the printer over the home network" : "Sent to the printer through Bambu's cloud")
                                         : errorText(r)));
-        if (lan) if (auto f = p.fn<fn_agent>("bambu_network_disconnect_printer")) f(agent);
-        if (auto f = p.fn<fn_destroy_agent>("bambu_network_destroy_agent")) f(agent);
+        if (lan) if (auto f = p.fn<PlugCall>("bambu_network_disconnect_printer")) f(agent);
+        if (auto f = p.fn<PlugFreeAgent>("bambu_network_destroy_agent")) f(agent);
         return finish();
     }
     if (cmd == "control") {
@@ -657,26 +662,26 @@ int runBambuAgent(int argc, char** argv) {
         bool lan = !ip.empty() && !code.empty();
         if (lan) {
             // Straight to the printer, like OrcaSlicer's Device tab on the home network.
-            auto conn = p.fn<fn_connect_printer>("bambu_network_connect_printer");
+            auto conn = p.fn<PlugConnect>("bambu_network_connect_printer");
             if (!conn) return fail("This Bambu plugin cannot connect to printers directly");
             conn(agent, devId, ip, "bblp", code, true);
             auto c0 = std::chrono::steady_clock::now();
             while (localState.load() == -1 && std::chrono::steady_clock::now() - c0 < std::chrono::seconds(20)) mq.pump(200);
             if (localState.load() != 0) return fail(localState.load() == -1 ? "The printer did not answer at " + ip : "Could not connect to the printer");
-            if (legacy) { if (auto f = p.fn<fn_send_msg_legacy>("bambu_network_send_message_to_printer")) r = f(agent, devId, msg, 1); }
-            else if (auto f = p.fn<fn_send_msg>("bambu_network_send_message_to_printer")) r = f(agent, devId, msg, 1, 1);
+            if (legacy) { if (auto f = p.fn<PlugSendV1>("bambu_network_send_message_to_printer")) r = f(agent, devId, msg, 1); }
+            else if (auto f = p.fn<PlugSend>("bambu_network_send_message_to_printer")) r = f(agent, devId, msg, 1, 1);
         } else if (login) {
-            if (legacy) { if (auto f = p.fn<fn_send_msg_legacy>("bambu_network_send_message")) r = f(agent, devId, msg, 1); }
-            else if (auto f = p.fn<fn_send_msg>("bambu_network_send_message")) r = f(agent, devId, msg, 1, 1);
+            if (legacy) { if (auto f = p.fn<PlugSendV1>("bambu_network_send_message")) r = f(agent, devId, msg, 1); }
+            else if (auto f = p.fn<PlugSend>("bambu_network_send_message")) r = f(agent, devId, msg, 1, 1);
         } else {
             return fail("Kestral needs the printer's IP and access code (or a Bambu login) to control it.");
         }
         mq.pump(1500);   // let it go out before the helper ends
-        if (lan) if (auto f = p.fn<fn_agent>("bambu_network_disconnect_printer")) f(agent);
+        if (lan) if (auto f = p.fn<PlugCall>("bambu_network_disconnect_printer")) f(agent);
         out.set("code", Value(r));
         out.set("ok", Value(r == 0));
         out.set("message", Value(r == 0 ? std::string("Sent ") + action + " to the printer" : "The printer did not take the command (" + std::to_string(r) + ")"));
-        if (auto f = p.fn<fn_destroy_agent>("bambu_network_destroy_agent")) f(agent);
+        if (auto f = p.fn<PlugFreeAgent>("bambu_network_destroy_agent")) f(agent);
         return finish();
     }
     return fail("Unknown helper command " + cmd);

@@ -1784,6 +1784,10 @@ void computeFeature(const Document& snap, const std::vector<App::RecomputeResult
         if (tids.empty()) {
             ShapePtr probe = kernel::extrudeRegion(regions[0], dir, 10000, false, 0);
             tids = autoTargets(snap, done, f, {probe});
+            if (tids.empty()) {   // the body is behind the sketch: look the other way
+                probe = kernel::extrudeRegion(regions[0], -dir, 10000, false, 0);
+                tids = autoTargets(snap, done, f, {probe});
+            }
         }
         if (tids.empty()) throw std::runtime_error("The emboss does not meet a body");
         ResolvedTarget rt;

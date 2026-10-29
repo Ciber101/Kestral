@@ -415,10 +415,23 @@ bool Renderer::initImGui() {
     return imguiReady_;
 }
 
+bool Renderer::canCapture() const { return ctx_ && ctx_->canCapture; }
+
+bool Renderer::takeCapture(std::vector<uint8_t>& rgba, int& w, int& h) {
+    if (!captureReady_) return false;
+    rgba.swap(capture_);
+    capture_.clear();
+    w = captureW_;
+    h = captureH_;
+    captureReady_ = false;
+    return true;
+}
+
 void Renderer::shutdown() {
     if (!ctx_ || !ctx_->device) return;
     VkDevice dev = ctx_->device;
     vkDeviceWaitIdle(dev);
+    destroyBuffer(captureBuf_);
     if (imguiReady_) ImGui_ImplVulkan_Shutdown();
     imguiReady_ = false;
     for (auto& f : frames_) {
@@ -882,9 +895,44 @@ bool Renderer::drawFrame(const FrameParams& fp, ImDrawData* ui) {
         vkCmdEndRendering(cmd);
     }
 
-    imageBarrier(cmd, swapImg, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                 VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                 VK_PIPELINE_STAGE_2_NONE, 0, VK_IMAGE_ASPECT_COLOR_BIT);
+    // ---- 4. Window screenshot (asked for by the MCP server): copy the finished image out.
+    bool capturing = false;
+    if (captureReq_ && ctx_->canCapture) {
+        VkDeviceSize need = (VkDeviceSize)ext.width * ext.height * 4;
+        if (captureBuf_.size < need) {
+            destroyBuffer(captureBuf_);
+            createBuffer(captureBuf_, need, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, true);
+        }
+        if (captureBuf_.buf) {
+            imageBarrier(cmd, swapImg, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+            VkBufferImageCopy region{};
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.imageExtent = {ext.width, ext.height, 1};
+            vkCmdCopyImageToBuffer(cmd, swapImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, captureBuf_.buf, 1, &region);
+            VkBufferMemoryBarrier2 bb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
+            bb.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            bb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            bb.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+            bb.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+            bb.srcQueueFamilyIndex = bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bb.buffer = captureBuf_.buf;
+            bb.size = VK_WHOLE_SIZE;
+            VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            di.bufferMemoryBarrierCount = 1;
+            di.pBufferMemoryBarriers = &bb;
+            vkCmdPipelineBarrier2(cmd, &di);
+            imageBarrier(cmd, swapImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                         VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                         VK_PIPELINE_STAGE_2_NONE, 0, VK_IMAGE_ASPECT_COLOR_BIT);
+            capturing = true;
+        }
+    }
+    if (!capturing)
+        imageBarrier(cmd, swapImg, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_NONE, 0, VK_IMAGE_ASPECT_COLOR_BIT);
     vkEndCommandBuffer(cmd);
 
     VkSemaphoreSubmitInfo waitInfo{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
@@ -908,6 +956,27 @@ bool Renderer::drawFrame(const FrameParams& fp, ImDrawData* ui) {
         f.pickPending = false;
         if (sr == VK_ERROR_DEVICE_LOST) throw std::runtime_error("GPU device lost");
         return false;
+    }
+    if (capturing) {
+        // A one off wait: the picture is wanted now, and it costs one frame.
+        vkWaitForFences(dev, 1, &f.fence, VK_TRUE, UINT64_MAX);
+        vmaInvalidateAllocation(ctx_->vma, captureBuf_.alloc, 0, VK_WHOLE_SIZE);
+        const uint8_t* src = static_cast<const uint8_t*>(captureBuf_.mapped);
+        if (src) {
+            size_t n = (size_t)ext.width * ext.height;
+            capture_.resize(n * 4);
+            bool bgr = ctx_->swapFormat == VK_FORMAT_B8G8R8A8_UNORM || ctx_->swapFormat == VK_FORMAT_B8G8R8A8_SRGB;
+            for (size_t i = 0; i < n; ++i) {
+                capture_[i * 4 + 0] = src[i * 4 + (bgr ? 2 : 0)];
+                capture_[i * 4 + 1] = src[i * 4 + 1];
+                capture_[i * 4 + 2] = src[i * 4 + (bgr ? 0 : 2)];
+                capture_[i * 4 + 3] = 255;
+            }
+            captureW_ = (int)ext.width;
+            captureH_ = (int)ext.height;
+            captureReady_ = true;
+        }
+        captureReq_ = false;
     }
 
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};

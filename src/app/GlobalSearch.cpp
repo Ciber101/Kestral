@@ -1,6 +1,7 @@
 // The search box at the top right: finds any command, slice setting, page, preset or preference,
 // jumps there and makes the spot blink so the eye finds it.
 #include "app/App.h"
+#include "ui/UiItems.h"
 #include "app/SliceStyle.h"
 #include "print/OrcaOptions.h"
 #include "ui/Icons.h"
@@ -142,6 +143,9 @@ void App::flashRect(ImDrawList* dl, ImVec2 a, ImVec2 b, float amount, float roun
 }
 
 void App::flashItem(const std::string& key) {
+    // Search keys double as names for the item just drawn ("pref:Show its thinking").
+    size_t colon = key.find(':');
+    if (colon != std::string::npos && key.compare(0, colon, "pref") == 0) uiitems::nameLast(key.substr(colon + 1));
     if (flashKey_.empty() || key != flashKey_) return;
     ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
     float right = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;

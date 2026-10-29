@@ -24,13 +24,19 @@ rough edges, and please report them.
 * **Slice**: a Slice tab with OrcaSlicer's engine inside Kestral. Plates, arranging, painting
   (supports, seams, colors), every OrcaSlicer setting, layer preview, calibration prints, and your
   own OrcaSlicer printer, filament and process profiles.
-* **Print**: send to Bambu Lab printers (cloud or LAN), OctoPrint, Klipper (Moonraker) and
-  PrusaLink. Printer status, camera, AMS, temperatures and controls on the Device page.
+* **Print**: send to Bambu Lab printers (LAN mode, or optionally through Bambu's own network
+  plugin from your OrcaSlicer install), OctoPrint, Klipper (Moonraker) and PrusaLink. Printer status, camera, AMS, temperatures and controls on the Device page.
 * **Assistant** (Ctrl+Space): tell it what to make or change in plain words. It builds, edits,
   slices and prints with Kestral's own tools, checks its work by looking at the model, and models
   things from pictures you paste in. Works with local models through Ollama or LM Studio (free, on
   your own computer) and with Claude, OpenAI, Gemini, Grok, DeepSeek, Mistral, OpenRouter, Groq and
   any OpenAI compatible service (your own API key).
+* **Illustrations**: clean pictures of your design for instructions, posts and READMEs: isometric
+  or any view, shaded, flat tones or line art, exploded, with numbered parts and a parts list.
+  PNG, or SVG with the lines and numbers as vectors.
+* **MCP server**: Claude Desktop, Claude Code, Cursor and any other MCP app can drive Kestral live:
+  every modeling, slicing and printing tool, every control by name, screenshots, mouse and keyboard,
+  with a read-only key, an action log and a hidden window mode for batch work.
 * **Search** (Ctrl+F): finds any command, slicer setting, preset or preference, takes you there and
   points it out.
 
@@ -69,6 +75,49 @@ Open it with Ctrl+Space and pick a provider with the gear button. For a free, pr
 A model that cannot see pictures can still work from screenshots and photos: pick a vision model
 as the picture helper in Preferences > Assistant, and it describes them for the main model.
 Kestral only starts a print after you press **Print**, unless you allow it in the settings.
+
+## Use Kestral from other AI apps (MCP)
+Kestral runs an MCP server while it is open (Preferences > Assistant > MCP server). It only accepts
+programs on your own computer that send Kestral's key.
+
+* **Claude Desktop**: press **Add Kestral to Claude Desktop** in that section, then restart Claude
+  Desktop. Or add this to its `claude_desktop_config.json` yourself:
+  ```json
+  { "mcpServers": { "kestral": { "command": "C:\\path\\to\\Kestral.exe", "args": ["--mcp"] } } }
+  ```
+* **Claude Code**: `claude mcp add --scope user kestral -- "C:\path\to\Kestral.exe" --mcp`
+* **Cursor and others**: the same command and `--mcp` argument, or connect by address
+  (Streamable HTTP) with **Copy address and key**: `http://127.0.0.1:47800/mcp` and the header
+  `Authorization: Bearer <key>`.
+
+`Kestral.exe --mcp` finds the open Kestral window (and starts Kestral if it is not open). Every
+step the other app takes shows in Kestral's assistant chat and is one undo step.
+
+What an MCP app gets:
+* About 100 modeling, slicing and printing tools (the same ones Kestral's own assistant uses).
+* Controls by name: `ui_find`, `ui_click` and `ui_set` find any button, menu, menu item, checkbox,
+  field, drop down, tab, browser row or timeline step by what it says, and scroll it into view.
+* The screen: `screenshot`, `ui_input` (clicks, drags, scrolling, typing, keys), `get_ui_state`.
+* The rest: `list_commands`, `view`, `undo`, `redo`, `design_tabs`, `workspace`, `get_settings`,
+  `set_setting`, `assistant` (talk to Kestral's own assistant, with pictures), `get_log`, `window`,
+  and `wait_for` (until the design is rebuilt, the design changed, the assistant finished or the
+  printer's state changed).
+
+Keys and the log:
+* The **full key** can do everything above. The **read-only key** can only look: read the design,
+  take pictures and wait. Set an app up with it using `Kestral.exe --mcp --read-only`, or copy the
+  read-only address and key in Preferences.
+* Every call is written to `mcp_log.jsonl` in Kestral's settings folder (when, which app, the tool,
+  the result). **Show what MCP apps did** opens it.
+* Prints still wait for you to press Print. Secrets, the MCP settings and the auto print setting
+  cannot be changed from outside. Only one Kestral window serves MCP apps (the first one opened).
+
+Without a window:
+* `Kestral.exe --hidden` runs Kestral with no window on screen (1920 x 1080 inside), for MCP apps
+  and servers. On Linux without a desktop, run it under `xvfb-run`.
+* `Kestral.exe --batch <calls.jsonl> <out.kst>` runs tool calls from a file, one JSON object per
+  line (`{"t":"create_box","a":{"width":20,"depth":20,"height":5}}`), saves the design and quits.
+  The results go to `<calls.jsonl>.out.txt`.
 
 ## Controls (Fusion style)
 | Action | Input |

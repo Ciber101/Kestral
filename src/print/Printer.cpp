@@ -20,9 +20,9 @@ using json::Value;
 
 const char* kindName(PrinterKind k) {
     switch (k) {
-    case PrinterKind::BambuOrca: return "Bambu Lab, normal mode (through Bambu's cloud, the way OrcaSlicer sends)";
+    case PrinterKind::BambuOrca: return "Bambu Lab, normal mode (optional: Bambu's network plugin from OrcaSlicer)";
     case PrinterKind::BambuConnect: return "Bambu Lab, through Bambu Connect (you press Print there)";
-    case PrinterKind::BambuLan: return "Bambu Lab, LAN only + Developer mode (fully automatic)";
+    case PrinterKind::BambuLan: return "Bambu Lab, LAN only + Developer mode (recommended)";
     case PrinterKind::OctoPrint: return "OctoPrint";
     case PrinterKind::Moonraker: return "Klipper (Moonraker / Mainsail / Fluidd)";
     case PrinterKind::PrusaLink: return "Prusa (PrusaLink)";
@@ -682,7 +682,10 @@ void PrinterCamera::start(const PrinterConn& c) {
         auto setStatus = [&](const std::string& s) { std::lock_guard lk(m_); status_ = s; };
         while (run_) {
             if (c.host.empty() || c.secret.empty()) { setStatus("The camera needs the printer's IP and access code (Preferences > Printer)."); return; }
-            setStatus("Connecting to the camera...");
+            {
+                std::lock_guard lk(m_);
+                if (status_.empty() && jpeg_.empty()) status_ = "Connecting to the camera...";   // keeps an earlier reason while retrying
+            }
             net::TlsConn conn;
             std::string err;
             if (!conn.connect(c.host, 6000, 6000, err)) {
@@ -699,7 +702,6 @@ void PrinterCamera::start(const PrinterConn& c) {
             std::memcpy(&auth[48], c.secret.data(), std::min<size_t>(c.secret.size(), 32));
             conn.writeAll(auth);
             std::string buf;
-            setStatus("");
             auto lastPic = std::chrono::steady_clock::now();
             while (run_) {
                 char tmp[65536];
@@ -716,10 +718,11 @@ void PrinterCamera::start(const PrinterConn& c) {
                         std::lock_guard lk(m_);
                         jpeg_ = std::move(pic);
                         ++seq_;
+                        status_.clear();
                         lastPic = std::chrono::steady_clock::now();
                     }
                 }
-                if (std::chrono::steady_clock::now() - lastPic > std::chrono::seconds(12)) { setStatus("The camera sends no pictures (is it switched on in the printer's settings?)"); break; }
+                if (std::chrono::steady_clock::now() - lastPic > std::chrono::seconds(12)) { setStatus("The printer accepts the camera connection but sends no pictures. In LAN only mode, turn on \"LAN only liveview\" on the printer (its settings menu), and check that the camera is not switched off there."); break; }
             }
             conn.close();
             for (int i = 0; i < 10 && run_; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));

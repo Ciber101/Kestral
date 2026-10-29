@@ -1,5 +1,6 @@
 // Kestral's dropdown lists (see SliceStyle.h): the same look everywhere in the Slice tab.
 #include "app/SliceStyle.h"
+#include "ui/UiItems.h"
 
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -21,6 +22,7 @@ bool beginMenuCombo(const char* id, const char* preview, float popupWidth, bool 
     ImVec2 p = ImGui::GetCursorScreenPos();
     ImGui::PushID(id);
     bool clicked = ImGui::InvisibleButton("##btn", ImVec2(w, h));
+    uiitems::nameLast(preview ? preview : "");
     bool hov = ImGui::IsItemHovered();
     ImGuiID popupId = ImGui::GetID("##list");
     bool open = ImGui::IsPopupOpen(popupId, 0);
@@ -82,6 +84,7 @@ bool menuRow(const char* label, bool selected, const char* hint, ImU32 swatch) {
     ImVec2 p = ImGui::GetCursorScreenPos();
     ImGui::PushID(label);
     bool clicked = ImGui::InvisibleButton("##row", ImVec2(w, h));
+    uiitems::nameLast(label);
     bool hov = ImGui::IsItemHovered();
     ImGui::PopID();
     ImDrawList* dl = ImGui::GetWindowDrawList();

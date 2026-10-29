@@ -67,6 +67,10 @@ struct Settings {
     std::string aiCustomPrompt;   // extra instructions for every chat
     int aiMainVision = 0;         // the chat model sees pictures: 0 find out, 1 yes, 2 no (a helper describes them)
     std::string aiVisionModel;    // helper that describes pictures for a model that cannot see (same provider)
+    bool mcpEnabled = true;        // MCP server: other AI apps may use Kestral's tools (this computer only)
+    int mcpPort = 47800;
+    std::string mcpToken;          // the key MCP apps must send (made on first start)
+    std::string mcpReadToken;      // a second key that only looks (reads, pictures), never changes anything
     std::string aiProvider = "ollama";
     std::map<std::string, AiProvider> ai;
     // Keyboard shortcut overrides: command id -> combo ("" = unassigned). Defaults are Fusion's.

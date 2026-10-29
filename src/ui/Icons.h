@@ -16,6 +16,7 @@ enum class Icon {
     Trim, Offset, Project, Construction, FinishSketch, CenterRect, ConCoincident, ConCollinear, ConConcentric,
     ConMidpoint, ConFix, ConParallel, ConPerpendicular, ConHorizontal, ConVertical, ConTangent, ConEqual,
     ConSymmetric, SketchOptions, Break, Intersect, ProjectFace, CrossPoint, Sphere, Cone, Torus, Wedge, Tube,
+    Illustration,
 };
 
 void drawIcon(ImDrawList* dl, ImVec2 center, float size, Icon icon, bool enabled = true);

@@ -33,6 +33,7 @@ struct VkContext {
     std::string gpuName;
     bool wideLines = false;
     bool multiDrawIndirect = false;
+    bool canCapture = false;   // the swapchain images can be copied out (window screenshots)
     float lineWidthMax = 1.f;
     VkSampleCountFlagBits msaa = VK_SAMPLE_COUNT_4_BIT;
     bool validation = false;

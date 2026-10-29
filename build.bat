@@ -52,8 +52,16 @@ cmake --build "%KESTRAL_BUILD%\build"
 if errorlevel 1 goto :fail
 
 if not exist "%SRC%\bin" mkdir "%SRC%\bin"
-robocopy "%KESTRAL_BUILD%\build" "%SRC%\bin" *.exe *.dll /NFL /NDL /NJH /NJS /NP >nul
-if errorlevel 8 goto :fail
+rem A running Kestral (or the MCP bridge an AI app started) keeps bin\Kestral.exe locked. Windows
+rem lets a running program be renamed, so move it aside and copy the new one in its place.
+if exist "%SRC%\bin\Kestral.old.exe" del /q "%SRC%\bin\Kestral.old.exe" >nul 2>nul
+if exist "%SRC%\bin\Kestral.exe" move /y "%SRC%\bin\Kestral.exe" "%SRC%\bin\Kestral.old.exe" >nul 2>nul
+robocopy "%KESTRAL_BUILD%\build" "%SRC%\bin" *.exe *.dll /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
+if errorlevel 8 (
+  echo [Kestral] Could not copy into bin. Close Kestral and any AI app using it, then run build.bat again.
+  goto :fail
+)
+echo [Kestral] Restart Kestral to use the new version.
 echo.
 echo [Kestral] Done. Run: run.bat   (or bin\Kestral.exe)
 goto :end

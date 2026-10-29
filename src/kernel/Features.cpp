@@ -615,7 +615,7 @@ ShapePtr embossOnBody(const std::vector<RegionLoops>& regions, const glm::dvec3&
     if (regions.empty()) throw std::runtime_error("Emboss needs a closed profile");
     if (!(depth > 1e-6)) throw std::runtime_error("Depth must be greater than zero");
     if (glm::length(dir) < 0.5) throw std::runtime_error("Bad emboss direction");
-    glm::dvec3 d = glm::normalize(dir);
+    glm::dvec3 d0 = glm::normalize(dir);
     gp_Trsf tr;
     tr.SetValues(xform[0][0], xform[1][0], xform[2][0], xform[3][0],
                  xform[0][1], xform[1][1], xform[2][1], xform[3][1],
@@ -628,12 +628,16 @@ ShapePtr embossOnBody(const std::vector<RegionLoops>& regions, const glm::dvec3&
     box.Get(x0, y0, z0, x1, y1, z1);
     glm::dvec3 corners[8] = {{x0, y0, z0}, {x1, y0, z0}, {x0, y1, z0}, {x1, y1, z0},
                              {x0, y0, z1}, {x1, y0, z1}, {x0, y1, z1}, {x1, y1, z1}};
+    // Projects along the sketch normal; when the body is on the other side of the sketch (its
+    // normal points away, common for sketches on side planes), projects the other way instead.
+    TopoDS_Shape tool;
+    bool any = false;
+    for (int attempt = 0; attempt < 2 && !any; ++attempt) {
+    glm::dvec3 d = attempt == 0 ? d0 : -d0;
     double u0 = glm::dot(planeO, d);
     double reach = 0;
     for (auto& c : corners) reach = std::max(reach, glm::dot(c, d) - u0);
     reach += 5.0;
-    TopoDS_Shape tool;
-    bool any = false;
     for (auto& region : regions) {
         ShapePtr probe = extrudeRegion(region, d, reach, false, 0);
         BRepAlgoAPI_Common common(probe->shape, body);
@@ -656,6 +660,7 @@ ShapePtr embossOnBody(const std::vector<RegionLoops>& regions, const glm::dvec3&
         TopoDS_Shape pad = prism(face, extrude);
         tool = any ? boolOp(true, tool, pad, "emboss") : pad;
         any = true;
+    }
     }
     if (!any) throw std::runtime_error("The emboss does not meet a body");
     auto h = std::make_shared<ShapeHandle>();

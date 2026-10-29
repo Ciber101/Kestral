@@ -1,5 +1,6 @@
 // Kestral CAD: personal parametric CAD. Entry point.
 #include "app/App.h"
+#include "app/Mcp.h"
 #include "kernel/Kernel.h"
 #include "print/BambuCloud.h"
 #include "print/Orca.h"
@@ -55,6 +56,12 @@ int main(int argc, char** argv) {
         for (auto& s : a) av.push_back(s.data());
         int rc = kst::print::runBambuAgent((int)av.size(), av.data());
         kst::platform::hardExit(rc);   // the plugin's own threads must not hold the helper open
+    }
+    // MCP stdio bridge: an AI app started Kestral to talk to the open Kestral window (see app/Mcp.h).
+    if (argc >= 2 && std::string(argv[1]) == "--mcp") {
+        bool ro = false;
+        for (int i = 2; i < argc; ++i) if (std::string(argv[i]) == "--read-only") ro = true;
+        return kst::mcp::runBridge(ro);
     }
     if (argc >= 3 && std::string(argv[1]) == "--slice-test")
         return kst::print::sliceSelfTest(argv[2], argc >= 4 ? argv[3] : "");

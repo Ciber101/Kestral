@@ -2,6 +2,7 @@
 // Project, Calibration) with Slice plate and Print plate at the right; the 3D toolbar over the
 // plate; each build plate's name, number and side buttons; the view buttons at the bottom left.
 #include "app/App.h"
+#include "ui/UiItems.h"
 #include "app/SliceStyle.h"
 #include "core/Log.h"
 #include "kernel/Features.h"
@@ -89,6 +90,7 @@ void App::drawSliceBar() {
         ImGui::SetCursorScreenPos(a);
         ImGui::PushID(i);
         bool clicked = ImGui::InvisibleButton("##tab", ImVec2(tw, h - 1));
+        uiitems::nameLast(i == 0 ? "Home" : tabs[i].name);
         bool hov = ImGui::IsItemHovered();
         if (hov) ImGui::SetTooltip("%s", tabs[i].tip);
         ImGui::PopID();

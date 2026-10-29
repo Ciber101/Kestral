@@ -2,7 +2,9 @@
 #include <cctype>
 #include <cmath>
 #include <map>
+#include <mutex>
 #include <set>
+#include <string>
 #include <utility>
 
 #ifdef _WIN32
@@ -202,7 +204,24 @@ std::string squash(const std::string& s) {
 
 // A font file for a family name. Windows names map to the usual Linux look-alikes, and anything
 // unknown falls back to a plain sans font so text never silently disappears.
+std::string findFontFileScan(const std::string& family);
+
+// Fonts are looked up once per family name (scanning the font folders takes a moment).
 std::string findFontFile(const std::string& family) {
+    static std::mutex mx;
+    static std::map<std::string, std::string> cache;
+    {
+        std::lock_guard<std::mutex> lk(mx);
+        auto it = cache.find(family);
+        if (it != cache.end()) return it->second;
+    }
+    std::string f = findFontFileScan(family);
+    std::lock_guard<std::mutex> lk(mx);
+    cache[family] = f;
+    return f;
+}
+
+std::string findFontFileScan(const std::string& family) {
     namespace fs = std::filesystem;
     std::vector<fs::path> dirs = {"/usr/share/fonts", "/usr/local/share/fonts"};
     if (const char* h = std::getenv("HOME")) {
@@ -351,6 +370,10 @@ std::vector<uint32_t> addLoops(Sketch& s, const std::vector<std::vector<Vec2>>& 
 }
 
 } // namespace
+
+std::vector<std::vector<Vec2>> textOutlines(const std::string& font, const std::string& text, double height) {
+    return fontLoops(font, text, height);
+}
 
 std::vector<uint32_t> addSketchText(Sketch& s, const std::string& text, Vec2 origin, double height, bool construction,
                                     const std::string& font, uint32_t* noteId) {

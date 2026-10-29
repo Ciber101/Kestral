@@ -1,6 +1,7 @@
-// OrcaSlicer's settings as OrcaSlicer shows them: label, unit, tooltip, choices, simple or advanced,
-// and the page and group each sits in on the process, filament and printer tabs. The table is made
-// from OrcaSlicer's source by tools/gen_orca_options.py (run it again after a big Orca update).
+// OrcaSlicer's settings: key, name, unit, choices, limits, simple or advanced, and the page and group
+// each sits in on the process, filament and printer tabs, so Kestral can drive Orca's engine. The
+// descriptions are Kestral's own (tools/orca_setting_descriptions.json). The table is made by
+// tools/gen_orca_options.py (run it again after a big Orca update).
 #pragma once
 #include <string>
 #include <vector>

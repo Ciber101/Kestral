@@ -12,3 +12,7 @@ docs/
 *.tgz
 .vscode/
 tools/KestralExportAll/.vscode/
+*.out.txt
+src/*.jsonl
+src/*.obj
+bin/Kestral.old.exe

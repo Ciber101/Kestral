@@ -318,7 +318,8 @@ std::string App::aiPrintTool(const std::string& name, const std::string& argsJso
                 auto k = s.knownPrinters[0];
                 std::string code = print::orcaSavedAccessCode(s, k.serial);
                 if (!onMain<print::PrinterConn>(post, cancel, [this, k, code] {
-                        settings_.printerKind = print::kindId(print::PrinterKind::BambuOrca);
+                        // LAN mode when the access code is known (no Bambu software needed), else through OrcaSlicer's plugin.
+                        settings_.printerKind = print::kindId(code.empty() ? print::PrinterKind::BambuOrca : print::PrinterKind::BambuLan);
                         settings_.printerName = k.model.empty() ? k.name : k.model;
                         settings_.printerHost = k.ip;
                         settings_.printerSerial = k.serial;
@@ -1068,9 +1069,10 @@ void App::drawPrinterPrefs() {
     flashItem("pref:Printers");
     if (ImGui::Checkbox("Let the assistant start prints without asking", &settings_.aiAutoPrint)) settings_.save(settingsPath_);
     ImGui::SetItemTooltip("For \"model it and print it\" while you are away. Off: the assistant shows a Print / Cancel card first.");
-    static const print::PrinterKind kinds[] = {print::PrinterKind::None, print::PrinterKind::BambuOrca, print::PrinterKind::BambuConnect,
-                                               print::PrinterKind::BambuLan, print::PrinterKind::OctoPrint, print::PrinterKind::Moonraker,
-                                               print::PrinterKind::PrusaLink};
+    // LAN mode first: it talks to the printer directly. The two Bambu software routes come last.
+    static const print::PrinterKind kinds[] = {print::PrinterKind::None, print::PrinterKind::BambuLan, print::PrinterKind::OctoPrint,
+                                               print::PrinterKind::Moonraker, print::PrinterKind::PrusaLink, print::PrinterKind::BambuConnect,
+                                               print::PrinterKind::BambuOrca};
     print::PrinterKind cur = print::kindFromString(settings_.printerKind);
     ImGui::SetNextItemWidth(-1);
     if (ImGui::BeginCombo("##pkind", print::kindName(cur))) {
@@ -1090,10 +1092,11 @@ void App::drawPrinterPrefs() {
     };
     switch (cur) {
     case print::PrinterKind::BambuOrca:
-        dim("Kestral sends the print through Bambu's cloud with Bambu's own network plugin, exactly like OrcaSlicer does. "
-            "The printer stays in its normal mode (Bambu Handy keeps working). Kestral uses the plugin and the Bambu login "
-            "OrcaSlicer already has on this computer. Pick the printer with Find my Bambu printers. Add the IP and access code "
-            "too (or use the OrcaSlicer button) so Kestral can also see the print's progress.");
+        dim("Optional. Kestral sends the print with Bambu's own network plugin, the way OrcaSlicer does. The printer stays in its "
+            "normal mode (Bambu Handy keeps working). Kestral does not include the plugin: it uses the copy and the Bambu login "
+            "OrcaSlicer already has on this computer, under Bambu's own terms. LAN mode (the first choice) needs no plugin. "
+            "Pick the printer with Find my Bambu printers. Add the IP and access code too (or use the OrcaSlicer button) so "
+            "Kestral can also see the print's progress.");
         drawBambuCloudPicker();
         ImGui::Spacing();
         break;
@@ -1102,9 +1105,9 @@ void App::drawPrinterPrefs() {
             "printer mode, Bambu Handy keeps working.");
         break;
     case print::PrinterKind::BambuLan:
-        dim("Fully automatic: Kestral sends and starts the print itself after you press Print in Kestral. The printer must be in "
-            "LAN only mode with Developer mode on (printer screen: Settings > WLAN / Network). Note: in LAN only mode Bambu Handy "
-            "and the cloud do not work. The access code is on the same screen.");
+        dim("Recommended. Kestral talks to the printer directly over your home network (no Bambu software involved) and starts "
+            "the print itself after you press Print. Put the printer in LAN only mode with Developer mode on (printer screen: "
+            "Settings > WLAN / Network); the access code is on the same screen. In LAN only mode Bambu Handy and the cloud do not work.");
         break;
     case print::PrinterKind::OctoPrint: dim("Address of OctoPrint (e.g. 192.168.1.50) and an API key (OctoPrint: Settings > Application Keys)."); break;
     case print::PrinterKind::Moonraker: dim("Address of the Klipper machine (Mainsail / Fluidd), e.g. 192.168.1.60. API key only if you set one."); break;

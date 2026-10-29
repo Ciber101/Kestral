@@ -272,6 +272,13 @@ void drawIcon(ImDrawList* dl, ImVec2 center, float size, Icon icon, bool enabled
         p.stdBox(0.25f, -0.15f, 0.8f, 0.4f);
         p.circle(0.f, 0.f, 0.22f, p.col(230, 60, 60), true);
         break;
+    case Icon::Illustration:
+        // A framed picture of a part.
+        p.rect(-0.85f, -0.75f, 0.85f, 0.75f, p.col(250, 250, 252), true);
+        p.rect(-0.85f, -0.75f, 0.85f, 0.75f, slate, false, 0.08f);
+        p.stdBox(0, 0.12f, 0.8f, 0.36f);
+        p.circle(0.55f, -0.48f, 0.13f, orange, true);
+        break;
     case Icon::Section:
         p.stdBox(0, 0.05f, 1.1f, 0.5f);
         p.line(-0.9f, 0.5f, 0.9f, -0.4f, p.col(230, 60, 60), 0.08f);

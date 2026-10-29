@@ -91,14 +91,19 @@ struct ToolDef { const char* name; const char* desc; const char* schema; };
 const ToolDef kTools[] = {
     {"find_tools", "Search Kestral's tools and commands by words (e.g. \"thread\", \"chamfer\", \"gear\", \"brim\", \"AMS slots\", \"appearance wood\"). Kestral has about 110 tools; only the most common are loaded. The ones found are loaded for your next step: call them then. Also lists matching commands for run_command and appearance names.",
      R"({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]})"},
-    {"get_design", "Read the current design: components (folders), bodies with path, size, center and color, the timeline, user parameters and the current selection. Call this before changing anything.",
-     R"({"type":"object","properties":{}})"},
+    {"get_design", "Read the current design: components (folders), bodies with path, size, center and color, the timeline, user parameters and the current selection. Call this before changing anything. Big designs come as an overview of their components: then pass under (a component path) to list the bodies in it.",
+     R"({"type":"object","properties":{"under":{"type":"string","description":"only bodies whose path starts with this component path"}}})"},
     {"look_at_design", "Take a picture of the design to check your work with your own eyes: shapes, holes, chamfers, positions, "
      "colors. Views: iso (front right top), front (looking along +Y), back, left, right (looking along -X), top (looking down), "
      "bottom, current (what the user sees). Several views come as one picture, panels left to right then top to bottom in the "
      "order asked. The axis sign in the corner shows X red, Y green, Z blue. Use it after building something, to compare with "
      "the user's request or picture. If you cannot see pictures, Kestral's picture helper looks and answers your question.",
      R"({"type":"object","properties":{"views":{"type":"array","items":{"type":"string","enum":["iso","front","back","left","right","top","bottom","current"]},"description":"default: iso, front, top, right"},"bodies":{"type":"array","items":{"type":"string"},"description":"only these body paths, default every visible body"},"question":{"type":"string","description":"what to check, e.g. 'is the hole centred on the top face?'"}}})"},
+    {"export_illustration", "Save a clean picture of the design for instructions, posts or a README: isometric or another view, "
+     "style shaded, illustration (flat tones), line_art or shaded_no_lines, exploded (0 assembled .. 1.5 far apart), numbered "
+     "balloons with a parts list, background transparent, white or dark. .png or .svg (vector lines and text). path is optional: "
+     "default is the designs folder. bodies limits it to those body paths.",
+     R"({"type":"object","properties":{"path":{"type":"string"},"view":{"type":"string","enum":["iso","front","top","right","left","back","bottom","current"]},"style":{"type":"string","enum":["shaded","illustration","line_art","shaded_no_lines"]},"explode":{"type":"number"},"numbers":{"type":"boolean"},"parts_list":{"type":"boolean"},"background":{"type":"string","enum":["transparent","white","dark"]},"width":{"type":"integer"},"height":{"type":"integer"},"bodies":{"type":"array","items":{"type":"string"}}}})"},
     {"run_command", "Run any Kestral command by its id (see the command list in the instructions), exactly like clicking it. Commands that need picks or values open their dialog for the user.",
      R"({"type":"object","properties":{"command_id":{"type":"string"}},"required":["command_id"]})"},
     {"select", "Select bodies by name or path (\"Folder/Body\"). A folder name selects every body in it. add=true keeps the current selection.",
@@ -291,6 +296,9 @@ const ToolDef kTools[] = {
      R"({"type":"object","properties":{"action":{"type":"string","enum":["pause","resume","stop"]}},"required":["action"]})"},
     {"printer_status", "Ask the printer how it is doing: idle, printing (percent, time left), finished, temperatures.",
      R"({"type":"object","properties":{}})"},
+    {"printer_camera", "A picture from the printer's own camera right now (Bambu Lab A1, A1 mini, P1): watch a print, check the first layer, "
+     "spaghetti, warping or whether the plate is clear. question: what to check (used when a helper describes the picture for you).",
+     R"({"type":"object","properties":{"question":{"type":"string"}}})"},
     {"set_printer", "Set how Kestral reaches the printer. connection: bambu_orca (Bambu Lab in normal mode: Kestral sends through Bambu's cloud with Bambu's network plugin, like OrcaSlicer; serial is a printer id from bambu_printers), bambu_connect (Bambu Lab via the Bambu Connect app), bambu_lan (Bambu Lab in LAN only + Developer mode: fully automatic), octoprint, moonraker (Klipper, Mainsail, Fluidd) or prusalink. from_orcaslicer_printer (a serial, name or model from print_setup) fills in the IP, serial and access code OrcaSlicer already saved. Otherwise give host (IP) and for Bambu serial and access_code, for the others api_key.",
      R"({"type":"object","properties":{"connection":{"type":"string"},"name":{"type":"string"},"from_orcaslicer_printer":{"type":"string"},"host":{"type":"string"},"serial":{"type":"string"},"access_code":{"type":"string"},"api_key":{"type":"string"},"use_ams":{"type":"boolean"},"ams_slot":{"type":"number"}},"required":["connection"]})"},
 };
@@ -579,16 +587,38 @@ std::vector<App::AiTurn> fitHistory(const std::vector<App::AiTurn>& h, int ctx, 
         for (auto& c : t.calls) n += c.argsJson.size() + c.name.size() + 20;
         return n;
     };
+    budget = std::max(budget, 6000.0);
+    // The newest user message always stays: chat templates (Qwen and others) refuse a conversation
+    // without one. Older exchanges go first; then long tool results are cut down to fit.
+    size_t lastUser = h.size();
+    for (size_t i = h.size(); i-- > 0;)
+        if (h[i].role == "user") { lastUser = i; break; }
     double total = 0;
     for (auto& t : h) total += (double)sizeOf(t);
     size_t start = 0;
-    while (total > budget && start + 1 < h.size()) {
-        total -= (double)sizeOf(h[start]);
-        ++start;
-        while (start < h.size() && h[start].role != "user") { total -= (double)sizeOf(h[start]); ++start; }
+    while (total > budget && start < lastUser && lastUser < h.size()) {
+        size_t next = start + 1;
+        while (next < lastUser && h[next].role != "user") ++next;
+        for (size_t i = start; i < next; ++i) total -= (double)sizeOf(h[i]);
+        start = next;
     }
-    if (start >= h.size()) start = h.size() - 1;
-    return std::vector<App::AiTurn>(h.begin() + (long)start, h.end());
+    std::vector<App::AiTurn> out(h.begin() + (long)std::min(start, h.size()), h.end());
+    if (total > budget) {
+        // Still too long: shorten the biggest tool results (newest last), keeping their beginning.
+        double over = total - budget;
+        std::vector<size_t> tools;
+        for (size_t i = 0; i < out.size(); ++i)
+            if (out[i].role == "tool" && out[i].text.size() > 2000) tools.push_back(i);
+        std::sort(tools.begin(), tools.end(), [&](size_t a, size_t b) { return out[a].text.size() > out[b].text.size(); });
+        for (size_t i : tools) {
+            if (over <= 0) break;
+            size_t keep = (size_t)std::max(1500.0, (double)out[i].text.size() - over);
+            if (keep >= out[i].text.size()) continue;
+            over -= (double)(out[i].text.size() - keep);
+            out[i].text = out[i].text.substr(0, keep) + "\n...(cut: too long for the model's context window; ask for less, e.g. get_design with under)";
+        }
+    }
+    return out;
 }
 
 // Live text while a reply streams in: (thinking so far, answer so far).
@@ -930,10 +960,11 @@ std::string App::aiSystemPrompt() const {
          "- If something is missing, walk the user through it, one step at a time: (1) no OrcaSlicer: install it free from "
          "github.com/SoftFever/OrcaSlicer/releases and run its setup wizard to pick the printer; (2) no profile for their "
          "printer or filament: find built in ones with list_print_profiles (search the printer model, e.g. \"A1 mini\", "
-         "and the filament, e.g. \"PLA basic A1M\") and pass them to slice; (3) no printer connection: Bambu Lab printers "
-         "normally use bambu_orca (works as is, fully hands off: Kestral presses OrcaSlicer's buttons; set from_orcaslicer_printer "
-         "when print_setup lists the printer so its status can be read too) or bambu_connect; bambu_lan is fully automatic but needs LAN only + Developer mode on the "
-         "printer, which turns off Bambu Handy and the cloud, so only suggest it if they want that; other printers: "
+         "and the filament, e.g. \"PLA basic A1M\") and pass them to slice; (3) no printer connection: for Bambu Lab printers "
+         "suggest bambu_lan first (Kestral talks to the printer directly, no Bambu software; it needs LAN only + Developer mode on the "
+         "printer, which turns off Bambu Handy and the cloud; set from_orcaslicer_printer when print_setup lists the printer). "
+         "bambu_orca (Bambu's network plugin from OrcaSlicer) and bambu_connect are optional routes for users who want to keep "
+         "the printer in its normal mode; other printers: "
          "OctoPrint, Klipper (moonraker) or PrusaLink with the printer's IP and API key.\n"
          "- Never ask the user to type an access code or API key into this chat: they can enter it in Preferences > "
          "3D printer, or it can come from OrcaSlicer (from_orcaslicer_printer).\n\n";
@@ -1027,8 +1058,79 @@ std::string App::aiRunTool(const std::string& name, const std::string& argsJson)
         d.set("name", doc_.name);
         d.set("units", "mm");
         Value bodies = Value::array();
+        std::string under = a["under"].asString();
+        while (!under.empty() && under.back() == '/') under.pop_back();
+        std::vector<uint32_t> ids;
         for (auto& [id, b] : doc_.bodies) {
             if (!doc_.isBodyAlive(b)) continue;
+            if (!under.empty()) {
+                std::string p = aiBodyPath(id);
+                if (p != under && p.rfind(under + "/", 0) != 0) continue;
+            }
+            ids.push_back(id);
+        }
+        const size_t kMaxListed = 80;
+        bool overview = ids.size() > kMaxListed;
+        d.set("body_count", (int)ids.size());
+        if (overview) {
+            // Too many bodies to list one by one (the reply would fill the model's window): the
+            // components with their body counts and extents, and the biggest bodies.
+            struct Comp { int n = 0; Aabb bb; };
+            std::map<std::string, Comp> comps;
+            std::vector<std::pair<float, uint32_t>> bySize;
+            Aabb all;
+            int depthBase = under.empty() ? 0 : (int)std::count(under.begin(), under.end(), '/') + 1;
+            for (uint32_t id : ids) {
+                const Body& b = doc_.bodies.at(id);
+                std::string p = aiBodyPath(id);
+                // The component one or two levels below where we look.
+                std::vector<std::string> segs;
+                size_t st = 0;
+                for (size_t q = p.find('/'); q != std::string::npos; q = p.find('/', st)) { segs.push_back(p.substr(st, q - st)); st = q + 1; }
+                std::string key;
+                for (int k = 0; k < std::min((int)segs.size(), depthBase + 2); ++k) key += (key.empty() ? "" : "/") + segs[(size_t)k];
+                if (key.empty()) key = "(top level bodies)";
+                auto pit = doc_.parts.find(b.partId);
+                Aabb bb;
+                if (pit != doc_.parts.end() && pit->second.mesh) bb = pit->second.mesh->bounds.transformed(b.xform);
+                Comp& c = comps[key];
+                c.n++;
+                c.bb.add(bb);
+                all.add(bb);
+                bySize.push_back({bb.valid() ? bb.diag() : 0.f, id});
+            }
+            Value cl = Value::array();
+            for (auto& [k, c] : comps) {
+                Value co = Value::object();
+                co.set("component", k);
+                co.set("bodies", c.n);
+                if (c.bb.valid()) {
+                    glm::vec3 sz = c.bb.max - c.bb.min, ce = c.bb.center();
+                    char buf[160];
+                    std::snprintf(buf, sizeof buf, "%.1f x %.1f x %.1f", sz.x, sz.y, sz.z);
+                    co.set("size_mm", buf);
+                    std::snprintf(buf, sizeof buf, "%.1f, %.1f, %.1f", ce.x, ce.y, ce.z);
+                    co.set("center", buf);
+                }
+                cl.push(co);
+                if (cl.size() >= 120) break;
+            }
+            d.set("components", cl);
+            if (all.valid()) {
+                glm::vec3 sz = all.max - all.min;
+                char buf[160];
+                std::snprintf(buf, sizeof buf, "%.1f x %.1f x %.1f", sz.x, sz.y, sz.z);
+                d.set("overall_size_mm", buf);
+            }
+            std::sort(bySize.begin(), bySize.end(), [](auto& x, auto& y) { return x.first > y.first; });
+            ids.clear();
+            for (size_t i = 0; i < bySize.size() && i < 30; ++i) ids.push_back(bySize[i].second);
+            d.set("note", "This design has " + std::to_string(bySize.size()) +
+                              " bodies: shown are its components and the 30 biggest bodies. Call get_design with under set to a component path "
+                              "to list the bodies inside it.");
+        }
+        for (uint32_t id : ids) {
+            const Body& b = doc_.bodies.at(id);
             Value bo = Value::object();
             bo.set("id", (int)id);
             bo.set("path", aiBodyPath(id));
@@ -1036,7 +1138,7 @@ std::string App::aiRunTool(const std::string& name, const std::string& argsJson)
             bo.set("color", hexColor(b.color));
             if (!b.mat.name.empty()) bo.set("material", b.mat.name);
             auto pit = doc_.parts.find(b.partId);
-            if (pit != doc_.parts.end() && pit->second.shape) {
+            if (!overview && pit != doc_.parts.end() && pit->second.shape) {
                 try {
                     ShapePtr sh = pit->second.shape;
                     glm::mat3 L(b.xform);
@@ -1079,9 +1181,12 @@ std::string App::aiRunTool(const std::string& name, const std::string& argsJson)
             bo.set("solid", pit != doc_.parts.end() && (bool)pit->second.shape);
             bodies.push(bo);
         }
-        d.set("bodies", bodies);
+        d.set(overview ? "biggest_bodies" : "bodies", bodies);
         Value tl = Value::array();
-        for (int i = 0; i < (int)doc_.timeline.size(); ++i) {
+        // Long timelines: the last 60 steps (the rest are older).
+        int tl0 = std::max(0, (int)doc_.timeline.size() - 60);
+        if (tl0 > 0) d.set("timeline_note", std::to_string(tl0) + " older steps not shown");
+        for (int i = tl0; i < (int)doc_.timeline.size(); ++i) {
             auto& f = doc_.timeline[i];
             std::string s = f.name + (f.suppressed ? " (suppressed)" : "") + (f.failed ? " (FAILED: " + f.error + ")" : "") +
                             (i >= doc_.markerPos ? " (rolled back)" : "");
@@ -1725,13 +1830,15 @@ const char* kSliceTools[] = {"print_setup", "slice", "slice_view", "slice_tab", 
 // Words people use for a tool that are not in its name.
 struct Syn { const char* word; const char* tools; };
 const Syn kSyn[] = {
+    {"illustration", "export_illustration"}, {"exploded", "export_illustration"}, {"instructions", "export_illustration"},
+    {"poster", "export_illustration"}, {"render", "export_illustration"}, {"svg", "export_illustration"}, {"png", "export_illustration"},
     {"screenshot", "look_at_design"}, {"look", "look_at_design"}, {"check", "look_at_design"}, {"picture", "look_at_design"},
     {"photo", "look_at_design"}, {"image", "look_at_design"}, {"see", "look_at_design"},
     {"print", "print_setup slice slice_view start_print find_slice_settings"}, {"slice", "print_setup slice slice_view slice_tab find_slice_settings"},
     {"layer", "slice_view find_slice_settings"}, {"infill", "slice_view find_slice_settings"}, {"wall", "slice_view find_slice_settings"},
     {"brim", "slice_view find_slice_settings"}, {"support", "slice_view find_slice_settings"}, {"filament", "slice_tab"}, {"ams", "slice_tab printer_device"},
     {"plate", "slice_view slice_tab"}, {"printer", "printer_status printer_device set_printer"}, {"nozzle", "printer_device slice_tab"},
-    {"camera", "printer_device"}, {"temperature", "printer_device find_slice_settings"}, {"pause", "printer_control"}, {"stop", "printer_control"},
+    {"camera", "printer_camera printer_device"}, {"temperature", "printer_device find_slice_settings"}, {"pause", "printer_control"}, {"stop", "printer_control"},
     {"colour", "set_color"}, {"color", "set_color"}, {"material", "set_appearance"}, {"wood", "set_appearance"}, {"metal", "set_appearance"},
     {"appearance", "set_appearance"}, {"look", "set_appearance"}, {"hole", "create_hole"}, {"round", "fillet full_round"}, {"bevel", "chamfer"},
     {"pattern", "rect_pattern circular_pattern pattern_on_path"}, {"array", "rect_pattern circular_pattern"}, {"text", "emboss"}, {"engrave", "emboss"},
@@ -2289,67 +2396,11 @@ void App::aiSend(const std::string& textIn, bool showLine, std::vector<std::shar
         // look_at_design: renders the design here (off the main thread) and hands the picture to the model,
         // or to the helper with the model's question.
         auto lookAtDesign = [&](const std::string& argsJson, AiTurn& tr) {
-            Value a = Value::parse(argsJson);
-            std::vector<std::string> views;
-            for (auto& v : a["views"].items()) views.push_back(lower(v.asString()));
-            if (views.empty()) views = {"iso", "front", "top", "right"};
-            if (views.size() > 8) views.resize(8);
-            std::vector<std::string> bodies;
-            for (auto& b : a["bodies"].items()) bodies.push_back(b.asString());
-            std::string question = a["question"].asString();
+            std::string question = Value::parse(argsJson)["question"].asString();
             stage("Taking a picture of the design");
-            auto prom = std::make_shared<std::promise<AiShotScene>>();
-            auto fut = prom->get_future();
-            post([this, prom, bodies] { prom->set_value(aiShotScene(bodies)); });
-            AiShotScene sc;
-            for (;;) {
-                if (cancel->load()) { tr.text = "Stopped."; return; }
-                if (fut.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready) { sc = fut.get(); break; }
-            }
-            if (sc.items.empty()) { tr.text = "Nothing to look at: no visible bodies" + (sc.missing.empty() ? std::string(".") : " (not found: " + sc.missing + ")."); return; }
-            // Views and their directions (from the model toward the camera) and screen up.
-            auto dirFor = [&](const std::string& v, glm::vec3& eye, glm::vec3& up) {
-                up = glm::vec3(0, 0, 1);
-                if (v == "front") eye = {0, -1, 0};
-                else if (v == "back") eye = {0, 1, 0};
-                else if (v == "right") eye = {1, 0, 0};
-                else if (v == "left") eye = {-1, 0, 0};
-                else if (v == "top") { eye = {0, 0, 1}; up = {0, 1, 0}; }
-                else if (v == "bottom") { eye = {0, 0, -1}; up = {0, 1, 0}; }
-                else if (v == "current") { eye = -sc.camFwd; up = sc.camUp; }
-                else eye = glm::normalize(glm::vec3(1, -1, 0.8f));   // iso, the home view
-            };
-            int n = (int)views.size();
-            int cols = n == 1 ? 1 : n <= 4 ? 2 : n <= 6 ? 3 : 4, rows = (n + cols - 1) / cols;
-            int pw = n == 1 ? 960 : 560, ph = n == 1 ? 720 : 480;
-            int W = cols * pw + (cols - 1) * 4, H = rows * ph + (rows - 1) * 4;
-            std::vector<uint8_t> sheet((size_t)W * H * 4, 255);
-            for (size_t i = 0; i < sheet.size(); i += 4) { sheet[i] = 60; sheet[i + 1] = 62; sheet[i + 2] = 68; }   // gaps between panels
-            for (int k = 0; k < n; ++k) {
-                glm::vec3 eye, up;
-                dirFor(views[(size_t)k], eye, up);
-                auto px = thumb::renderView(sc.items, pw, ph, eye, up);
-                int ox = (k % cols) * (pw + 4), oy = (k / cols) * (ph + 4);
-                for (int y = 0; y < ph; ++y)
-                    std::memcpy(&sheet[((size_t)(oy + y) * W + ox) * 4], &px[(size_t)y * pw * 4], (size_t)pw * 4);
-            }
-            if (const char* dump = std::getenv("KESTRAL_SHOT_DUMP")) thumb::writePng(dump, sheet, W, H);   // developer check
-            AiImageBuilt built = aiBuildImage(sheet.data(), W, H);
-            std::string order;
-            for (auto& v : views) order += (order.empty() ? "" : ", ") + v;
-            // Size of what is shown, so the picture has a scale.
-            glm::vec3 lo(1e30f), hi(-1e30f);
-            for (auto& it : sc.items) {
-                const auto& v = it.mesh->verts;
-                for (size_t i = 0; i + 5 < v.size(); i += 6) {
-                    glm::vec3 p = glm::vec3(it.xform * glm::vec4(v[i], v[i + 1], v[i + 2], 1.f));
-                    lo = glm::min(lo, p);
-                    hi = glm::max(hi, p);
-                }
-            }
-            char box[160];
-            std::snprintf(box, sizeof box, "%d bodies, overall %.1f x %.1f x %.1f mm (X x Y x Z)", (int)sc.items.size(), hi.x - lo.x, hi.y - lo.y, hi.z - lo.z);
-            std::string head = "Picture of the design: " + order + " (panels left to right, then top to bottom). " + box + ".";
+            AiImageBuilt built;
+            std::string head, order, perr;
+            if (!designPicture(argsJson, post, cancel, built, head, order, perr)) { tr.text = perr; return; }
             post([this, built, order]() mutable {
                 aiImageTexture(built);
                 AiLine ln{6, "Looked at the design: " + order};
@@ -2589,6 +2640,62 @@ void App::aiSend(const std::string& textIn, bool showLine, std::vector<std::shar
                     tr.callId = c.id;
                     tr.toolName = c.name;
                     tr.text = result;
+                    history.push_back(tr);
+                    continue;
+                }
+                if (c.name == "export_illustration") {
+                    waitIdle();
+                    if (cancel->load()) break;
+                    stage("Drawing the illustration");
+                    std::string result = illustrationTool(c.argsJson, post, cancel, nullptr);
+                    if (cancel->load()) break;
+                    post([this, result] { aiLog("tool export_illustration", result); });
+                    AiTurn tr;
+                    tr.role = "tool";
+                    tr.callId = c.id;
+                    tr.toolName = c.name;
+                    tr.text = result;
+                    history.push_back(tr);
+                    continue;
+                }
+                if (c.name == "printer_camera") {
+                    AiTurn tr;
+                    tr.role = "tool";
+                    tr.callId = c.id;
+                    tr.toolName = c.name;
+                    stage("Looking through the printer's camera");
+                    AiImageBuilt built;
+                    std::string msg, perr;
+                    bool got = false;
+                    if (!platform::guarded("printer camera", [&] { got = cameraPicture(post, cancel, built, msg); }, perr)) msg = "Error: " + perr;
+                    if (cancel->load()) break;
+                    if (got) {
+                        post([this, built]() mutable {
+                            aiImageTexture(built);
+                            AiLine ln{6, "Looked through the printer's camera"};
+                            ln.images = {built.img};
+                            ai_.lines.push_back(ln);
+                            ai_.scroll = true;
+                        });
+                        if (mainSees()) {
+                            tr.text = msg;
+                            tr.images = {built.img};
+                        } else if (visionModel.empty() || visionModel == cfg.model) {
+                            tr.text = msg + " You cannot see pictures and no picture helper is set in the assistant settings.";
+                        } else {
+                            std::string q = Value::parse(c.argsJson)["question"].asString(), derr;
+                            std::string desc = describe({built.img},
+                                "You are the eyes of a 3D printing assistant. The picture is from the camera inside the user's 3D printer. "
+                                "Answer the question first, then describe what you see: the print on the plate, how far along it looks, and "
+                                "any problem (spaghetti, warping, a part that came loose, stringing, an empty or dirty plate). Be short.",
+                                msg + "\nThe assistant asks: " + (q.empty() ? "How is the print going?" : q), derr);
+                            if (derr == "\x01") { tr.text = "Stopped."; }
+                            else tr.text = derr.empty() ? msg + " " + visionModel + " looked at it for you:\n" + desc : msg + " " + derr;
+                        }
+                    } else {
+                        tr.text = msg;
+                    }
+                    post([this, r = tr.text] { aiLog("tool printer_camera", r); });
                     history.push_back(tr);
                     continue;
                 }
@@ -3896,6 +4003,27 @@ void App::drawAssistantPrefs() {
         if (ImGui::InputTextMultiline("##custom", &settings_.aiCustomPrompt, ImVec2(-1, 90 * S), ImGuiInputTextFlags_WordWrap)) settings_.save(settingsPath_);
         ImGui::TextDisabled("For example: \"Always use PETG profiles\", \"Answer in German\", \"Ask before deleting bodies\".");
     }
+    drawMcpPrefs();
 }
+
+json::Value App::mcpToolList() const {
+    // Every tool at once (MCP apps load them all), except find_tools, which only matters for
+    // Kestral's own trimmed tool list.
+    Value arr = Value::array();
+    for (auto& t : kTools) {
+        if (std::string(t.name) == "find_tools") continue;
+        Value schema = Value::parse(t.schema);
+        if (!schema.isObject()) schema = Value::object();
+        if (!schema.has("type")) schema.set("type", "object");
+        Value o = Value::object();
+        o.set("name", t.name);
+        o.set("description", t.desc);
+        o.set("inputSchema", schema);
+        arr.push(o);
+    }
+    return arr;
+}
+
+bool App::mcpKnownTool(const std::string& name) { return name != "find_tools" && toolExists(name); }
 
 } // namespace kst

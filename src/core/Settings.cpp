@@ -68,6 +68,10 @@ void Settings::load(const std::string& path) {
             else if (k == "aiPageContext") aiPageContext = toBool(v);
             else if (k == "aiMainVision") aiMainVision = std::atoi(v.c_str());
             else if (k == "aiVisionModel") aiVisionModel = v;
+            else if (k == "mcpEnabled") mcpEnabled = toBool(v);
+            else if (k == "mcpPort") mcpPort = std::stoi(v);
+            else if (k == "mcpToken") mcpToken = v;
+            else if (k == "mcpReadToken") mcpReadToken = v;
             else if (k == "aiCustomPrompt") {
                 aiCustomPrompt.clear();
                 for (size_t i = 0; i < v.size(); ++i) {
@@ -159,6 +163,10 @@ void Settings::save(const std::string& path) const {
     f << "aiPageContext=" << aiPageContext << "\n";
     f << "aiMainVision=" << aiMainVision << "\n";
     f << "aiVisionModel=" << aiVisionModel << "\n";
+    f << "mcpEnabled=" << mcpEnabled << "\n";
+    f << "mcpPort=" << mcpPort << "\n";
+    f << "mcpToken=" << mcpToken << "\n";
+    f << "mcpReadToken=" << mcpReadToken << "\n";
     {
         std::string esc;
         for (char c : aiCustomPrompt) {
