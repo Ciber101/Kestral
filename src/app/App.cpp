@@ -31,7 +31,7 @@ namespace kst {
 
 namespace {
 App* g_app = nullptr;
-const char* kVersion = "0.4.0";
+const char* kVersion = "0.5.0";
 
 void cbCursor(GLFWwindow*, double, double) { if (g_app) g_app->activity(); }
 void cbButton(GLFWwindow*, int, int, int) { if (g_app) g_app->activity(); }

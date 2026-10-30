@@ -3,6 +3,7 @@
 #include "app/App.h"
 #include "ui/UiItems.h"
 #include "app/Materials.h"
+#include "app/Mcp.h"
 #include "core/Log.h"
 #include "core/SaveLoad.h"
 #include "kernel/Features.h"
@@ -2070,7 +2071,7 @@ void App::drawSettings() {
     }
     } else {
         drawDonateBanner();
-        ImGui::TextDisabled("Kestral 0.4.0   GPU: %s   OpenCASCADE %s", vk_.gpuName.c_str(), kernel::kernelVersion().c_str());
+        ImGui::TextDisabled("Kestral %s   GPU: %s   OpenCASCADE %s", kestralVersion(), vk_.gpuName.c_str(), kernel::kernelVersion().c_str());
         // The license notice (GNU AGPL v3) and where the source is.
         ImGui::Spacing();
         ImGui::TextWrapped("Kestral is free software: you can share and change it under the GNU Affero General Public License v3 "
