@@ -130,6 +130,8 @@ private:
     VkPipelineLayout meshLayout_ = VK_NULL_HANDLE, bgLayout_ = VK_NULL_HANDLE, gridLayout_ = VK_NULL_HANDLE;
     VkPipeline meshPipe_ = VK_NULL_HANDLE, idPipe_ = VK_NULL_HANDLE, linePipe_ = VK_NULL_HANDLE, bgPipe_ = VK_NULL_HANDLE, gridPipe_ = VK_NULL_HANDLE;
     VkPipeline glassBackPipe_ = VK_NULL_HANDLE, glassFrontPipe_ = VK_NULL_HANDLE;   // see through pass
+    VkPipeline xrayPipe_ = VK_NULL_HANDLE;   // hovered / selected parts through what hides them
+    bool anyHighlight_ = false;              // some instance is selected or has selected faces
 
     // Geometry (all unique meshes packed in shared buffers)
     GpuBuffer vbo_, ibo_, faceBuf_, edgeVbo_;

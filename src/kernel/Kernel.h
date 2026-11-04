@@ -50,9 +50,16 @@ struct FeatureCacheData {
 };
 bool saveFeatureCache(uint64_t key, const FeatureCacheData& d);
 bool loadFeatureCache(uint64_t key, FeatureCacheData& d);
+// A step result kept with a design (its .kestral_versions/<name>/pins/<step id>.kfc): used in place
+// of computing that step, so a rebuild gives exactly the geometry that was saved.
+bool loadPinnedResult(const std::string& file, FeatureCacheData& d);
+// Writes one step's result to a file of its own (the saved shapes kept with a design).
+bool saveStepResult(const std::string& file, const FeatureCacheData& d);
+// When Features.cpp was built (part of the feature cache key, so a kernel fix is never hidden).
+uint64_t featuresBuildStamp();
 
 // Display tessellation of a B-rep (faces with per-triangle face ids plus feature edges).
-MeshPtr tessellate(const ShapeHandle& shape, double relDeflection = 0.0005, double angDeflection = 0.2);
+MeshPtr tessellate(const ShapeHandle& shape, double relDeflection = 0.0005, double angDeflection = 0.1);
 
 struct ExportItem {
     ShapePtr shape;

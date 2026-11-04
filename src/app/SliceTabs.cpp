@@ -9,7 +9,25 @@
 namespace kst {
 
 std::string App::sliceDocKey() const {
-    return doc_.path.empty() ? "untitled:" + doc_.name : doc_.path;
+    return doc_.path.empty() ? "untitled:" + doc_.name + "#" + std::to_string(doc_.uid) : doc_.path;
+}
+
+void App::sliceFollowDesign() {
+    // The AI's slicing tools work on the open design: bring its slice tab in front (making one
+    // when it has none), like opening the Slice tab does. Without this a new design tab kept
+    // slicing the plate of the design before it.
+    std::string key = sliceDocKey();
+    if (sliceActive_ >= 0 && sliceTabOwns(sliceActive_, key)) return;
+    int tab = sliceTabFor(key);
+    if (tab < 0) {
+        SliceDocState d;
+        d.key = key;
+        d.name = doc_.name;
+        sliceDocs_.push_back(std::move(d));
+        tab = (int)sliceDocs_.size() - 1;
+    }
+    sliceActivate(tab);
+    if (!slice_.choicesLoaded) sliceLoadChoices();
 }
 
 int App::sliceTabFor(const std::string& key) const {

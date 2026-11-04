@@ -236,7 +236,36 @@ void App::updateHover() {
     }
     uint32_t body = hoverBody_;
     if (body && !doc_.bodies.count(body)) body = 0;
-    uint32_t edgeBody = body ? pickBodyFor(body) : 0;
+    // The body under the cursor first. Then bodies whose outline is right next to the cursor, so a
+    // silhouette edge can be picked from just outside the part (the face pick misses there).
+    std::vector<uint32_t> edgeCands;
+    if (body) edgeCands.push_back(pickBodyFor(body));
+    if (filt & PickEdge) {
+        glm::dmat4 vpAll = viewProj();
+        ImVec2 ds = ImGui::GetIO().DisplaySize;
+        float pad = 12.f * S;
+        for (auto& [id, b] : doc_.bodies) {
+            if (edgeCands.size() >= 12) break;
+            if (!bodyShown(b) || id == body) continue;
+            auto pit = doc_.parts.find(b.partId);
+            if (pit == doc_.parts.end() || !pit->second.mesh) continue;
+            Aabb bb = pit->second.mesh->bounds.transformed(b.xform);
+            if (!bb.valid()) continue;
+            float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+            bool behind = false;
+            for (int c = 0; c < 8; ++c) {
+                glm::dvec4 q = vpAll * glm::dvec4((c & 1) ? bb.max.x : bb.min.x, (c & 2) ? bb.max.y : bb.min.y, (c & 4) ? bb.max.z : bb.min.z, 1.0);
+                if (q.w <= 1e-9) { behind = true; break; }
+                float sx = (float)((q.x / q.w * 0.5 + 0.5) * ds.x), sy = (float)((q.y / q.w * 0.5 + 0.5) * ds.y);
+                x0 = std::min(x0, sx); x1 = std::max(x1, sx); y0 = std::min(y0, sy); y1 = std::max(y1, sy);
+            }
+            if (behind || m.x < x0 - pad || m.x > x1 + pad || m.y < y0 - pad || m.y > y1 + pad) continue;
+            // Only when the cursor is near the outline, not over the middle of another part.
+            if (body && m.x > x0 + pad && m.x < x1 - pad && m.y > y0 + pad && m.y < y1 - pad) continue;
+            edgeCands.push_back(pickBodyFor(id));
+        }
+    }
+    for (uint32_t edgeBody : edgeCands)
     if ((filt & PickEdge) && edgeBody) {
         auto bit = doc_.bodies.find(edgeBody);
         const auto* polys = bit != doc_.bodies.end() ? bodyEdges(edgeBody) : nullptr;
@@ -246,13 +275,13 @@ void App::updateHover() {
             // Sliver edges from imported files often sit right on a big edge on screen. Among
             // edges inside the pick radius, the more prominent (longer on screen) one wins,
             // so clicking a long edge never grabs the tiny one lying beside it.
-            float radius = 7.f * S;
+            float radius = 10.f * S;
             int bestE = -1;
             float bestDist = 0.f, bestLen = 0.f;
             // What the eye actually sees under the cursor: edges behind that surface are skipped, so
             // a click on a face never grabs a line on the far side of the model.
             glm::dvec3 ro, rd, hp;
-            bool haveHit = rayAt(m, ro, rd) && hitPoint(body, hoverFace_, m, hp);
+            bool haveHit = edgeBody == pickBodyFor(body) && body && rayAt(m, ro, rd) && hitPoint(body, hoverFace_, m, hp);
             double tHit = 0, tol = 0;
             if (haveHit) {
                 rd = glm::normalize(rd);
@@ -343,12 +372,14 @@ void App::updateHover() {
                 h.hasPoint = true;
                 h.point = w;
             }
-            if (h.kind == HoverKind::Profile && body) {
-                // A body face in front of the profile wins.
+            if (h.kind == HoverKind::Profile && body && !dlg_.open) {
+                // A body face clearly in front of the profile wins. A profile just under the surface
+                // (a circle drawn where a chamfer slopes away) stays pickable, and inside the
+                // Extrude command profiles always win.
                 glm::dvec3 hp;
                 if (hitPoint(body, hoverFace_, m, hp)) {
                     double tb = glm::dot(hp - o, d);
-                    double tol = std::max(1e-3, sceneBounds_.diag() * 1e-5);
+                    double tol = std::max(1e-3, std::max(sceneBounds_.diag() * 1e-5, bestT * 0.03));
                     if (tb < bestT - tol) h = HoverInfo{};
                 }
             }
@@ -641,27 +672,77 @@ void App::drawInteractionOverlay() {
     }
 
     // Orbit pivot dot (Fusion shows a small green dot where it orbits around).
-    if (drag_ == Drag::Orbit && orbitPivotValid_) {
+    if (drag_ == Drag::Orbit && (orbitPivotValid_ || !settings_.orbitAtPress) && dragDist_ > 3.f * S) {
         ImVec2 q;
-        if (worldToScreen(orbitPivot_, q)) {
+        glm::dvec3 at = settings_.orbitAtPress && orbitPivotValid_ ? orbitPivot_ : orbitCenterSet_ ? orbitCenter_ : glm::dvec3(cam_.target);
+        if (worldToScreen(at, q)) {
             dl->AddCircleFilled(q, 5 * S, ui::th(IM_COL32(40, 190, 80, 230)));
             dl->AddCircle(q, 5 * S, ui::th(IM_COL32(255, 255, 255, 230)), 0, 1.5f * S);
         }
     }
     drawManipulator();
     drawMoveTriad();
+    drawAlignSnaps();
 }
 
 // ===================================================================== manipulator (drag arrow)
 
-void App::setManip(int target, const glm::dvec3& origin, const glm::dvec3& dir, double value) {
+// Every flat face square to the arrow, as the value that puts the arrow's tip on its plane. Read
+// once when the drag starts (the faces do not move while dragging). Alt while dragging skips it.
+void App::collectManipSnaps() {
+    manip_.snaps.clear();
+    size_t faces = 0;
+    for (auto& [id, b] : doc_.bodies) {
+        if (!bodyShown(b)) continue;
+        auto pit = doc_.parts.find(b.partId);
+        if (pit == doc_.parts.end() || !pit->second.shape) continue;
+        uint32_t nf = kernel::faceCount(pit->second.shape);
+        if (faces + nf > 6000) break;
+        faces += nf;
+        glm::dmat4 xf(b.xform);
+        for (uint32_t f = 0; f < nf; ++f) {
+            glm::dvec3 c, n;
+            bool planar = false;
+            if (!kernel::faceInfo(pit->second.shape, f, c, n, planar) || !planar) continue;
+            glm::dvec3 wn = glm::normalize(glm::dmat3(xf) * n);
+            if (std::abs(glm::dot(wn, manip_.dir)) < 0.9999) continue;
+            glm::dvec3 wc = glm::dvec3(xf * glm::dvec4(c, 1.0));
+            double v = glm::dot(wc - manip_.origin, manip_.dir);
+            if (std::abs(v) > 1e-6) manip_.snaps.push_back(v);
+        }
+    }
+}
+
+void App::setManip(int target, const glm::dvec3& origin, const glm::dvec3& dir, double value, bool atMouse) {
     if (manip_.dragging && manip_.target == target) return;   // keep the live drag stable
     manip_.active = true;
     manip_.minValue = -1e300;
     manip_.target = target;
-    manip_.origin = origin;
     double l = glm::length(dir);
     manip_.dir = l > 1e-12 ? dir / l : glm::dvec3(0, 0, 1);
+    // The arrow starts where the mouse is on the face (the point under the cursor, slid onto the
+    // face's plane), not at the face's center. Worked out once per command so it stays put.
+    uint32_t fid = dlg_.open ? dlg_.featureId : tdlg_.open ? tdlg_.featureId : 0;
+    if (!atMouse) {
+        manipShift_ = glm::dvec3(0);
+    } else if (manipShiftFid_ == UINT32_MAX) {   // once per command (reset when its dialog closes)
+        manipShiftFid_ = fid;
+        manipShift_ = glm::dvec3(0);
+        glm::dvec3 o, d;
+        ImVec2 m = ImGui::GetIO().MousePos;
+        if (viewportHovered_ && rayAt(m, o, d)) {
+            double den = glm::dot(d, manip_.dir);
+            if (std::abs(den) > 1e-6) {
+                double t = glm::dot(origin - o, manip_.dir) / den;
+                glm::dvec3 hit = o + d * t;
+                glm::dvec3 off = hit - origin;
+                off -= manip_.dir * glm::dot(off, manip_.dir);
+                double lim = sceneBounds_.valid() ? sceneBounds_.diag() * 0.5 : 1e3;
+                if (t > 0 && glm::length(off) < lim) manipShift_ = off;
+            }
+        }
+    }
+    manip_.origin = origin + manipShift_;
     manip_.value = value;
 }
 
@@ -709,6 +790,7 @@ void App::drawManipulator() {
         if (axisParam(t)) {
             manip_.dragging = true;
             manip_.grab = t - manip_.value;
+            collectManipSnaps();
         }
     }
     if (manip_.dragging) {
@@ -725,6 +807,13 @@ void App::drawManipulator() {
                 double p10 = std::pow(10.0, std::floor(std::log10(std::max(raw, 1e-6))));
                 double step = raw / p10 < 2 ? p10 : raw / p10 < 5 ? 2 * p10 : 5 * p10;
                 v = std::round(v / step) * step;
+                // Snap onto another face's plane when the arrow comes near it (about 10 px).
+                manip_.snapped = false;
+                if (settings_.manipSnap && !io.KeyAlt) {
+                    double best = wpp * 10.0;
+                    for (double s : manip_.snaps)
+                        if (std::abs((t - manip_.grab) - s) < best) { best = std::abs((t - manip_.grab) - s); v = s; manip_.snapped = true; }
+                }
                 v = std::max(v, manip_.minValue);
                 if (std::abs(v - manip_.value) > 1e-12) {
                     manip_.value = v;
@@ -733,7 +822,7 @@ void App::drawManipulator() {
             }
             // Value readout next to the arrow.
             char buf[48];
-            std::snprintf(buf, sizeof buf, "%.4g mm", manip_.value);
+            std::snprintf(buf, sizeof buf, manip_.snapped ? "%.4g mm  (on a face)" : "%.4g mm", manip_.value);
             ImVec2 ts = ImGui::CalcTextSize(buf);
             ImVec2 p(m.x + 18 * S, m.y + 8 * S);
             dl->AddRectFilled(ImVec2(p.x - 4 * S, p.y - 2 * S), ImVec2(p.x + ts.x + 4 * S, p.y + ts.y + 2 * S), ui::th(IM_COL32(255, 255, 255, 235)), 3 * S);
@@ -743,7 +832,97 @@ void App::drawManipulator() {
     }
 }
 
-// Move / Copy: three axis arrows on the moved bodies (Fusion's triad, translation part).
+namespace {
+// R = Rz * Ry * Rx (the Move step's X, then Y, then Z turn), back to the three angles in degrees.
+void eulerXYZ(const glm::dmat4& M, double& rx, double& ry, double& rz) {
+    double sy = std::clamp(-M[0][2], -1.0, 1.0);
+    ry = std::asin(sy);
+    if (std::abs(sy) < 1.0 - 1e-9) {
+        rx = std::atan2(M[1][2], M[2][2]);
+        rz = std::atan2(M[0][1], M[0][0]);
+    } else {
+        rx = 0;
+        rz = std::atan2(-M[1][0], M[1][1]);
+    }
+    rx = glm::degrees(rx); ry = glm::degrees(ry); rz = glm::degrees(rz);
+}
+
+glm::dmat4 eulerRot(double rx, double ry, double rz) {
+    return glm::rotate(glm::dmat4(1.0), glm::radians(rz), glm::dvec3(0, 0, 1)) *
+           glm::rotate(glm::dmat4(1.0), glm::radians(ry), glm::dvec3(0, 1, 0)) *
+           glm::rotate(glm::dmat4(1.0), glm::radians(rx), glm::dvec3(1, 0, 0));
+}
+
+std::string angleText(double v) {
+    v = std::round(v * 1e4) / 1e4;
+    if (std::abs(v) < 1e-9) v = 0;
+    char b[32];
+    std::snprintf(b, sizeof b, "%.6g", v);
+    return b;
+}
+} // namespace
+
+// The one point every picked body turns about (the Move step's pivot), when they share one.
+bool App::moveSharedPivot(glm::dvec3& pivot) {
+    int fi = doc_.featureIndex(tdlg_.featureId);
+    if (fi < 0 || !doc_.timeline[fi].move) return false;
+    const MoveParams& mv = *doc_.timeline[fi].move;
+    if (!mv.pxExpr.empty() || !mv.pyExpr.empty() || !mv.pzExpr.empty()) {
+        auto ev = [&](const std::string& e) {
+            try { return e.empty() ? 0.0 : peval::eval(e, doc_.params); } catch (const std::runtime_error&) { return 0.0; }
+        };
+        pivot = {ev(mv.pxExpr), ev(mv.pyExpr), ev(mv.pzExpr)};
+        return true;
+    }
+    if (!mv.together && tdlg_.targets.size() > 1) return false;
+    Aabb all;
+    for (auto& t : tdlg_.targets) {
+        std::vector<uint32_t> src = doc_.featureBodies(t.first);
+        if (t.second >= src.size()) continue;
+        auto sb = doc_.bodies.find(src[t.second]);
+        if (sb == doc_.bodies.end()) continue;
+        auto pit = doc_.parts.find(sb->second.partId);
+        if (pit != doc_.parts.end() && pit->second.mesh) all.add(pit->second.mesh->bounds.transformed(sb->second.xform));
+    }
+    if (!all.valid()) return false;
+    pivot = glm::dvec3(all.center());
+    return true;
+}
+
+// Places the preview bodies from the dialog's values right away (a move is a pure transform), the
+// way the recompute will place them a moment later.
+void App::previewMove() {
+    int fi = doc_.featureIndex(tdlg_.featureId);
+    if (fi < 0 || !doc_.timeline[fi].move || tdlg_.option == 1) return;
+    const MoveParams& mv = *doc_.timeline[fi].move;
+    if (mv.hasMat) return;
+    auto ev = [&](const char* e) {
+        try { return e[0] ? peval::eval(e, doc_.params) : 0.0; } catch (const std::runtime_error&) { return 0.0; }
+    };
+    glm::dmat4 T = glm::translate(glm::dmat4(1.0), glm::dvec3(ev(tdlg_.v1), ev(tdlg_.v2), ev(tdlg_.v3)));
+    glm::dmat4 R = eulerRot(ev(tdlg_.v4), ev(tdlg_.v5), ev(tdlg_.v6));
+    glm::dvec3 shared;
+    bool haveShared = moveSharedPivot(shared);
+    std::vector<uint32_t> outs = doc_.featureBodies(tdlg_.featureId);
+    for (size_t k = 0; k < outs.size() && k < tdlg_.targets.size(); ++k) {
+        std::vector<uint32_t> src = doc_.featureBodies(tdlg_.targets[k].first);
+        if (tdlg_.targets[k].second >= src.size()) continue;
+        auto sb = doc_.bodies.find(src[tdlg_.targets[k].second]);
+        auto ob = doc_.bodies.find(outs[k]);
+        if (sb == doc_.bodies.end() || ob == doc_.bodies.end()) continue;
+        glm::dvec3 pv = shared;
+        if (!haveShared) {
+            auto pit = doc_.parts.find(sb->second.partId);
+            if (pit == doc_.parts.end() || !pit->second.mesh) continue;
+            pv = glm::dvec3(pit->second.mesh->bounds.transformed(sb->second.xform).center());
+        }
+        glm::mat4 M(T * glm::translate(glm::dmat4(1.0), pv) * R * glm::translate(glm::dmat4(1.0), -pv));
+        glm::mat4 want = M * sb->second.xform;
+        if (ob->second.xform != want) { ob->second.xform = want; markSceneDirty(); }
+    }
+}
+
+// Move / Copy: three axis arrows and three rotation rings on the moved bodies (Fusion's triad).
 void App::drawMoveTriad() {
     if (!(tdlg_.open && tdlg_.type == FeatureType::Move)) { triad_ = Triad{}; return; }
     // Where the bodies are now: the bounds of the Move feature's own outputs.
@@ -759,7 +938,16 @@ void App::drawMoveTriad() {
     const float S = uiScale_;
     ImGuiIO& io = ImGui::GetIO();
     ImVec2 m = io.MousePos;
-    glm::dvec3 c = triad_.dragging ? triad_.center : glm::dvec3(bb.center());
+    // On the pivot (moved along with the bodies), so the rings turn about the point they circle.
+    glm::dvec3 home = glm::dvec3(bb.center()), pivot;
+    bool scaleMode = tdlg_.option == 1;
+    if (!scaleMode && moveSharedPivot(pivot)) {
+        auto ev = [&](const char* e) {
+            try { return e[0] ? peval::eval(e, doc_.params) : 0.0; } catch (const std::runtime_error&) { return 0.0; }
+        };
+        home = pivot + glm::dvec3(ev(tdlg_.v1), ev(tdlg_.v2), ev(tdlg_.v3));
+    }
+    glm::dvec3 c = triad_.dragging || triad_.ring >= 0 ? triad_.center : home;
     ImVec2 c0;
     if (!worldToScreen(c, c0)) return;
     const glm::dvec3 axes[3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
@@ -774,7 +962,7 @@ void App::drawMoveTriad() {
         float dx = p.x - c0.x, dy = p.y - c0.y, l = std::hypot(dx, dy);
         if (l < 1e-3f) { tips[a] = c0; continue; }   // axis pointing at the camera
         tips[a] = ImVec2(c0.x + dx / l * 75 * S, c0.y + dy / l * 75 * S);
-        if (!triad_.dragging && distToSeg(m, c0, tips[a]) < 8 * S && viewportHovered_) hoverAxis = a;
+        if (!triad_.dragging && triad_.ring < 0 && distToSeg(m, c0, tips[a]) < 8 * S && viewportHovered_) hoverAxis = a;
     }
     for (int a = 0; a < 3; ++a) {
         bool hot = triad_.dragging ? triad_.axis == a : hoverAxis == a;
@@ -790,6 +978,102 @@ void App::drawMoveTriad() {
     dl->AddCircleFilled(c0, 5 * S, ui::th(IM_COL32(250, 250, 250, 255)));
     dl->AddCircle(c0, 5 * S, ui::th(IM_COL32(60, 60, 60, 255)), 0, 1.5f);
     if (hoverAxis >= 0) manipHovered_ = true;
+
+    // Rotation rings: drag one to turn about that world axis through the pivot.
+    int fi = doc_.featureIndex(tdlg_.featureId);
+    const MoveParams* mvp = fi >= 0 && doc_.timeline[fi].move ? doc_.timeline[fi].move.get() : nullptr;
+    bool axisTurn = mvp && !mvp->angExpr.empty() && mvp->angExpr != "0" &&
+                    (mvp->axExpr != "0" || mvp->ayExpr != "0" || mvp->azExpr != "0");
+    if (!scaleMode && mvp && !mvp->hasMat && !axisTurn) {
+        double ppu = 0;   // screen pixels per world unit at the pivot
+        for (int a = 0; a < 3; ++a) {
+            ImVec2 p;
+            if (worldToScreen(c + axes[a] * unit, p)) ppu = std::max(ppu, (double)std::hypot(p.x - c0.x, p.y - c0.y) / unit);
+        }
+        int hoverRing = -1;
+        if (ppu > 1e-9) {
+            double r = 58.0 * S / ppu;
+            const int N = 72;
+            ImVec2 pts[3][N];
+            bool ok[3] = {true, true, true};
+            float sign[3] = {1, 1, 1};
+            for (int a = 0; a < 3; ++a) {
+                glm::dvec3 u = axes[(a + 1) % 3], v = axes[(a + 2) % 3];   // u x v = the ring's axis
+                for (int i = 0; i < N && ok[a]; ++i) {
+                    double t = 2.0 * kPiD * i / N;
+                    ok[a] = worldToScreen(c + r * (std::cos(t) * u + std::sin(t) * v), pts[a][i]);
+                }
+                if (!ok[a]) continue;
+                ImVec2 pu = pts[a][0], pv = pts[a][N / 4];
+                float cr = (pu.x - c0.x) * (pv.y - c0.y) - (pu.y - c0.y) * (pv.x - c0.x);
+                sign[a] = cr >= 0 ? 1.f : -1.f;
+                // Seen edge on, a ring is a line: it cannot be dragged around.
+                float rpx = 58.f * S;
+                bool edgeOn = std::abs(cr) < 0.12f * rpx * rpx;
+                if (!triad_.dragging && triad_.ring < 0 && hoverAxis < 0 && !edgeOn && viewportHovered_) {
+                    for (int i = 0; i < N; ++i)
+                        if (distToSeg(m, pts[a][i], pts[a][(i + 1) % N]) < 6 * S) { hoverRing = a; break; }
+                }
+            }
+            for (int a = 0; a < 3; ++a) {
+                if (!ok[a]) continue;
+                bool hot = triad_.ring >= 0 ? triad_.ring == a : hoverRing == a;
+                ImU32 col = hot ? ui::th(IM_COL32(255, 160, 40, 255)) : cols[a];
+                dl->AddPolyline(pts[a], N, col, ImDrawFlags_Closed, (hot ? 3.f : 2.f) * S);
+            }
+            if (hoverRing >= 0) manipHovered_ = true;
+
+            auto screenAngle = [&] { return std::atan2((double)(m.y - c0.y), (double)(m.x - c0.x)); };
+            if (hoverRing >= 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !mm_.open) {
+                auto ev = [&](const char* e) {
+                    try { return e[0] ? peval::eval(e, doc_.params) : 0.0; } catch (const std::runtime_error&) { return 0.0; }
+                };
+                triad_.ring = hoverRing;
+                triad_.center = c;
+                triad_.ringStart = screenAngle();
+                triad_.startVal = 0;
+                triad_.ringSign = sign[hoverRing];
+                triad_.rot0 = eulerRot(ev(tdlg_.v4), ev(tdlg_.v5), ev(tdlg_.v6));
+            }
+        }
+        if (triad_.ring >= 0) {
+            if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                triad_.ring = -1;
+                return;
+            }
+            // Summed frame by frame, so a drag can go round more than half a turn.
+            double now = std::atan2((double)(m.y - c0.y), (double)(m.x - c0.x));
+            double d = now - triad_.ringStart;
+            while (d > kPiD) d -= 2 * kPiD;
+            while (d < -kPiD) d += 2 * kPiD;
+            triad_.ringStart = now;
+            triad_.startVal += d;
+            // Whole degrees; Shift snaps to 15.
+            double deg = glm::degrees(triad_.startVal) * triad_.ringSign;
+            double step = io.KeyShift ? 15.0 : 1.0;
+            deg = std::round(deg / step) * step;
+            glm::dmat4 R = glm::rotate(glm::dmat4(1.0), glm::radians(deg), axes[triad_.ring]) * triad_.rot0;
+            double rx, ry, rz;
+            eulerXYZ(R, rx, ry, rz);
+            std::string sx = angleText(rx), sy = angleText(ry), sz = angleText(rz);
+            if (sx != tdlg_.v4 || sy != tdlg_.v5 || sz != tdlg_.v6) {
+                std::snprintf(tdlg_.v4, sizeof tdlg_.v4, "%s", sx.c_str());
+                std::snprintf(tdlg_.v5, sizeof tdlg_.v5, "%s", sy.c_str());
+                std::snprintf(tdlg_.v6, sizeof tdlg_.v6, "%s", sz.c_str());
+                applyToolDialog();
+            }
+            previewMove();
+            char buf[48];
+            std::snprintf(buf, sizeof buf, "%s %g deg", triad_.ring == 0 ? "X" : triad_.ring == 1 ? "Y" : "Z", deg);
+            ImVec2 ts = ImGui::CalcTextSize(buf);
+            ImVec2 p(m.x + 18 * S, m.y + 8 * S);
+            dl->AddRectFilled(ImVec2(p.x - 4 * S, p.y - 2 * S), ImVec2(p.x + ts.x + 4 * S, p.y + ts.y + 2 * S), ui::th(IM_COL32(255, 255, 255, 235)), 3 * S);
+            dl->AddText(p, ui::th(IM_COL32(30, 36, 46, 255)), buf);
+            manipHovered_ = true;
+            activity();
+            return;
+        }
+    }
 
     auto axisParam = [&](int a, double& t) {
         glm::dvec3 o, d;
@@ -831,24 +1115,7 @@ void App::drawMoveTriad() {
                 std::snprintf(bufs[triad_.axis], sizeof tdlg_.v1, "%s", nv.c_str());
                 applyToolDialog();
             }
-            // Real time: a move is a pure transform, so place the preview bodies right now instead
-            // of waiting for the recompute (which confirms the same place a moment later).
-            {
-                double off[3] = {0, 0, 0};
-                for (int a = 0; a < 3; ++a)
-                    try { off[a] = peval::eval(bufs[a], doc_.params); } catch (const std::runtime_error&) {}
-                glm::mat4 T = glm::translate(glm::mat4(1.f), glm::vec3((float)off[0], (float)off[1], (float)off[2]));
-                std::vector<uint32_t> outs = doc_.featureBodies(tdlg_.featureId);
-                for (size_t k = 0; k < outs.size() && k < tdlg_.targets.size(); ++k) {
-                    std::vector<uint32_t> src = doc_.featureBodies(tdlg_.targets[k].first);
-                    if (tdlg_.targets[k].second >= src.size()) continue;
-                    auto sb = doc_.bodies.find(src[tdlg_.targets[k].second]);
-                    auto ob = doc_.bodies.find(outs[k]);
-                    if (sb == doc_.bodies.end() || ob == doc_.bodies.end()) continue;
-                    glm::mat4 want = T * sb->second.xform;
-                    if (ob->second.xform != want) { ob->second.xform = want; markSceneDirty(); }
-                }
-            }
+            previewMove();
             char buf[48];
             std::snprintf(buf, sizeof buf, "%s %.4g mm", triad_.axis == 0 ? "X" : triad_.axis == 1 ? "Y" : "Z", v);
             ImVec2 ts = ImGui::CalcTextSize(buf);

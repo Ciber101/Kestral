@@ -71,7 +71,7 @@ ViewCube::Result ViewCube::draw(const glm::quat& camRot, float size) {
     }
 
     // Hit test sub regions of visible faces.
-    const float k = 0.58f;
+    const float k = 0.72f;   // wide face centers, thin edge and corner bands (like Fusion)
     const float cuts[4] = {-1.f, -k, k, 1.f};
     int hitFace = -1, hitI = -1, hitJ = -1;
     glm::vec3 hitDir(0);

@@ -27,6 +27,10 @@ void Settings::load(const std::string& path) {
             else if (k == "slicerPath") slicerPath = v;
             else if (k == "reverseZoom") reverseZoom = toBool(v);
             else if (k == "constrainedOrbit") constrainedOrbit = toBool(v);
+            else if (k == "orbitAtPress") orbitAtPress = toBool(v);
+            else if (k == "sketchLookAt") sketchLookAt = toBool(v);
+            else if (k == "hideUsedSketches") hideUsedSketches = toBool(v);
+            else if (k == "manipSnap") manipSnap = toBool(v);
             else if (k == "navStyle") navStyle = std::stoi(v);
             else if (k == "perspective") perspective = toBool(v);
             else if (k == "showEdges") showEdges = toBool(v);
@@ -122,6 +126,10 @@ void Settings::save(const std::string& path) const {
     f << "slicerPath=" << slicerPath << "\n";
     f << "reverseZoom=" << reverseZoom << "\n";
     f << "constrainedOrbit=" << constrainedOrbit << "\n";
+    f << "orbitAtPress=" << orbitAtPress << "\n";
+    f << "sketchLookAt=" << sketchLookAt << "\n";
+    f << "hideUsedSketches=" << hideUsedSketches << "\n";
+    f << "manipSnap=" << manipSnap << "\n";
     f << "navStyle=" << navStyle << "\n";
     f << "perspective=" << perspective << "\n";
     f << "showEdges=" << showEdges << "\n";

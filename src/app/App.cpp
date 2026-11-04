@@ -31,7 +31,7 @@ namespace kst {
 
 namespace {
 App* g_app = nullptr;
-const char* kVersion = "0.5.0";
+const char* kVersion = "0.5.1";
 
 void cbCursor(GLFWwindow*, double, double) { if (g_app) g_app->activity(); }
 void cbButton(GLFWwindow*, int, int, int) { if (g_app) g_app->activity(); }
@@ -573,6 +573,8 @@ void App::frame() {
     ImGui::Render();
     double tUi1 = profile ? profNow() : 0;
 
+    // Slice tab: the plate turns see-through while you look from under it.
+    if (sliceWs_ && (cam_.eye().z < -0.01f) != sliceBedBelow_) { sliceBedBelow_ = !sliceBedBelow_; markSceneDirty(); }
     if (sceneDirty_ || sceneRev_ != doc_.revision) rebuildScene();
     double tSc1 = profile ? profNow() : 0;
 
@@ -705,7 +707,7 @@ void App::rebuildScene() {
         // A hidden body hovered in the browser shows as a see-through ghost where it would be.
         bool ghost = false;
         if (!bodyShown(b)) {
-            if (browserHover_.count(b.id) && doc_.isBodyAlive(b)) ghost = true;
+            if ((browserHover_.count(b.id) || selection_.count(b.id)) && doc_.isBodyAlive(b)) ghost = true;   // a hidden part clicked in the browser stays shown until you click off
             else continue;
         }
         auto pit = doc_.parts.find(b.partId);
@@ -770,6 +772,19 @@ void App::rebuildScene() {
             selFaceList.insert(selFaceList.end(), fit->second.begin(), fit->second.begin() + ri.selCount);
         }
         batches[it->second].instances.push_back(ri);
+    }
+    if (cutPreview_ && dlg_.open && !cutPreview_->indices.empty()) {
+        // What the cut takes away: see-through red, like Fusion's preview.
+        MatProps cm;
+        cm.opacity = 0.35f;
+        cm.rough = 0.6f;
+        RenderInstance ri;
+        ri.color = glm::vec4(0.95f, 0.25f, 0.2f, 1.f);
+        ri.material = matOf(glm::vec3(0.95f, 0.25f, 0.2f), cm);
+        ri.transparent = true;
+        batches.push_back({cutPreview_, {ri}});
+    } else if (cutPreview_ && !dlg_.open) {
+        cutPreview_.reset();
     }
     renderer_.setScene(batches, selFaceList, mats, faceMats);
     sceneBounds_ = Aabb();
@@ -887,7 +902,7 @@ void App::registerTools() {
     int move = add("move", "Move/Copy", "M", Icon::MoveCopy, 0, [this] { runMove(); },
                    "Move the selected bodies by X/Y/Z (or copy them)");
     int align = add("align", "Align", "", Icon::Align, 0, [this] { runAlign(); },
-                    "Move bodies so a face center, edge middle or corner lands on another");
+                    "Move a part so a circle, face or corner lands on another. A circle uses its center and axis, so a shaft drops into a hole");
     int params = add("parameters", "Change Parameters", "", Icon::Parameters, 0, [this] { openParamsDialog(); },
                      "User parameters you can use in any dimension or distance");
     int appear = add("appearance", "Appearance", "A", Icon::Appearance, 0, [this] {
@@ -922,6 +937,8 @@ void App::registerTools() {
                       "Distance, angle, radius, area, or the length of a loop");
     int interf = add("interference", "Interference", "", Icon::Interference, 0, [this] { runInterference(); },
                      "Check the selected bodies for overlaps");
+    int rebuildAll = add("rebuild_from_steps", "Rebuild From Steps", "", Icon::Section, 0, [this] { rebuildFromSteps(); },
+                         "Build every step again from its settings, ignoring the shapes saved with the design");
     int section = add("section", "Section Analysis", "", Icon::Section, 0, [this] { runSection(); },
                       "Cut the view on an origin plane. The solids stay whole");
     // INSERT
@@ -981,7 +998,7 @@ void App::registerTools() {
     int tPat = sk("sk_pattern", "Pattern", "", Icon::RectPattern, "Select curves, then make a rectangular or circular pattern. The count includes the original");
     int tExtend = sk("extend", "Extend", "", Icon::Trim, "Click near the end of a line to extend it to the next curve");
     int tOffset = sk("offset", "Offset", "O", Icon::Offset, "Click a curve (its whole chain is used), move to the side, type the distance");
-    int tMirrorS = sk("mirror", "Mirror", "", Icon::Mirror, "Select curves, then pick the mirror line");
+    int tMirrorS = sk("mirror", "Mirror Curves", "", Icon::Mirror, "Select curves, then pick the mirror line");
     int tProject = sk("project", "Project", "P", Icon::Project, "Click body edges or faces to bring them into the sketch");
     int tInter = sk("sk_intersect", "Intersect", "", Icon::Intersect, "Click a body. The outline where it crosses this plane is added to the sketch");
     int tOnto = sk("sk_onto_face", "Onto Face", "", Icon::ProjectFace, "Select curves, then click a face. They drop onto it along the sketch normal");
@@ -1052,6 +1069,8 @@ void App::registerTools() {
         "See and change every keyboard shortcut");
     cmd("slice_workspace", "Slice in OrcaSlicer", "", Icon::Slicer, [this] { enterSliceWorkspace(); },
         "OrcaSlicer inside Kestral, one click from your model");
+    cmd("wiring", "Electronics and Wiring", "", Icon::Joint, [this] { wiringOpen_ = true; },
+        "Real boards, motors, servos and batteries wired pin to pin, checked, with a wiring guide");
     cmd("robot_export", "Robot Export (URDF / USD)", "", Icon::Joint, [this] { robotOpen_ = true; },
         "Links, joints and masses for Isaac Sim / Isaac Lab and ROS");
     cmd("move_from_fusion", "Move from Fusion", "", Icon::ImportFeature, [this] { fusionMoveOpen_ = true; },
@@ -1067,7 +1086,7 @@ void App::registerTools() {
         {"MODIFY", {press, fillet, chamfer, shell, thicken, draft, scale, combine, offFace, replFace, split, splitFace, move, align, params, appear}, 3},
         {"ASSEMBLE", {newComp, ground, joint, asbuilt, rigid}, 2},
         {"CONSTRUCT", {offPlane, anglePlane, midPlane, threePlane, tanPlane, axis, point}, 1},
-        {"INSPECT", {measure, interf, section}, 2},
+        {"INSPECT", {measure, interf, section, rebuildAll}, 2},
         {"INSERT", {insMesh, insStep}, 2},
         {"SELECT", {sel, selPrio}, 1},
         {"3D PRINT", {slicer, stl, slicerSetup}, 1},
@@ -1500,6 +1519,7 @@ void App::deleteSelection() {
         doc_.touch();
         markSceneDirty();
         dirty_ = true;
+        pendingDeleteFace_ = f.id;   // a failure is reported and the step taken back out
         scheduleRecompute(pos);
         return;
     }

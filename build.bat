@@ -55,7 +55,11 @@ if not exist "%SRC%\bin" mkdir "%SRC%\bin"
 rem A running Kestral (or the MCP bridge an AI app started) keeps bin\Kestral.exe locked. Windows
 rem lets a running program be renamed, so move it aside and copy the new one in its place.
 if exist "%SRC%\bin\Kestral.old.exe" del /q "%SRC%\bin\Kestral.old.exe" >nul 2>nul
-if exist "%SRC%\bin\Kestral.exe" move /y "%SRC%\bin\Kestral.exe" "%SRC%\bin\Kestral.old.exe" >nul 2>nul
+rem Kestral.old.exe itself may still run (an AI app's bridge started before the last build): then use another name.
+set "OLDEXE=%SRC%\bin\Kestral.old.exe"
+if exist "%OLDEXE%" set "OLDEXE=%SRC%\bin\Kestral.old%RANDOM%.exe"
+if exist "%SRC%\bin\Kestral.exe" move /y "%SRC%\bin\Kestral.exe" "%OLDEXE%" >nul 2>nul
+del /q "%SRC%\bin\Kestral.old?*.exe" >nul 2>nul
 robocopy "%KESTRAL_BUILD%\build" "%SRC%\bin" *.exe *.dll /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
 if errorlevel 8 (
   echo [Kestral] Could not copy into bin. Close Kestral and any AI app using it, then run build.bat again.

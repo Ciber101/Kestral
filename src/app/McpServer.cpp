@@ -57,6 +57,7 @@ const char* kInstructions =
     "- export_illustration saves a clean picture (exploded, numbered parts) as PNG or SVG.\n"
     "- To print: slice (print_setup lists printers, filaments and profiles), then start_print. Kestral shows the user a "
     "Print button and only prints when they press it, unless they allowed automatic prints.\n"
+    "- " KESTRAL_PRINT_FIT "\n"
     "- save_design saves the design. Do not overwrite or delete the user's work unless they asked.\n"
     "- You can also use the whole program like a person: screenshot shows the window, ui_input clicks, drags, scrolls and types "
     "anywhere (menus, dialogs, the browser, the timeline, the Slice tab, Preferences), get_ui_state says what is open, "
@@ -261,8 +262,13 @@ App::McpCall App::mcpRunTool(const std::string& client, const std::string& name,
             if (fut.wait_for(std::chrono::milliseconds(50)) == std::future_status::ready) return true;
         return false;
     };
+    // Some MCP apps give up on a call after about a minute: wait for a rebuild at most 40 s, then
+    // answer and say it is still running (wait_for until=idle waits for the rest).
+    bool stillBuilding = false;
     auto waitIdle = [&] {
+        auto t0 = std::chrono::steady_clock::now();
         for (int k = 0; k < 6000 && !cancel->load(); ++k) {
+            if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(40)) { stillBuilding = true; return; }
             auto p = std::make_shared<std::promise<bool>>();
             auto f = p->get_future();
             post([this, p] { p->set_value(recomputeQueuedFrom_ < 0 && !recomputeRunning_ && !recomputeResults_); });
@@ -339,6 +345,11 @@ App::McpCall App::mcpRunTool(const std::string& client, const std::string& name,
         out.text = illustrationTool(a, post, cancel, &built);
         if (built.img) out.images = {built.img};
         out.error = out.text.rfind("Saved", 0) != 0;
+    } else if (name == "interference") {   // booleans off the main thread, so the window keeps drawing
+        waitIdle();
+        std::string perr;
+        if (!platform::guarded("MCP interference", [&] { out.text = interferenceTool(a, post, cancel); }, perr)) out.text = "Error: " + perr;
+        chat(2, who + ": " + out.text);
     } else if (aiIsPrintTool(name)) {
         std::string perr;
         if (!platform::guarded("MCP print tool", [&] { out.text = aiPrintTool(name, a, post, cancel); }, perr)) out.text = "Error: " + perr;
@@ -350,8 +361,10 @@ App::McpCall App::mcpRunTool(const std::string& client, const std::string& name,
         auto prom = std::make_shared<std::promise<std::string>>();
         auto fut = prom->get_future();
         auto before = std::make_shared<std::set<uint32_t>>();
-        post([this, prom, name, a, before, who] {
+        auto failedBefore = std::make_shared<std::set<uint32_t>>();
+        post([this, prom, name, a, before, failedBefore, who] {
             for (auto& [id, b] : doc_.bodies) if (doc_.isBodyAlive(b)) before->insert(id);
+            for (auto& f : doc_.timeline) if (f.failed) failedBefore->insert(f.id);
             aiCaptured_.clear();
             aiCapture_ = true;
             std::string res, perr;
@@ -367,12 +380,15 @@ App::McpCall App::mcpRunTool(const std::string& client, const std::string& name,
             waitIdle();
             auto p2 = std::make_shared<std::promise<std::string>>();
             auto f2 = p2->get_future();
-            post([this, p2, before] {
-                std::string made, failed, said;
+            post([this, p2, before, failedBefore] {
+                std::string made, failed, said, newFail;
                 for (auto& [id, b] : doc_.bodies)
                     if (doc_.isBodyAlive(b) && !before->count(id)) made += (made.empty() ? "" : ", ") + aiBodyPath(id);
                 for (auto& f : doc_.timeline)
-                    if (f.failed && !f.error.empty()) failed += (failed.empty() ? "" : "; ") + f.name + ": " + f.error;
+                    if (f.failed && !f.error.empty()) {
+                        failed += (failed.empty() ? "" : "; ") + f.name + ": " + f.error;
+                        if (!failedBefore->count(f.id)) newFail += (newFail.empty() ? "" : "; ") + f.name + ": " + f.error;
+                    }
                 for (auto& m : aiCaptured_) said += (said.empty() ? "" : " | ") + m;
                 aiCapture_ = false;
                 aiCaptured_.clear();
@@ -380,13 +396,25 @@ App::McpCall App::mcpRunTool(const std::string& client, const std::string& name,
                 if (!made.empty()) o += " Bodies now in the design from this step: " + made + ".";
                 if (!said.empty()) o += " Kestral showed the user: \"" + said + "\".";
                 if (!failed.empty()) o += " Timeline steps with errors: " + failed + ".";
+                if (!newFail.empty()) o = std::string(kStepFailed) + newFail + "." + o;
                 p2->set_value(o);
             });
-            if (waitFuture(f2)) out.text += f2.get();
+            if (waitFuture(f2)) {
+                std::string more = f2.get();
+                if (more.rfind(kStepFailed, 0) == 0) {   // the step failed: say that first
+                    out.text = more + " (The tool itself answered: " + out.text + ")";
+                    out.error = true;
+                } else {
+                    out.text += more;
+                }
+            }
         } else {
             post([this] { aiCapture_ = false; aiCaptured_.clear(); });
         }
     }
+    if (stillBuilding)
+        out.text += " Kestral is still rebuilding the design (a heavy step): call wait_for with until=idle before the next change, "
+                    "then get_design to see the result.";
     std::string low = lowerStr(out.text.substr(0, 200));
     if (low.rfind("error", 0) == 0 || low.rfind("unknown", 0) == 0 || low.rfind("not found", 0) == 0 || low.rfind("stopped", 0) == 0)
         out.error = true;

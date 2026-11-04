@@ -42,6 +42,12 @@ struct GLFWwindow;
 
 namespace kst {
 
+// How an AI should choose print settings: shared by the assistant's prompt, the slice tool and MCP.
+#define KESTRAL_PRINT_FIT "What the user asks for always comes first: when they name a profile, a filament or settings, use exactly those and change nothing else. Otherwise choose for yourself. Check which filament is in the printer (print_setup and printer_status list it) and use a filament profile of that type. Decide what the part needs from what it is for, its shape and that filament, and set it in settings (the profile is a starting point, not an answer): strength (wall_loops, top_shell_layers, bottom_shell_layers, sparse_infill_density and pattern: more for parts that carry load, get dropped, clamp, snap or screw together; enough walls and bottom layers to be watertight for anything that holds liquid), bed adhesion (brim for a small footprint, tall thin parts, sharp corners or filaments that warp), supports (enable_support for overhangs past about 50 degrees or parts in mid air, or turn the part so it needs none) and orientation (biggest flat face down; layers split along the plate, so put the part's load across them). Tell the user in a line what you chose and why. The slice result lists these settings and the loaded filament: check them before start_print."
+
+// Starts a tool result when the timeline step it added could not be computed.
+inline constexpr const char* kStepFailed = "Failed: the step was added to the timeline but could not be computed: ";
+
 enum class ToastKind { Info, Success, Warning, Error };
 
 struct Tool {
@@ -269,7 +275,21 @@ private:
         glm::dvec3 origin{0}, dir{0, 0, 1};
         double value = 0, grab = 0;
         double minValue = -1e300;         // fillet / chamfer: keep the radius positive
+        std::vector<double> snaps;        // values where another face's plane is (filled at the grab)
+        bool snapped = false;
     };
+    std::set<uint32_t> freezeTargets_;
+    uint32_t pendingDeleteFace_ = 0;      // a Delete Face just added: taken back out with a message if it fails
+    std::string deleteFaceError_;
+    MeshPtr cutPreview_;                  // the material an open cut removes (drawn red)     // extrudes / revolves whose touched bodies get fixed after OK
+    bool sliceBedBelow_ = false;          // camera under the build plate (it draws see-through)
+    bool combineFinal_ = false;
+    // Each step's latest results (by its chain), written with the design on save.
+    std::map<uint32_t, std::map<uint64_t, kernel::FeatureCacheData>> stepShapes_;
+    void saveStepShapes();
+    void rebuildFromSteps();           // Combine writes its tools only on OK
+    uint32_t manipShiftFid_ = UINT32_MAX; // the arrow starts under the mouse: this command's offset (MAX: none yet)
+    glm::dvec3 manipShift_{0};
     std::set<SubRef> selFaces_, selEdges_, selProfiles_;
     HoverInfo hov_;
     std::map<uint32_t, ProfCache> profCache_;
@@ -282,6 +302,8 @@ private:
     Manip manip_;
     bool manipHovered_ = false;
     glm::dvec3 orbitPivot_{0};
+    glm::dvec3 orbitCenter_{0};      // set by a quick Shift + middle click; orbits turn around it after
+    bool orbitCenterSet_ = false;
     bool orbitPivotValid_ = false;
     int savedMarker_ = -1;            // marker position to restore after editing a feature / sketch
 
@@ -301,8 +323,12 @@ private:
     void viewportClick(bool add, bool dbl);
     void windowSelect(ImVec2 a, ImVec2 b, bool add);
     void drawInteractionOverlay();
-    void setManip(int target, const glm::dvec3& origin, const glm::dvec3& dir, double value);
+    void setManip(int target, const glm::dvec3& origin, const glm::dvec3& dir, double value, bool atMouse = false);
+    void collectManipSnaps();
     void drawManipulator();
+    // Ahead/behind for the extrude's auto operation; with no material right at the profile, looks
+    // along the drag for a shown body (a profile in a chamfer gap dragged into the part cuts).
+    void extrudeAutoOp(double d);
     void manipCommit(double value, bool final);
     void openMarkingMenu(ImVec2 at);
     void drawMarkingMenu();
@@ -380,6 +406,7 @@ private:
     std::atomic<bool> aiPsBusy_{false};
     double aiPsAt_ = -1e9;
     bool aiLiveOpen_ = false;          // the live Thinking dropdown is expanded
+    bool aiLiveTouched_ = false;       // its arrow was used: closed hides the text completely
     std::string aiLiveStage_;          // what the assistant is doing now ("Loading the model", "Running extrude"...)
     int aiLastPromptTok_ = 0, aiLastOutTok_ = 0, aiCtxWindow_ = 0;   // last round trip: tokens in / out, window used
     double aiLastOutRate_ = 0, aiLastInRate_ = 0;                    // tokens per second (writing / reading)
@@ -453,9 +480,14 @@ private:
     void aiSend(const std::string& text, bool showLine = true, std::vector<std::shared_ptr<const AiImage>> pics = {});
     std::string aiSystemPrompt() const;
     std::string aiRunTool(const std::string& name, const std::string& argsJson);
+    std::string slicerSweep(const std::string& argsJson);   // developer check of every slicer setting (app/SlicerSweep.cpp)
+    struct InterferenceItem { std::string name; ShapePtr shape; glm::mat4 xf{1.f}; };
+    std::string interferenceReport(const std::vector<InterferenceItem>& items, const std::atomic<bool>* cancel);
     // ---- Slicing and printing (PrintAssistant.cpp). These tools run on the assistant's worker
     // thread (slicing and printer talk take seconds to minutes); `post` runs code on the main thread.
     using PostFn = std::function<void(std::function<void()>)>;
+    // The interference tool off the main thread: bodies are gathered on the main thread, the booleans run here.
+    std::string interferenceTool(const std::string& argsJson, const PostFn& post, const std::shared_ptr<std::atomic<bool>>& cancel);
     static bool aiIsPrintTool(const std::string& name);
     std::string aiPrintTool(const std::string& name, const std::string& argsJson, const PostFn& post,
                             const std::shared_ptr<std::atomic<bool>>& cancel);
@@ -543,6 +575,16 @@ private:
     std::string robotSummary(const RobotModel& m) const;
     std::string exportRobot(const std::string& urdfPath, std::string& report);
     std::string robotTool(const std::string& argsJson);
+    // Electronics (Wiring.cpp): parts, wires, checks and the wiring guide.
+    std::string wiringTool(const std::string& argsJson);
+    ElecPart* elecFind(const std::string& nameOrId);
+    bool elecWhere(const ElecPart& p, glm::dvec3& at);
+    void drawWiringWindow();
+    void drawWiringOverlay();
+    bool wiringOpen_ = false, wiringLabels_ = true;
+    std::string wiringQuery_, wiringPick_, wiringLabel_, wiringFromPin_;
+    uint32_t wiringFromPart_ = 0;
+    int wiringSel_ = -1;
     void drawRobotWindow();
     std::string compPath(uint32_t cid) const;
     uint32_t compByPath(const std::string& path) const;
@@ -565,8 +607,25 @@ private:
         int axis = -1;
         glm::dvec3 center{0};
         double startVal = 0, grab = 0;
+        int ring = -1;                  // rotation ring being dragged (0 X, 1 Y, 2 Z)
+        double ringStart = 0;           // screen angle at the grab
+        float ringSign = 1.f;
+        glm::dmat4 rot0{1.0};           // the dialog's turn at the grab
     } triad_;
     void drawMoveTriad();
+    // Align: the snap a click at the mouse would take (face center or axis, circle center, edge
+    // middle or a corner), like Fusion's snap points. cands gets every snap on the hovered item.
+    struct AlignSnap {
+        AlignParams::Pick pick;
+        std::string label;
+        glm::dvec3 world{0};
+    };
+    bool alignSnapAt(AlignSnap& out, std::vector<AlignSnap>* cands);
+    void drawAlignSnaps();
+    glm::dvec3 alignFromWorld_{0};
+    bool alignFromShown_ = false;
+    void previewMove();
+    bool moveSharedPivot(glm::dvec3& pivot);
     // Hang watchdog: a second thread that notices when the main loop stops (a freeze), saves a
     // recovery copy of the last known good state and offers to close Kestral cleanly.
     std::thread watchdog_;
@@ -931,6 +990,7 @@ private:
     std::string designTabTitle(int i) const;
     std::string sliceDocKey() const;
     int sliceTabFor(const std::string& key) const;
+    void sliceFollowDesign();   // the slice tab in front is the open design's (AI slicing tools)
     bool sliceTabOwns(int tab, const std::string& key) const;   // the design's parts belong to this tab
     bool plateOwns(const std::string& key) const;                 // ... to the tab in front
     void sliceSwap(SliceDocState& d);
@@ -1236,6 +1296,7 @@ private:
         double distVal = 0;           // evaluated, for display
         bool opAuto = true;           // operation follows the drag direction until the user picks one
         bool inFront = false, inBack = false;   // a body lies in front of / behind the profile
+        glm::dvec3 probeO{0}, probeN{0, 0, 1};    // where the profile is, to look for material further along
         int extent = 0;               // 0 distance, 1 up to a face
         FaceRef to;                   // the face an extrude stops on
         std::string toName;
@@ -1274,6 +1335,8 @@ private:
         std::vector<std::string> sketchNames;
         int selA = 0, selB = 1;                                     // sweep profile / path indices
         std::vector<TargetRef> tools;                               // combine tool bodies
+        bool mirrorWaitPlane = false;   // Mirror from the toolbar: no copy until a plane or face is chosen
+        bool mirrorAsked = false;       // moved on to the face pick once already
         GearParams gear;                                            // gear / thread values being edited
         ThreadParams thread;
         WingParams wing;

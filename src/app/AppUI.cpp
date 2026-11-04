@@ -119,6 +119,7 @@ void App::drawUI() {
     drawKeysDialog();
     drawFusionMove();
     drawRobotWindow();
+    drawWiringWindow();
     drawIllustration();
     drawAssistant();
     drawAppearance();
@@ -207,6 +208,7 @@ void App::drawAppBar() {
         if (ImGui::MenuItem("Export 3MF...")) export3mfDialog();
         if (ImGui::MenuItem("Export Illustration (PNG / SVG)...")) illus_.open = true;
         if (ImGui::MenuItem("Export Robot (URDF / USD)...")) robotOpen_ = true;
+        if (ImGui::MenuItem("Electronics and Wiring...")) wiringOpen_ = true;
         if (ImGui::MenuItem("Send to Slicer", "Ctrl+P")) sendToSlicer();
         if (ImGui::MenuItem("Slice in OrcaSlicer (inside Kestral)")) enterSliceWorkspace();
         ImGui::Separator();
@@ -331,6 +333,7 @@ void App::drawAppBar() {
         }
         t1.x = x - 4 * S;
         ImGui::SetNextWindowPos(ImVec2(a0.x, a1.y + 2 * S));
+        ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(FLT_MAX, 420 * S));
         if (ImGui::BeginPopup("##vermenu")) {
             auto vers = designVersions(doc_.path);
             ImGui::TextDisabled("Versions of %s", doc_.name.c_str());
@@ -1603,7 +1606,19 @@ void App::drawViewCube() {
                 case 4: axis = -cam_.forward(); ang = -hp; break;
                 default: axis = -cam_.forward(); ang = hp; break;
                 }
-                cam_.animateTo(cam_.target, cam_.distance, glm::normalize(glm::angleAxis(ang, glm::normalize(axis)) * cam_.rot), 0.3f);
+                glm::quat to = glm::normalize(glm::angleAxis(ang, glm::normalize(axis)) * cam_.rot);
+                // Already square to the axes: land exactly square (no drift after many turns).
+                glm::mat3 m = glm::mat3_cast(to);
+                bool square = true;
+                for (int c = 0; c < 3 && square; ++c)
+                    for (int r = 0; r < 3; ++r) {
+                        float v = m[c][r];
+                        float rv = std::abs(v) > 0.98f ? (v > 0 ? 1.f : -1.f) : std::abs(v) < 0.02f ? 0.f : 2.f;
+                        if (rv == 2.f) { square = false; break; }
+                        m[c][r] = rv;
+                    }
+                if (square) to = glm::normalize(glm::quat_cast(m));
+                cam_.animateTo(cam_.target, cam_.distance, to, 0.3f);
                 activity();
             }
         }
@@ -1992,6 +2007,9 @@ void App::drawSettings() {
     } else if (sec == 2) {
     ImGui::Checkbox("Reverse zoom direction", &settings_.reverseZoom); flashItem("pref:Reverse zoom direction");
     ImGui::Checkbox("Constrained orbit (keep Z up)", &settings_.constrainedOrbit); flashItem("pref:Constrained orbit (keep Z up)");
+    ImGui::Checkbox("Orbit around the point I press (off: around the center a quick Shift + middle click sets)", &settings_.orbitAtPress);
+    ImGui::Checkbox("Turn the view to face a new sketch (off: the camera stays where it is)", &settings_.sketchLookAt);
+    ImGui::Checkbox("Hide a sketch once a feature uses it (like Fusion)", &settings_.hideUsedSketches);
     {
         static const char* styles[] = {"Fusion 360 / Inventor  (middle pan, Shift+middle orbit)",
                                        "SolidWorks  (middle orbit, Ctrl+middle pan, Shift+middle zoom)",
@@ -2203,7 +2221,10 @@ void App::handleViewportInput() {
             }
         }
         if (drag_ == Drag::Orbit && (d.x != 0 || d.y != 0)) {
-            if (orbitPivotValid_) cam_.orbitAround(glm::vec3(orbitPivot_), d.x, d.y, settings_.constrainedOrbit);
+            // Turning keeps the center set by the last Shift + middle click (the view center); the
+            // point pressed now only becomes the center on a quick click (below).
+            if (orbitPivotValid_ && settings_.orbitAtPress) cam_.orbitAround(glm::vec3(orbitPivot_), d.x, d.y, settings_.constrainedOrbit);
+            else if (orbitCenterSet_) cam_.orbitAround(glm::vec3(orbitCenter_), d.x, d.y, settings_.constrainedOrbit);   // stays put through zooms
             else cam_.orbit(d.x, d.y, settings_.constrainedOrbit);
         }
         if (drag_ == Drag::Pan && (d.x != 0 || d.y != 0)) cam_.pan(d.x, d.y, H);
@@ -2222,10 +2243,15 @@ void App::handleViewportInput() {
             // Shift + middle click (no drag): the clicked point becomes the view center, so every
             // orbit after this turns around it.
             bool rightClick = btn == 1 && dragDist_ < 4.f * S && drag_ != Drag::Select;
-            if (drag_ == Drag::Orbit && btn == 2 && navMode_ == NavMode::None && dragDist_ < 4.f * S && orbitPivotValid_) {
-                glm::vec3 p(orbitPivot_);
-                float dd = glm::dot(p - cam_.eye(), cam_.forward());
-                if (dd > 1e-3f) cam_.animateTo(p, dd, cam_.rot, 0.22f);
+            if (drag_ == Drag::Orbit && btn == 2 && navMode_ == NavMode::None && dragDist_ < 4.f * S) {
+                // A quick click on a part sets the center; on empty space it goes back to the view center.
+                orbitCenterSet_ = orbitPivotValid_;
+                if (orbitPivotValid_) {
+                    orbitCenter_ = orbitPivot_;
+                    glm::vec3 p(orbitPivot_);
+                    float dd = glm::dot(p - cam_.eye(), cam_.forward());
+                    if (dd > 1e-3f) cam_.animateTo(p, dd, cam_.rot, 0.22f);
+                }
             }
             // Shift adds. Ctrl alone picks a whole body in place of the selection.
             bool add = io.KeyShift || (io.KeyCtrl && (tdlg_.open || dlg_.open));
@@ -2457,7 +2483,7 @@ void App::handleShortcuts() {
         std::string front = nav ? (nav->RootWindow ? nav->RootWindow->Name : nav->Name) : "";
         struct W { const char* name; bool* open; };
         W wins[] = {{"Assistant", &ai_.open}, {"Appearance", &appearanceOpen_}, {"Preferences", &settingsOpen_},
-                    {"##datapanel", &dataOpen_}, {"Parameters", &paramsOpen_}, {"Robot", &robotOpen_}, {"Keyboard Shortcuts", &keysOpen_}};
+                    {"##datapanel", &dataOpen_}, {"Parameters", &paramsOpen_}, {"Robot", &robotOpen_}, {"Wiring", &wiringOpen_}, {"Keyboard Shortcuts", &keysOpen_}};
         bool closed = false;
         for (auto& w : wins)
             if (*w.open && front.rfind(w.name, 0) == 0) { *w.open = false; closed = true; break; }

@@ -72,6 +72,10 @@ ShapePtr revolveRegion(const RegionLoops& loops, const glm::dvec3& axisO, const 
 // Boolean combination. NewBody: {tool}. Join: one fused body. Cut: tool cut out of every
 // target (one body per target). Intersect: common of tool and every target.
 std::vector<ShapePtr> applyBool(BoolOp op, const ShapePtr& tool, const std::vector<BoolTarget>& targets);
+// Merges faces that are flush within 1e-4 mm (combine results of parts placed by matrices).
+ShapePtr mergeFlushFaces(const ShapePtr& shape);
+// On for steps made from fix1066 on: face merging never changes the inputs it was given.
+void setCopyBeforeUnify(bool on);
 
 // ---- M4: solid modification ----------------------------------------------------------
 
@@ -143,6 +147,9 @@ std::vector<uint32_t> tangentChain(const ShapePtr& shape, uint32_t edge);
 bool edgeAxis(const ShapePtr& shape, uint32_t edge, glm::dvec3& origin, glm::dvec3& dir);
 bool edgeFrame(const ShapePtr& shape, uint32_t edge, glm::dvec3& mid, glm::dvec3& outward);
 bool faceInfo(const ShapePtr& shape, uint32_t face, glm::dvec3& center, glm::dvec3& normal, bool& planar);
+// Axis of a round face (cylinder, cone, torus), in shape coordinates. origin is on the axis at the
+// face's middle. False for flat and freeform faces.
+bool faceRoundAxis(const ShapePtr& shape, uint32_t face, glm::dvec3& origin, glm::dvec3& dir);
 // Extrudes a flat face of a body (with the body's transform applied) along its outward normal.
 // dist may be negative (into the body). Result is in world coordinates.
 ShapePtr extrudeFace(const ShapePtr& shape, const glm::mat4& xf, uint32_t face, double dist, bool symmetric);

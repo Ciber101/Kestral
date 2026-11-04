@@ -4,6 +4,7 @@
 #include "app/Illustration.h"
 #include "app/Thumbnails.h"
 #include "core/Json.h"
+#include "kernel/Features.h"
 #include "platform/Platform.h"
 #include "third_party/stb_image.h"
 
@@ -194,6 +195,56 @@ bool App::cameraPicture(const PostFn& post, const std::shared_ptr<std::atomic<bo
     std::strftime(when, sizeof when, "%H:%M:%S", std::localtime(&t));
     msg = std::string("Picture from the printer's camera at ") + when + " (" + std::to_string(w) + " x " + std::to_string(h) + ").";
     return true;
+}
+
+// Which of these bodies share volume. Heavy (a boolean per touching pair): call it off the main thread.
+std::string App::interferenceReport(const std::vector<InterferenceItem>& items, const std::atomic<bool>* cancel) {
+    std::string hits;
+    for (size_t i = 0; i < items.size(); ++i)
+        for (size_t j = i + 1; j < items.size(); ++j) {
+            if (cancel && cancel->load()) return "Stopped.";
+            if (!kernel::shapesTouch(items[i].shape, items[i].xf, items[j].shape, items[j].xf)) continue;
+            try {
+                // The first body in its own frame, the second placed relative to it.
+                glm::mat4 rel = glm::inverse(items[i].xf) * items[j].xf;
+                auto common = kernel::applyBool(kernel::BoolOp::Intersect, items[i].shape, {{items[j].shape, rel}});
+                if (!common.empty() && std::abs(kernel::solidVolume(common[0])) > 1e-3)   // shared volume, not just a touching face
+                    hits += (hits.empty() ? "" : ", ") + items[i].name + "/" + items[j].name;
+            } catch (const std::exception&) {}
+        }
+    return hits.empty() ? "interference=none" : "interference=" + hits;
+}
+
+std::string App::interferenceTool(const std::string& argsJson, const PostFn& post, const std::shared_ptr<std::atomic<bool>>& cancel) {
+    struct Got { std::vector<InterferenceItem> items; std::string err; };
+    auto p = std::make_shared<std::promise<Got>>();
+    auto f = p->get_future();
+    post([this, p, argsJson] {
+        Got g;
+        json::Value a = json::Value::parse(argsJson);
+        std::vector<std::string> names;
+        if (a["names"].isString()) names.push_back(a["names"].asString());
+        for (auto& e : a["names"].items())
+            if (e.isString()) names.push_back(e.asString());
+        std::string missing;
+        auto ids = aiFindBodies(names, missing);
+        if (!missing.empty()) g.err = "Not found: " + missing + ". Use paths from get_design.";
+        for (uint32_t id : ids) {
+            auto bit = doc_.bodies.find(id);
+            if (bit == doc_.bodies.end()) continue;
+            auto pit = doc_.parts.find(bit->second.partId);
+            if (pit != doc_.parts.end() && pit->second.shape) g.items.push_back({bit->second.name, pit->second.shape, bit->second.xform});
+        }
+        p->set_value(g);
+    });
+    Got g;
+    for (;;) {
+        if (cancel && cancel->load()) return "Stopped.";
+        if (f.wait_for(std::chrono::milliseconds(150)) == std::future_status::ready) { g = f.get(); break; }
+    }
+    if (!g.err.empty()) return g.err;
+    if (g.items.size() < 2) return "Name at least two solid bodies (or folders holding them).";
+    return interferenceReport(g.items, cancel.get());
 }
 
 } // namespace kst

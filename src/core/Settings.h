@@ -12,6 +12,10 @@ struct Settings {
     // Navigation
     bool reverseZoom = false;   // false: wheel forward zooms in
     bool constrainedOrbit = false;
+    bool hideUsedSketches = false;  // a sketch hides once a feature uses it (Fusion). Off: it stays shown
+    bool sketchLookAt = false;  // starting a sketch turns the view to face it (off: the camera stays put)
+    bool orbitAtPress = false;  // true: every orbit turns around the point pressed (Fusion). false: around the view center
+    bool manipSnap = true;      // drag arrows snap to the planes of other faces
     int navStyle = 0;           // 0 Fusion, 1 SolidWorks, 2 Onshape, 3 Blender, 4 Tinkercad, 5 Maya / Alias
     bool perspective = true;
     // Display

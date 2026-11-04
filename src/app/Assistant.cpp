@@ -108,8 +108,8 @@ const ToolDef kTools[] = {
      R"({"type":"object","properties":{"command_id":{"type":"string"}},"required":["command_id"]})"},
     {"select", "Select bodies by name or path (\"Folder/Body\"). A folder name selects every body in it. add=true keeps the current selection.",
      R"({"type":"object","properties":{"names":{"type":"array","items":{"type":"string"}},"add":{"type":"boolean"}},"required":["names"]})"},
-    {"save_design", "Save the open design (like Ctrl+S). Every save is a new version (v1, v2...).",
-     R"({"type":"object","properties":{}})"},
+    {"save_design", "Save the open design (like Ctrl+S). Every save is a new version (v1, v2...). A new design that has no file yet needs name: it is saved as <name>.kst in the designs folder.",
+     R"({"type":"object","properties":{"name":{"type":"string"}}})"},
     {"open_design", "Open a design by name (or full path). Searches the Kestral designs folder and recent designs. version (optional) opens that older version in place.",
      R"({"type":"object","properties":{"name":{"type":"string"},"version":{"type":"integer"}},"required":["name"]})"},
     {"list_designs", "List the saved designs (name, version, path). query filters by name.",
@@ -182,14 +182,14 @@ const ToolDef kTools[] = {
      R"({"type":"object","properties":{"profile_sketch":{"type":"number"},"path_sketch":{"type":"number"},"guide_sketch":{"type":"number"},"twist":{},"operation":{"type":"string"},"name":{"type":"string"},"component":{"type":"string"}},"required":["profile_sketch","path_sketch"]})"},
     {"loft", "Loft through two or more profile sketches, in order. rails is a list of open sketch ids. The loft grows so each section meets those curves. point is [x, y, z] in world mm. point_end is start or end. The loft comes to that point, and one profile is enough. A point does not take rails. centerline is an open sketch id. The middle of each profile follows that curve, and the profiles keep their size. A centerline does not take rails or a point.",
      R"({"type":"object","properties":{"sketch_ids":{"type":"array","items":{"type":"number"}},"rails":{"type":"array","items":{"type":"number"}},"operation":{"type":"string"},"name":{"type":"string"},"component":{"type":"string"}},"required":["sketch_ids"]})"},
-    {"rotate", "Turn bodies. axis is x, y, z or [dx,dy,dz]. angle in degrees. pivot is center or [x,y,z]. copy true keeps the original.",
+    {"rotate", "Turn bodies. axis is x, y, z or [dx,dy,dz]. angle in degrees. pivot is center (the default: all the named bodies turn as one about the center of all of them) or [x,y,z]. copy true keeps the original.",
      R"({"type":"object","properties":{"names":{"type":"array","items":{"type":"string"}},"axis":{},"angle":{"type":"number"},"pivot":{},"copy":{"type":"boolean"}},"required":["names","angle"]})"},
     {"scale", "Scale bodies. factor, or x, y and z for a non-uniform scale. pivot is center or a point.",
      R"({"type":"object","properties":{"names":{"type":"array","items":{"type":"string"}},"factor":{"type":"number"},"x":{"type":"number"},"y":{"type":"number"},"z":{"type":"number"},"pivot":{}},"required":["names"]})"},
     {"set_transform", "Place bodies with a 4x4 row-major matrix (16 numbers). This replaces their placement.",
      R"({"type":"object","properties":{"names":{"type":"array","items":{"type":"string"}},"matrix":{"type":"array","items":{"type":"number"}}},"required":["names","matrix"]})"},
-    {"align", "Move a body so a face, edge middle or corner lands on one on another body. No clicks. kind is face, edge or corner. index is the face or edge id from get_body. corner end is 1 or 2.",
-     R"({"type":"object","properties":{"source_body":{"type":"string"},"source_kind":{"type":"string"},"source_index":{"type":"number"},"source_end":{"type":"number"},"target_body":{"type":"string"},"target_kind":{"type":"string"},"target_index":{"type":"number"},"target_end":{"type":"number"},"flip":{"type":"boolean"}},"required":["source_body","target_body"]})"},
+    {"align", "Move a body so a snap lands on a snap on another body. No clicks. kind is face, edge or corner. A circular edge uses the circle's center and axis, so a shaft drops into a hole. index is the face or edge id from get_body. corner end is 1 or 2. flip turns it the other way. angle (degrees) turns it about the target's axis after landing, offset (mm) leaves a gap along it.",
+     R"({"type":"object","properties":{"source_body":{"type":"string"},"source_kind":{"type":"string"},"source_index":{"type":"number"},"source_end":{"type":"number"},"target_body":{"type":"string"},"target_kind":{"type":"string"},"target_index":{"type":"number"},"target_end":{"type":"number"},"flip":{"type":"boolean"},"angle":{},"offset":{}},"required":["source_body","target_body"]})"},
     {"combine", "Boolean. operation join, cut or intersect. target is the body that remains. tools are the other bodies. keep_tools leaves the tools in the design.",
      R"({"type":"object","properties":{"target":{"type":"string"},"tools":{"type":"array","items":{"type":"string"}},"operation":{"type":"string"},"keep_tools":{"type":"boolean"}},"required":["target","tools","operation"]})"},
     {"circular_pattern", "Copy bodies around an axis. count includes the original. angle is the total sweep in degrees (360 for a full circle). axis is x, y or z.",
@@ -218,6 +218,8 @@ const ToolDef kTools[] = {
      R"({"type":"object","properties":{"type":{"type":"string"},"length":{"type":"number"},"width":{"type":"number"},"depth":{"type":"number"},"angle":{"type":"number"},"clearance":{"type":"number"},"name":{"type":"string"},"component":{"type":"string"}}})"},
     {"robot", "Robot description for URDF and USD export (Isaac Sim, Isaac Lab, ROS). Links are components (with everything inside them). action: show (the setup and a check: links, masses, problems), set (name, base = the root link component, density in g/cm3 for printed bodies, front = the way the robot faces in the design: x, -x, y or -y, default -y; the export turns it so front is +X), mass (component or body, grams: the real mass of a bought part like a servo, board or battery; 0 clears it), joint (name, parent, child = component paths, type revolute / continuous / fixed, origin [x,y,z] mm on the axis, axis [dx,dy,dz] or x / y / z / -x..., lower and upper in degrees, effort N m, velocity rad/s, stiffness, damping; the same name replaces it), remove_joint (name), export (path to a .urdf; also writes the .usda and the meshes next to it; blank path uses designs/Robots). The design's current pose is the zero pose.",
      R"({"type":"object","properties":{"action":{"type":"string","enum":["show","set","mass","joint","remove_joint","export"]},"name":{"type":"string"},"base":{"type":"string"},"density":{"type":"number"},"front":{"type":"string"},"component":{"type":"string"},"grams":{"type":"number"},"parent":{"type":"string"},"child":{"type":"string"},"type":{"type":"string"},"origin":{"type":"array","items":{"type":"number"}},"axis":{},"lower":{"type":"number"},"upper":{"type":"number"},"effort":{"type":"number"},"velocity":{"type":"number"},"stiffness":{"type":"number"},"damping":{"type":"number"},"path":{"type":"string"}},"required":["action"]})"},
+    {"wiring", "Electronics: real parts (Raspberry Pi 5, Fusion HAT+, motor drivers, encoder motors, servos, batteries, sensors) placed in the design and wired pin to pin, checked like the real thing (voltages, 3.3 V logic, current per rail and per motor channel, shorts, I2C addresses, wire gauge), with a step by step wiring guide for the real build. action: catalog (query) lists parts, part_info (part: catalog id or a placed label) gives pins, notes and sources, add (part: catalog id, label, attach: body or component path it is, capacity_mAh for batteries), set (label, new_label, attach, capacity_mAh), remove (label), stack (hat, pi: press a HAT onto a Pi's header), connect (from_part, from_pin, to_part, to_pin, color, awg, note; color and gauge are picked when left out), disconnect (wire id, or from_part and to_part), list, check (errors, warnings, power budget, battery life), guide (the wiring guide). Pins are the ids part_info lists (GPIO17, 5V, P0.S, M2.A, VCC).",
+     R"({"type":"object","properties":{"action":{"type":"string","enum":["catalog","part_info","add","set","remove","stack","connect","disconnect","list","check","guide"]},"query":{"type":"string"},"part":{"type":"string"},"label":{"type":"string"},"new_label":{"type":"string"},"attach":{"type":"string"},"capacity_mAh":{"type":"number"},"hat":{"type":"string"},"pi":{"type":"string"},"from_part":{"type":"string"},"from_pin":{"type":"string"},"to_part":{"type":"string"},"to_pin":{"type":"string"},"color":{"type":"string"},"awg":{"type":"number"},"note":{"type":"string"},"wire":{"type":"number"}},"required":["action"]})"},
     {"interference", "Report which of the named bodies share volume. Touching faces do not count.",
      R"({"type":"object","properties":{"names":{"type":"array","items":{"type":"string"}}},"required":["names"]})"},
     {"measure", "Measure. kind is distance (default), angle, radius, area, or loop. Distance: points is two [x,y,z], or names is two bodies (center to center). Angle: points is three [x,y,z] with the corner in the middle, or body with face and face2, or edge and edge2. The angle is the smaller one, 0 to 90 degrees. Radius: a cylinder, sphere, torus, or circular edge. Area: a face, in mm2. Loop: the outline of a face, or the wire an edge sits on, in mm. body names the solid. Leave face out to use the first round face or the first flat face.",
@@ -266,6 +268,8 @@ const ToolDef kTools[] = {
      R"({"type":"object","properties":{"sketch_id":{"type":"number"},"diameter":{"type":"number"},"inner_diameter":{"type":"number"},"length":{"type":"number"},"axis":{"type":"string"},"x":{"type":"number"},"y":{"type":"number"},"z":{"type":"number"},"name":{"type":"string"},"component":{"type":"string"}},"required":["diameter"]})"},
     {"draft", "Lean side faces so a mold releases. angle in degrees. direction is the pull (x, y or z). The base opposite the pull stays the same size. faces is an optional list of face ids from get_body; without it every side face is drafted.",
      R"({"type":"object","properties":{"names":{"type":"array","items":{"type":"string"}},"angle":{"type":"number"},"direction":{"type":"string"},"faces":{"type":"array","items":{"type":"number"}}},"required":["names","angle"]})"},
+    {"delete_faces", "Delete faces from a body and heal the gap (Fusion's Delete on faces): the faces around grow to close it. Good for holes, fillets, bosses and pockets. names: the body. faces: face ids from get_body.",
+     R"({"type":"object","properties":{"names":{"type":"array","items":{"type":"string"}},"faces":{"type":"array","items":{"type":"number"}}},"required":["names","faces"]})"},
     {"press_pull", "Move faces. distance in mm, positive grows the body. faces is a list of face ids from get_body. direction, when faces is omitted, picks the face whose normal matches it (default +z).",
      R"({"type":"object","properties":{"names":{"type":"array","items":{"type":"string"}},"distance":{"type":"number"},"faces":{"type":"array","items":{"type":"number"}},"direction":{"type":"string"}},"required":["names","distance"]})"},
     {"offset_face", "Same as press_pull. Shift faces along their normal.",
@@ -276,7 +280,7 @@ const ToolDef kTools[] = {
      R"({"type":"object","properties":{}})"},
     {"list_print_profiles", "Find OrcaSlicer profiles. type is machine (printer), process (quality / strength) or filament. search is words to match, e.g. \"a1 mini\", \"petg\", \"0.20mm strength\". The user's own profiles come first.",
      R"({"type":"object","properties":{"type":{"type":"string","enum":["machine","process","filament"]},"search":{"type":"string"}},"required":["type"]})"},
-    {"slice", "Slice the visible design (or only the selection with what=selected) with OrcaSlicer's engine (it runs hidden inside Kestral). Profiles default to what the Slice tab has picked; give names from list_print_profiles to use others. settings changes any OrcaSlicer setting for this print, e.g. {\"wall_loops\":\"3\",\"sparse_infill_density\":\"25%\"}. Returns print time, filament used and warnings.",
+    {"slice", "Slice the visible design (or only the selection with what=selected) with OrcaSlicer's engine (it runs hidden inside Kestral). Profiles default to what the Slice tab has picked; give names from list_print_profiles to use others. settings changes any OrcaSlicer setting for this print, e.g. {\"wall_loops\":\"3\",\"sparse_infill_density\":\"25%\"}. Returns print time, filament used, the strength, brim and support settings used, and warnings. " KESTRAL_PRINT_FIT,
      R"({"type":"object","properties":{"printer_profile":{"type":"string"},"process_profile":{"type":"string"},"filament_profile":{"type":"string"},"bed_type":{"type":"string"},"settings":{"type":"object"},"what":{"type":"string","enum":["visible","selected"]},"arrange":{"type":"boolean"}}})"},
     {"slice_view", "Kestral's Slice tab, the same things the user does there: open it (tab=slice) or go back (tab=design), pick profiles for the tab (printer_profile, process_profile, filament_profile, bed_type), show the design or the sliced toolpaths (view=design or preview), choose the layer range shown (top_layer, bottom_layer, 1 based), show or hide features by name (features, e.g. {\"Sparse infill\":false}), change settings in the tab the way the user would (settings, OrcaSlicer keys, e.g. {\"wall_loops\":\"3\"}; an empty value puts one back to the profile's), Auto orient (auto_orient), and the plate like the user edits it in Prepare: plate is a list of {body (name), x, y (plate position of the center, mm), rotate (degrees), scale (percent), copies, on_plate, lay_flat (true: onto its biggest flat face), build_plate (1 based: which build plate it sits on)}; arrange_now packs everything onto the plate; build_plates sets how many build plates there are; active_plate (1 based) picks the plate that Slice plate slices. Returns what the tab shows: the plate (each part, copies, positions, size, on or off the bed), layers, heights, features and their share.",
      R"({"type":"object","properties":{"settings":{"type":"object"},"plate":{"type":"array","items":{"type":"object"}},"arrange_now":{"type":"boolean"},"build_plates":{"type":"number"},"active_plate":{"type":"number"},"auto_orient":{"type":"boolean"},"tab":{"type":"string","enum":["slice","design"]},"view":{"type":"string","enum":["design","preview"]},"printer_profile":{"type":"string"},"process_profile":{"type":"string"},"filament_profile":{"type":"string"},"bed_type":{"type":"string"},"top_layer":{"type":"number"},"bottom_layer":{"type":"number"},"features":{"type":"object"}}})"},
@@ -946,14 +950,15 @@ std::string App::aiSystemPrompt() const {
          "- Keyboard shortcuts can be changed: right click a toolbar command or Preferences > Keyboard Shortcuts.\n\n";
     o << "SLICING AND PRINTING\n"
          "- Kestral slices with the user's own OrcaSlicer profiles and sends prints to their printer. Always call "
-         "print_setup first. Use the profiles OrcaSlicer has selected unless the user names others.\n"
+         "print_setup first. Use the printer and process profiles OrcaSlicer has selected unless the user names others; the filament "
+         "profile must match the filament loaded in the printer.\n"
          "- When asked to print: slice (with any setting changes asked for), tell the user the print time and filament, "
-         "then call start_print. Use the profiles OrcaSlicer has selected: never swap in other profiles unless the user names "
-         "them. If slicing fails, tell the user the exact error instead of trying other profiles. start_print shows the user a Print button "
+         "then call start_print. Do not swap the printer or process profile unless the user names one. If slicing fails, tell the user the exact error instead of trying other profiles. start_print shows the user a Print button "
          "(or starts at once when the user allowed that in Preferences): never claim a print started unless the tool says so. If the user only "
          "asked to slice or to check, do not call start_print.\n"
          "- \"Model it and print it\" (often while the user is away): build the model, check it (get_design), slice, then call start_print "
          "yourself in the same turn. Do not stop to ask in between.\n"
+         "- " KESTRAL_PRINT_FIT "\n"
          "- Turn plain words into settings: \"stronger\" -> more walls (wall_loops 3-4) and more infill (20-40%), "
          "\"faster\" -> fewer walls, less infill, thicker layers (0.24-0.28), \"smoother / finer\" -> thinner layers "
          "(0.12-0.16), \"needs supports\" -> enable_support 1. Settings: " << print::commonSettingsHelp() << "\n"
@@ -1053,6 +1058,7 @@ std::string App::aiRunTool(const std::string& name, const std::string& argsJson)
     }
     aiOpenedCommand_ = false;
     if (name == "robot") return robotTool(argsJson);
+    if (name == "wiring") return wiringTool(argsJson);
     if (name == "get_design") {
         Value d = Value::object();
         d.set("name", doc_.name);
@@ -1257,16 +1263,37 @@ std::string App::aiRunTool(const std::string& name, const std::string& argsJson)
         return err.empty() ? "Selected " + std::to_string(ids.size()) + " bodies." : err;
     }
     if (name == "save_design") {
-        if (doc_.path.empty()) return "This design has no file yet: ask the user to Save As once (it needs a name and folder).";
+        std::string nm = a["name"].asString();
+        if (doc_.path.empty()) {
+            // A new design: save it under the given name in the designs folder (the folder Save As opens in).
+            if (nm.empty()) return "This design has no file yet: call save_design again with a name for it.";
+            for (auto& ch : nm) if (std::strchr("<>:\"/\\|?*", ch)) ch = '_';
+            std::string p = pathToU8(u8path(designFolder()) / u8path(nm + ".kst"));
+            std::error_code ec;
+            if (std::filesystem::exists(u8path(p), ec)) return "A design named " + nm + " already exists there: pick another name, or open_design it first.";
+            doc_.path = p;
+            doc_.name = nm;
+            doc_.components[doc_.rootId].name = doc_.name;
+            doc_.touch();
+            markSceneDirty();
+        }
+        int before = doc_.version;
         saveDocumentNow();
+        if (doc_.version == before) return "Nothing changed since v" + std::to_string(before) + ", so no new version was saved.";
         return "Saved " + doc_.name + " as v" + std::to_string(doc_.version) + ".";
     }
     if (name == "list_designs" || name == "open_design") {
         namespace fs = std::filesystem;
-        std::string q = toLower(a[name == "open_design" ? "name" : "query"].asString());
+        // open_design also takes path or file (what models often send); an empty name used to match
+        // every design and open the shortest one.
+        std::string given = a["name"].asString();
+        if (name == "open_design" && given.empty()) given = a.has("path") ? a["path"].asString() : a["file"].asString();
+        if (name == "open_design" && given.empty()) return "Error: give the design's name (or full path) in name.";
+        std::string q = toLower(name == "open_design" ? given : a["query"].asString());
         std::vector<std::string> found;
         std::error_code ec;
-        if (name == "open_design" && fs::exists(u8path(a["name"].asString()), ec)) found.push_back(a["name"].asString());
+        bool exactPath = name == "open_design" && fs::is_regular_file(u8path(given), ec);
+        if (exactPath) found.push_back(given);
         int n = 0;
         for (auto it = fs::recursive_directory_iterator(u8path(platform::designsDir()), fs::directory_options::skip_permission_denied, ec);
              it != fs::recursive_directory_iterator() && n < 20000; it.increment(ec), ++n) {
@@ -1289,12 +1316,14 @@ std::string App::aiRunTool(const std::string& name, const std::string& argsJson)
             }
             return out.empty() ? "No designs match." : out;
         }
-        if (found.empty()) return "No design named like \"" + a["name"].asString() + "\". Use list_designs.";
+        if (found.empty()) return "No design named like \"" + given + "\". Use list_designs.";
         // The closest name: an exact match first, then the shortest one containing the words.
         std::string best = found[0];
-        for (auto& f : found)
+        for (auto& f : found) {
+            if (exactPath) break;
             if (toLower(pathToU8(u8path(f).stem())) == q) { best = f; break; }
             else if (pathToU8(u8path(f).stem()).size() < pathToU8(u8path(best).stem()).size()) best = f;
+        }
         int ver = a["version"].isNumber() ? (int)a["version"].asNumber() : 0;
         if (ver > 0) openDesignVersion(best, ver);
         else openDocumentPath(best);
@@ -1372,7 +1401,17 @@ std::string App::aiRunTool(const std::string& name, const std::string& argsJson)
         std::string mname = a["material"].asString();
         if (!mname.empty()) {
             const LibMaterial* lm = findLibMaterial(mname);
-            if (!lm) return "No appearance called '" + mname + "'. Use a name from the library list.";
+            if (!lm) {
+                // Say what there is (MCP apps do not see the assistant's instructions with the list).
+                std::string first = toLower(mname.substr(0, mname.find_first_of(" -")));
+                std::string close, all;
+                for (auto& lmat : materialLibrary()) {
+                    std::string n = lmat.name;
+                    all += (all.empty() ? "" : ", ") + n;
+                    if (!first.empty() && toLower(n).find(first) != std::string::npos) close += (close.empty() ? "" : ", ") + n;
+                }
+                return "No appearance called '" + mname + "'. " + (close.empty() ? "The library has: " + all : "Close ones: " + close) + ".";
+            }
             c = lm->color;
             m = lm->mat;
         }
@@ -1407,13 +1446,18 @@ std::string App::aiRunTool(const std::string& name, const std::string& argsJson)
         std::string err;
         auto ids = bodiesArg(err);
         if (ids.empty()) return err.empty() ? "Nothing to move." : err;
+        // dx/dy/dz are what models often send; a move of nothing is refused instead of "Moved".
+        auto off = [&](const char* k, const char* alt) { return a.has(k) ? a[k].asNumber(0) : a[alt].asNumber(0); };
+        double mx = off("x", "dx"), my = off("y", "dy"), mz = off("z", "dz");
+        if (mx == 0 && my == 0 && mz == 0 && !a["copy"].asBool(false))
+            return "Error: nothing moved. Give the offset in mm as x, y and z.";
         clearSelection();
         selectBodies(ids, false);
         startToolFeature(FeatureType::Move);
         if (!tdlg_.open) return "Could not start Move.";
-        std::snprintf(tdlg_.v1, sizeof tdlg_.v1, "%g", a["x"].asNumber(0));
-        std::snprintf(tdlg_.v2, sizeof tdlg_.v2, "%g", a["y"].asNumber(0));
-        std::snprintf(tdlg_.v3, sizeof tdlg_.v3, "%g", a["z"].asNumber(0));
+        std::snprintf(tdlg_.v1, sizeof tdlg_.v1, "%g", mx);
+        std::snprintf(tdlg_.v2, sizeof tdlg_.v2, "%g", my);
+        std::snprintf(tdlg_.v3, sizeof tdlg_.v3, "%g", mz);
         tdlg_.option2 = a["copy"].asBool(false) ? 1 : 0;
         applyToolDialog();
         closeToolDialog(true);
@@ -1535,13 +1579,27 @@ std::string App::aiRunTool(const std::string& name, const std::string& argsJson)
         if (where.empty() && a.has("x")) where.push_back({a["x"].asNumber(), a["y"].asNumber(), a["z"].asNumber()});
         if (where.empty()) return "Give positions: a list of [x,y,z] points on the face.";
         std::string notes;
+        // Bodies the holes may cut: their faces decide the direction first (a point on a face the
+        // target shares with a neighbour, like a gasket under a head, must drill into the target).
+        std::set<uint32_t> targetIds;
+        if (a.has("target_bodies")) {
+            std::string missing;
+            for (uint32_t id : aiFindBodies(stringList(a["target_bodies"]), missing)) targetIds.insert(id);
+        }
+        std::vector<uint32_t> order;
+        for (uint32_t id : targetIds) order.push_back(id);
+        for (auto& [id, b] : doc_.bodies)
+            if (!targetIds.count(id)) order.push_back(id);
         for (auto& w : where) {
             glm::dvec3 dir(0, 0, -1);
             bool found = false;
             if (!hasDir) {
                 // The face the point is on decides the direction (straight into it).
-                for (auto& [id, b] : doc_.bodies) {
-                    if (!bodyShown(b)) continue;
+                for (uint32_t id : order) {
+                    auto bit = doc_.bodies.find(id);
+                    if (bit == doc_.bodies.end()) continue;
+                    const Body& b = bit->second;
+                    if (!doc_.isBodyAlive(b) || !bodyShown(b)) continue;
                     auto pit = doc_.parts.find(b.partId);
                     if (pit == doc_.parts.end() || !pit->second.shape) continue;
                     double tol = std::max(0.05, kernel::shapeDiag(pit->second.shape) * 1e-3);
@@ -1851,7 +1909,7 @@ const Syn kSyn[] = {
     {"ring", "create_torus create_tube"}, {"tube", "create_tube pipe"}, {"pipe", "pipe"}, {"wedge", "create_wedge"}, {"cut", "split_body combine"},
     {"split", "split_body split_face"}, {"join", "combine"}, {"union", "combine"}, {"subtract", "combine"}, {"mirror", "mirror"},
     {"sweep", "sweep"}, {"loft", "loft"}, {"rib", "rib"}, {"draft", "draft"}, {"thicken", "thicken"}, {"plane", "offset_plane plane_at_angle midplane"},
-    {"component", "create_component activate_component"}, {"folder", "create_component"}, {"robot", "robot"}, {"joint", "joint rigid_group asbuilt_joint"},
+    {"component", "create_component activate_component"}, {"folder", "create_component"}, {"robot", "robot"}, {"wiring", "wiring"}, {"wire", "wiring"}, {"electronics", "wiring"}, {"battery", "wiring"}, {"servo", "wiring"}, {"motor", "wiring"}, {"joint", "joint rigid_group asbuilt_joint"},
     {"parameter", "set_parameter"}, {"section", "section_analysis"}, {"constraint", "sketch_constrain"}, {"dimension", "sketch_constrain"},
     {"trim", "sketch_ops"}, {"offset", "sketch_ops offset_face"}, {"push", "press_pull"}, {"pull", "press_pull"}, {"align", "align"},
     {"snap", "snap"}, {"lip", "lip"}, {"boss", "boss"}, {"web", "web"}, {"gear", "gear"}, {"blade", "blades"}, {"fan", "blades"},
@@ -2713,6 +2771,21 @@ void App::aiSend(const std::string& textIn, bool showLine, std::vector<std::shar
                     history.push_back(tr);
                     continue;
                 }
+                if (c.name == "interference") {
+                    // Booleans for every touching pair: here, so the window keeps drawing.
+                    waitIdle();
+                    std::string result, perr;
+                    if (!platform::guarded("interference", [&] { result = interferenceTool(c.argsJson, post, cancel); }, perr)) result = "Error: " + perr;
+                    if (cancel->load()) break;
+                    post([this, result] { ai_.lines.push_back({2, result}); ai_.scroll = true; aiLog("tool interference", result); });
+                    AiTurn tr;
+                    tr.role = "tool";
+                    tr.callId = c.id;
+                    tr.toolName = c.name;
+                    tr.text = result;
+                    history.push_back(tr);
+                    continue;
+                }
                 if (aiIsPrintTool(c.name)) {
                     // Slicing and printer talk run right here (they take a while); they reach the
                     // main thread themselves when they need to.
@@ -2738,8 +2811,10 @@ void App::aiSend(const std::string& textIn, bool showLine, std::vector<std::shar
                 waitIdle();
                 if (cancel->load()) break;
                 auto before = std::make_shared<std::set<uint32_t>>();
-                post([this, prom, nm, args, before] {
+                auto failedBefore = std::make_shared<std::set<uint32_t>>();
+                post([this, prom, nm, args, before, failedBefore] {
                     for (auto& [id, b] : doc_.bodies) if (doc_.isBodyAlive(b)) before->insert(id);
+                    for (auto& f : doc_.timeline) if (f.failed) failedBefore->insert(f.id);
                     aiCaptured_.clear();
                     aiCapture_ = true;
                     std::string res, perr;
@@ -2760,14 +2835,17 @@ void App::aiSend(const std::string& textIn, bool showLine, std::vector<std::shar
                     waitIdle();
                     auto p2 = std::make_shared<std::promise<std::string>>();
                     auto f2 = p2->get_future();
-                    post([this, p2, before] {
+                    post([this, p2, before, failedBefore] {
                         std::string made;
                         for (auto& [id, b] : doc_.bodies)
                             if (doc_.isBodyAlive(b) && !before->count(id)) made += (made.empty() ? "" : ", ") + aiBodyPath(id);
                         // Failed timeline steps count too.
-                        std::string failed;
+                        std::string failed, newFail;
                         for (auto& f : doc_.timeline)
-                            if (f.failed && !f.error.empty()) failed += (failed.empty() ? "" : "; ") + f.name + ": " + f.error;
+                            if (f.failed && !f.error.empty()) {
+                                failed += (failed.empty() ? "" : "; ") + f.name + ": " + f.error;
+                                if (!failedBefore->count(f.id)) newFail += (newFail.empty() ? "" : "; ") + f.name + ": " + f.error;
+                            }
                         std::string said;
                         for (auto& m : aiCaptured_) said += (said.empty() ? "" : " | ") + m;
                         aiCapture_ = false;
@@ -2776,11 +2854,15 @@ void App::aiSend(const std::string& textIn, bool showLine, std::vector<std::shar
                         if (!made.empty()) out += " Bodies now in the design from this step: " + made + ".";
                         if (!said.empty()) out += " Kestral showed the user: \"" + said + "\".";
                         if (!failed.empty()) out += " Timeline steps with errors: " + failed + ".";
+                        if (!newFail.empty()) out = std::string(kStepFailed) + newFail + "." + out;
                         p2->set_value(out);
                     });
                     while (!cancel->load()) {
                         if (f2.wait_for(std::chrono::milliseconds(200)) == std::future_status::ready) {
-                            result += f2.get();
+                            std::string more = f2.get();
+                            // A step that failed comes first, so the tool's own "done" does not read as success.
+                            if (more.rfind(kStepFailed, 0) == 0) result = more + " (The tool itself answered: " + result + ")";
+                            else result += more;
                             break;
                         }
                     }
@@ -3231,7 +3313,9 @@ void App::drawAssistant() {
         if (open) ImGui::SetNextItemOpen(*open);
         bool isOpen = ImGui::TreeNodeEx("##think", fl, "%s", title.c_str());
         if (open) *open = isOpen;
-        if (isOpen || (live && !text.empty())) {
+        // While it thinks, a closed block shows its last lines; once the arrow is used, closed means closed.
+        if (live && ImGui::IsItemToggledOpen()) aiLiveTouched_ = true;
+        if (isOpen || (live && !aiLiveTouched_ && !text.empty())) {
             const ImGuiStyle& st = ImGui::GetStyle();
             float lineH = ImGui::GetTextLineHeight();
             float boxW = ImGui::GetContentRegionAvail().x;

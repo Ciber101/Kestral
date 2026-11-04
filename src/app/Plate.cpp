@@ -250,14 +250,9 @@ void App::plateArrange() {
     for (int p = 0; p < slice_.plates; ++p)
         if (!(p < (int)slice_.ex.plateLocked.size() && slice_.ex.plateLocked[(size_t)p])) plates.push_back(p);
     if (plates.empty()) return;
-    std::set<int> free(plates.begin(), plates.end());
-    std::vector<std::pair<uint32_t, int>> items;
-    for (auto& [id, o] : slice_.plate) {
-        if (!o.onPlate || !plateInFilter(id)) continue;
-        for (int k = 0; k < (int)o.pos.size(); ++k)
-            if (free.count(plateOfCopy(o, k))) items.push_back({id, k});
-    }
-    platePack(items, plates);
+    // Each plate keeps its own parts (a part put on plate 2 stays there); what does not fit moves
+    // on to an empty plate or a new one.
+    for (int p : plates) plateArrangeOne(p);
 }
 
 void App::plateArrangeOne(int plateIdx) {

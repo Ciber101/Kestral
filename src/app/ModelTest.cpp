@@ -1553,6 +1553,66 @@ void App::modelTestStep() {
             }
             return std::string();
         }});
+        // A turned shaft's circular end lands on a hole's circular edge: same center, axes parallel.
+        static glm::dvec3 holeCenter(0);
+        steps.push_back({"align circ", 40, [&] {
+            fresh();
+            call("create_box", R"({"width":40,"depth":40,"height":10,"name":"Plate"})");
+        }, [&] { return volName("Plate") > 0 ? std::string() : "no plate " + last; }});
+        steps.push_back({"align circ 2", 40, [&] { call("create_hole", R"({"positions":[[20,20,10]],"diameter":12,"target_bodies":["Plate"]})"); },
+            [&] { return volName("Plate") < 40 * 40 * 10.0 - 1 ? std::string() : "no hole " + last; }});
+        steps.push_back({"align circ 3", 40, [&] { call("create_cylinder", R"({"diameter":10,"height":20,"name":"Shaft"})"); },
+            [&] { return volName("Shaft") > 0 ? std::string() : "no shaft " + last; }});
+        steps.push_back({"align circ 4", 30, [&] { call("rotate", R"({"names":["Shaft"],"axis":"x","angle":90})"); },
+            [&] { return fails(); }});
+        steps.push_back({"align circ 5", 30, [&] { call("move", R"({"names":["Shaft"],"x":40,"y":15,"z":5})"); },
+            [&] { return fails(); }});
+        steps.push_back({"align circ 6", 40, [&] {
+            int shaftEdge = -1, holeEdge = -1;
+            holeCenter = glm::dvec3(0);
+            std::string seen;
+            for (auto& [id, b] : doc_.bodies) {
+                if (!doc_.isBodyAlive(b)) continue;
+                auto pit = doc_.parts.find(b.partId);
+                if (pit == doc_.parts.end() || !pit->second.shape) continue;
+                uint32_t n = kernel::edgeCount(pit->second.shape);
+                for (uint32_t i = 0; i < n; ++i) {
+                    kernel::EdgeGeom g;
+                    if (!kernel::edgeGeom(pit->second.shape, b.xform, i, g)) continue;
+                    if (g.type == 1 || g.type == 2)
+                        seen += b.name + " t" + std::to_string(g.type) + " r" + numStr(g.radius) + " ";
+                    if (g.type != 1 && g.type != 2) continue;
+                    if (b.name == "Shaft" && std::abs(g.radius - 5) < 0.2 && shaftEdge < 0) shaftEdge = (int)i;
+                    if (b.name == "Plate" && std::abs(g.radius - 6) < 0.2 && holeEdge < 0) { holeEdge = (int)i; holeCenter = g.center; }
+                }
+            }
+            if (shaftEdge < 0 || holeEdge < 0) { last = "no circle [" + seen + "]"; return; }
+            call("align", "{\"source_body\":\"Shaft\",\"source_kind\":\"edge\",\"source_index\":" + std::to_string(shaftEdge) +
+                 ",\"target_body\":\"Plate\",\"target_kind\":\"edge\",\"target_index\":" + std::to_string(holeEdge) + "}");
+        }, [&] {
+            if (last.rfind("no circle", 0) == 0) return last;
+            if (!fails().empty()) return fails() + last;
+            std::vector<glm::dvec3> ends;
+            for (auto& [id, b] : doc_.bodies) {
+                if (!doc_.isBodyAlive(b) || b.name != "Shaft") continue;
+                auto pit = doc_.parts.find(b.partId);
+                if (pit == doc_.parts.end() || !pit->second.shape) continue;
+                uint32_t n = kernel::edgeCount(pit->second.shape);
+                for (uint32_t i = 0; i < n; ++i) {
+                    kernel::EdgeGeom g;
+                    if (!kernel::edgeGeom(pit->second.shape, b.xform, i, g) || (g.type != 1 && g.type != 2)) continue;
+                    if (std::abs(g.radius - 5) < 0.2) ends.push_back(g.center);
+                }
+            }
+            if (ends.size() < 2) return "ends " + std::to_string(ends.size());
+            bool onHole = false;
+            for (auto& c : ends)
+                if (glm::length(c - holeCenter) < 0.05) onHole = true;
+            if (!onHole) return "center " + numStr(ends[0].x) + "," + numStr(ends[0].y) + "," + numStr(ends[0].z);
+            glm::dvec3 axis = glm::normalize(ends[1] - ends[0]);
+            if (std::abs(axis.x) > 0.02 || std::abs(axis.y) > 0.02) return "axis " + numStr(axis.x) + "," + numStr(axis.y);
+            return std::string();
+        }});
         steps.push_back({"undo", 20, [&] { fresh(); call("create_box", R"({"width":8,"depth":8,"height":8,"name":"U"})"); },
             [&] { return std::string(); }});
         steps.push_back({"undo 2", 15, [&] { call("run_command", R"({"command_id":"undo"})"); },
@@ -2597,6 +2657,116 @@ void App::modelTestStep() {
             }
             if (!outR) return std::string("outside the shaft is empty");
             if (inR) return std::string("grew into the shaft");
+            return std::string();
+        }});
+    }
+
+    {
+        // Picks made the way a click makes them: the face of a named body that passes test.
+        auto pickFace = [&](const std::string& body, std::function<bool(const glm::dvec3&, const glm::dvec3&, bool)> test) {
+            clearSelection();
+            for (auto& [id, b] : doc_.bodies) {
+                if (!doc_.isBodyAlive(b) || b.name != body) continue;
+                auto pit = doc_.parts.find(b.partId);
+                if (pit == doc_.parts.end() || !pit->second.shape) continue;
+                uint32_t n = kernel::faceCount(pit->second.shape);
+                for (uint32_t i = 0; i < n; ++i) {
+                    glm::dvec3 c, normal; bool planar = false;
+                    if (!kernel::faceInfo(pit->second.shape, i, c, normal, planar)) continue;
+                    glm::dmat4 xf(b.xform);
+                    c = glm::dvec3(xf * glm::dvec4(c, 1.0));
+                    normal = glm::normalize(glm::dmat3(xf) * normal);
+                    if (test(c, normal, planar)) { selFaces_.insert({id, i}); return true; }
+                }
+            }
+            return false;
+        };
+        // E on a cylinder's end face, typed distance, OK: the cylinder grows (Join), it must not vanish.
+        auto faceExtrudeAlong = [&, pickFace](glm::dvec3 want) {
+            if (!pickFace("Shaft", [&](const glm::dvec3&, const glm::dvec3& n, bool planar) { return planar && glm::dot(n, want) > 0.9; })) {
+                last = "no end face";
+                return;
+            }
+            runExtrude();
+            if (!dlg_.open) { last = "extrude did not open"; return; }
+            std::snprintf(dlg_.dist, sizeof dlg_.dist, "10");
+            applyDialogValues();
+            commandOk();
+        };
+        auto faceExtrude = [faceExtrudeAlong](bool bottom) { faceExtrudeAlong(glm::dvec3(0, 0, bottom ? -1 : 1)); };
+        auto shaftCheck = [&] {
+            if (last == "no end face" || last == "extrude did not open") return last;
+            if (!fails().empty()) return fails();
+            if (nAlive() != 1) return "bodies " + std::to_string(nAlive());
+            if (!near(volName("Shaft"), kPi * 100 * 30)) return "vol " + numStr(volName("Shaft"));
+            return std::string();
+        };
+        steps.push_back({"face extrude", 30, [&] { fresh(); last.clear(); call("create_cylinder", R"({"diameter":20,"height":20,"name":"Shaft"})"); },
+            [&] { return std::string(); }});
+        steps.push_back({"face extrude bottom", 40, [&, faceExtrude] { faceExtrude(true); }, shaftCheck});
+        steps.push_back({"face extrude 2", 30, [&] { fresh(); last.clear(); call("create_cylinder", R"({"diameter":20,"height":20,"name":"Shaft"})"); },
+            [&] { return std::string(); }});
+        steps.push_back({"face extrude top", 40, [&, faceExtrude] { faceExtrude(false); }, shaftCheck});
+        // The same on a cylinder that was turned and moved first, and on one extruded from a sketch circle.
+        steps.push_back({"face extrude turned", 30, [&] { fresh(); last.clear(); call("create_cylinder", R"({"diameter":20,"height":20,"name":"Shaft"})"); },
+            [&] { return std::string(); }});
+        steps.push_back({"face extrude turned 2", 30, [&] { call("rotate", R"({"names":["Shaft"],"axis":"x","angle":90})"); },
+            [&] { return fails(); }});
+        steps.push_back({"face extrude turned 3", 30, [&] { call("move", R"({"names":["Shaft"],"x":15,"y":7,"z":3})"); },
+            [&] { return fails(); }});
+        steps.push_back({"face extrude turned 4", 40, [&, faceExtrudeAlong] { faceExtrudeAlong({0, 1, 0}); }, shaftCheck});
+        steps.push_back({"face extrude sketch", 30, [&] {
+            fresh(); last.clear();
+            std::string r = aiRunTool("create_sketch", R"({"plane":"XY"})");
+            auto p = r.find("sketch_id=");
+            int sid = p == std::string::npos ? 0 : std::atoi(r.c_str() + p + 10);
+            aiRunTool("sketch_add", "{\"sketch_id\":" + std::to_string(sid) + R"(,"entities":[{"type":"circle","x":0,"y":0,"r":10}]})");
+            if (sk_.active) leaveSketchMode();
+            call("extrude", "{\"sketch_id\":" + std::to_string(sid) + R"(,"distance":20,"name":"Shaft"})");
+        }, [&] { return fails(); }});
+        steps.push_back({"face extrude sketch 2", 40, [&, faceExtrude] { faceExtrude(true); }, shaftCheck});
+
+        // Delete on a hole's wall heals the hole shut (Fusion's Delete Face).
+        auto deleteWall = [&, pickFace] {
+            if (!pickFace("Plate", [](const glm::dvec3&, const glm::dvec3&, bool planar) { return !planar; })) { last = "no wall"; return; }
+            deleteSelection();
+        };
+        auto plateCheck = [&] {
+            if (last == "no wall") return last;
+            if (!fails().empty()) return fails();
+            if (!near(volName("Plate"), 40 * 40 * 10.0)) return "vol " + numStr(volName("Plate"));
+            return std::string();
+        };
+        auto plate = [&] { fresh(); last.clear(); call("create_box", R"({"width":40,"depth":40,"height":10,"name":"Plate"})"); };
+        steps.push_back({"delete hole", 30, plate, [&] { return std::string(); }});
+        steps.push_back({"delete hole 2", 40, [&] { call("create_hole", R"({"positions":[[20,20,10]],"diameter":8})"); },
+            [&] { return volName("Plate") < 40 * 40 * 10.0 - 1 ? std::string() : "no hole " + last; }});
+        steps.push_back({"delete hole wall", 40, deleteWall, plateCheck});
+        steps.push_back({"delete blind hole", 30, plate, [&] { return std::string(); }});
+        steps.push_back({"delete blind hole 2", 40, [&] { call("create_hole", R"({"positions":[[20,20,10]],"diameter":8,"depth":5})"); },
+            [&] { return volName("Plate") < 40 * 40 * 10.0 - 1 ? std::string() : "no hole " + last; }});
+        steps.push_back({"delete blind hole wall", 40, deleteWall, plateCheck});
+
+        // Two bodies turned together go round the center of both, as one piece.
+        auto centerOf = [&](const std::string& nm) {
+            for (auto& [id, b] : doc_.bodies) {
+                if (!doc_.isBodyAlive(b) || b.name != nm) continue;
+                auto pit = doc_.parts.find(b.partId);
+                if (pit != doc_.parts.end() && pit->second.mesh && pit->second.mesh->bounds.valid())
+                    return glm::dvec3(pit->second.mesh->bounds.transformed(b.xform).center());
+            }
+            return glm::dvec3(1e9);
+        };
+        steps.push_back({"rotate together", 30, [&] {
+            fresh(); last.clear();
+            call("create_box", R"({"x":0,"y":0,"z":0,"width":10,"depth":10,"height":10,"name":"A"})");
+            call("create_box", R"({"x":20,"y":0,"z":0,"width":10,"depth":10,"height":10,"name":"B"})");
+        }, [&] { return nAlive() == 2 ? std::string() : "bodies " + std::to_string(nAlive()); }});
+        steps.push_back({"rotate together 2", 40, [&] { call("rotate", R"({"names":["A","B"],"axis":"z","angle":90})"); }, [&, centerOf] {
+            if (!fails().empty()) return fails() + last;
+            glm::dvec3 a = centerOf("A"), b = centerOf("B");
+            if (glm::length(a - glm::dvec3(15, -5, 5)) > 0.01) return "A at " + numStr(a.x) + "," + numStr(a.y) + " " + last;
+            if (glm::length(b - glm::dvec3(15, 15, 5)) > 0.01) return "B at " + numStr(b.x) + "," + numStr(b.y);
             return std::string();
         }});
     }

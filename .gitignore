@@ -15,4 +15,4 @@ tools/KestralExportAll/.vscode/
 *.out.txt
 src/*.jsonl
 src/*.obj
-bin/Kestral.old.exe
+bin/Kestral.old*.exe

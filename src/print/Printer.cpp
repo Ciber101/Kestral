@@ -257,6 +257,8 @@ PrintStatus bambuStatus(const PrinterConn& c, int timeoutMs) {
         st.bedC = p["bed_temper"].asNumber(-1);
         st.job = p["subtask_name"].asString();
         auto num = [](const Value& v, double d) { return v.isNumber() ? v.asNumber() : v.isString() && !v.asString().empty() ? std::atof(v.asString().c_str()) : d; };
+        // A job stopped by the user ends as "failed" with error 0x0300400C ("the task was canceled").
+        if (st.state == "failed" && (long long)num(p["print_error"], 0) == 0x0300400C) st.state = "cancelled";
         st.nozzleTarget = num(p["nozzle_target_temper"], -1);
         st.bedTarget = num(p["bed_target_temper"], -1);
         st.chamberC = num(p["chamber_temper"], -1);

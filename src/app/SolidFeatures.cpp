@@ -13,6 +13,7 @@
 #include <imgui.h>
 #include <imgui_stdlib.h>
 
+#include <glm/gtc/constants.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <algorithm>
@@ -22,9 +23,12 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
+#include <map>
 #include <mutex>
 #include <unordered_map>
 #include <filesystem>
+#include <fstream>
 #include <set>
 #include <sstream>
 
@@ -115,6 +119,13 @@ uint64_t ownSig(const Document& d, const Feature& f) {
             if (!ec) h = mixU64(h, (uint64_t)t.time_since_epoch().count());
             auto sz = std::filesystem::file_size(u8path(f.importPath), ec);
             if (!ec) h = mixU64(h, sz);
+        } else if (const char* fake = std::getenv("KESTRAL_IMPORT_STAMP")) {
+            // Debug: "fid:ticks:size" stands in for a file on another computer (to work out its chain).
+            unsigned long long fid = 0, ticks = 0, size = 0;
+            if (std::sscanf(fake, "%llu:%llu:%llu", &fid, &ticks, &size) == 3 && fid == f.id) {
+                h = mixU64(h, (uint64_t)ticks);
+                h = mixU64(h, (uint64_t)size);
+            }
         }
         return h;
     }
@@ -417,6 +428,8 @@ uint64_t ownSig(const Document& d, const Feature& f) {
         const AlignParams& a = *f.align;
         h = mixU64(h, 0x616c676e);
         h = mixU64(h, a.flip ? 1 : 0);
+        h = hashStr(h, a.angleExpr);
+        h = hashStr(h, a.offsetExpr);
         auto pk = [&](const AlignParams::Pick& q) {
             h = mixU64(h, (uint64_t)q.kind);
             h = mixU64(h, q.ref.first); h = mixU64(h, q.ref.second);
@@ -424,7 +437,10 @@ uint64_t ownSig(const Document& d, const Feature& f) {
         };
         pk(a.from); pk(a.to);
         for (auto& t : a.targets) { h = mixU64(h, t.first); h = mixU64(h, t.second); }
-        return h;
+        std::set<std::string> ns;
+        for (auto& n : peval::names(a.angleExpr)) ns.insert(n);
+        for (auto& n : peval::names(a.offsetExpr)) ns.insert(n);
+        return hashParams(h, d, ns);
     }
     if ((f.type == FeatureType::Sweep || f.type == FeatureType::Loft) && f.multi) {
         for (uint32_t sid : f.multi->sketchIds) {
@@ -466,6 +482,8 @@ uint64_t ownSig(const Document& d, const Feature& f) {
                                    &mv.pzExpr, &mv.sxExpr, &mv.syExpr, &mv.szExpr};
         for (auto* e : es) h = hashStr(h, *e);
         h = mixU64(h, mv.copy ? 1 : 0);
+        h = mixU64(h, mv.together ? 1 : 0);
+        h = mixU64(h, (uint64_t)mv.op);
         h = mixU64(h, mv.hasMat ? 1 : 0);
         if (mv.hasMat)
             for (int i = 0; i < 16; ++i) h = hashDbl(h, mv.mat[i]);
@@ -579,6 +597,12 @@ uint64_t ownSig(const Document& d, const Feature& f) {
         h = mixU64(h, f.extrude->to.slot);
         h = mixU64(h, f.extrude->to.face);
         h = mixU64(h, f.extrude->to.faceTotal);
+        for (auto& [msid, mpts] : f.extrude->moreSketches) {   // only when used: old steps hash as before
+            h = mixU64(h, msid);
+            for (auto& q : mpts) { h = hashDbl(h, q.x); h = hashDbl(h, q.y); }
+            auto mit = d.sketches.find(msid);
+            h = mixU64(h, mit != d.sketches.end() ? sketchSig(mit->second) : 0xdead);
+        }
     } else if (f.type == FeatureType::Revolve && f.revolve) {
         sketchId = f.revolve->sketchId;
         e1 = f.revolve->angleExpr;
@@ -658,8 +682,11 @@ struct App::RecomputeResults {
         std::vector<TargetRef> consumed;             // bodies these outputs replace
         bool isImport = false;
         kernel::ImportResult import;
+        MeshPtr cutPreview;                          // a cut's tool shape, shown red while its dialog is open
     };
     std::vector<Item> items;
+    int keptSaved = 0;          // steps shown with their saved shapes although their inputs changed
+    std::string keptFirst;      // the first such step, for the message
 };
 
 namespace {
@@ -719,10 +746,54 @@ bool resolveTarget(const Document& snap, const std::vector<App::RecomputeResults
     return true;
 }
 
+// Whether a step's output is shown now (eye on, folder shown). Fresh outputs take their visibility
+// from the body they came from (as the document will once the pass lands), unless a saved override
+// says otherwise. Hidden parts are never changed by a join, cut or hole.
+bool targetShown(const Document& snap, const std::vector<App::RecomputeResults::Item>& done, TargetRef t) {
+    std::function<bool(uint32_t, uint32_t, int)> shown = [&](uint32_t fid, uint32_t slot, int depth) -> bool {
+        if (const BodyOverride* o = snap.findOverride(fid, slot)) return o->visible;
+        const App::RecomputeResults::Item* fr = nullptr;
+        for (auto& it : done)
+            if (it.featureId == fid) fr = &it;
+        std::vector<uint32_t> bids = snap.featureBodies(fid);
+        if (!fr && slot < bids.size()) {
+            const Body& hb = snap.bodies.at(bids[slot]);
+            return hb.visible && snap.isComponentShown(hb.componentId);
+        }
+        if (fr && fr->isImport) {
+            // A fresh import (every rebuild from a file): hidden when one of its folders is hidden,
+            // as the bodies already shown would say. Without this a rebuild cut parts that were
+            // hidden while you worked (the motor in a hidden import folder).
+            const auto& imp = fr->import;
+            if (slot >= imp.bodies.size()) return true;
+            const Feature* ff = nullptr;
+            for (auto& t : snap.timeline) if (t.id == fid) ff = &t;
+            std::string ext = ff ? toLower(pathToU8(u8path(ff->importPath).extension())) : std::string();
+            bool isStep = ext == ".step" || ext == ".stp";
+            if (isStep && snap.compHidden.count(Document::overrideKey(fid, 0))) return false;
+            int c = imp.bodies[slot].comp;
+            for (int guard = 0; c >= 0 && c < (int)imp.comps.size() && guard < 256; ++guard) {
+                uint32_t cs = (c == 0 && imp.firstCompIsRoot) ? 0u
+                            : (uint32_t)((isStep ? 1 : 0) + c - (imp.firstCompIsRoot ? 1 : 0));
+                if (snap.compHidden.count(Document::overrideKey(fid, cs))) return false;
+                c = imp.comps[c].parent;
+            }
+            return true;
+        }
+        if (!fr || depth > 64) return true;
+        TargetRef r{0, 0};
+        if (slot < fr->instanceRefs.size() && fr->instanceRefs[slot].first) r = fr->instanceRefs[slot];
+        else if (slot < fr->consumed.size()) r = fr->consumed[slot];
+        else if (!fr->consumed.empty()) r = fr->consumed[0];
+        return r.first ? shown(r.first, r.second, depth + 1) : true;
+    };
+    return shown(t.first, t.second, 0);
+}
+
 // Bodies alive just before feature `f` (made earlier, not yet replaced) that touch any of the tool
 // shapes: what Fusion's Join / Cut pick automatically when you do not choose bodies yourself.
 std::vector<TargetRef> autoTargets(const Document& snap, const std::vector<App::RecomputeResults::Item>& done,
-                                   const Feature& f, const std::vector<ShapePtr>& tools) {
+                                   const Feature& f, const std::vector<ShapePtr>& tools, std::vector<bool>* hiddenOut = nullptr) {
     std::vector<TargetRef> out;
     int fi = snap.featureIndex(f.id);
     if (fi < 0) return out;
@@ -737,9 +808,14 @@ std::vector<TargetRef> autoTargets(const Document& snap, const std::vector<App::
         std::vector<uint32_t> ids = snap.featureBodies(src.id);
         size_t count = fresh ? (fresh->isImport ? fresh->import.bodies.size() : fresh->shapes.size()) : ids.size();
         for (uint32_t k = 0; k < count; ++k) {
+            // Hidden bodies (eye off, on the body or its folder) are reported, so the caller passes
+            // them through untouched (a join or cut never changes a part you hid). They stay in the
+            // list, so the step's output slots keep their old numbers.
+            bool hiddenNow = !targetShown(snap, done, {src.id, k});
+            const char* atDbg = std::getenv("KESTRAL_AT");
+            bool dbg = atDbg && (uint32_t)std::atoi(atDbg) == f.id;
             if (fresh) {
-                if (!fresh->ok) break;
-                if (k < ids.size() && !snap.bodies.at(ids[k]).visible) continue;
+                if (!fresh->ok) { if (dbg) std::fprintf(stderr, "AT %u: %u:%u fresh failed\n", f.id, src.id, k); break; }
                 bool used = false;
                 for (auto& it : done) {
                     if (it.featureId == f.id || !it.ok) continue;
@@ -748,20 +824,22 @@ std::vector<TargetRef> autoTargets(const Document& snap, const std::vector<App::
                     for (auto& c : it.consumed)
                         if (c.first == src.id && c.second == k) used = true;
                 }
-                if (used) continue;
+                if (used) { if (dbg) std::fprintf(stderr, "AT %u: %u:%u used earlier this pass\n", f.id, src.id, k); continue; }
             } else {
                 const Body& b = snap.bodies.at(ids[k]);
-                if (!b.visible) continue;
                 if (b.consumedBy != 0 && b.consumedBy != f.id) {
                     int ci = snap.featureIndex(b.consumedBy);
-                    if (ci >= 0 && ci < fi && !snap.timeline[ci].suppressed && !snap.timeline[ci].failed) continue;
+                    if (ci >= 0 && ci < fi && !snap.timeline[ci].suppressed && !snap.timeline[ci].failed) { if (dbg) std::fprintf(stderr, "AT %u: %u:%u consumed by %u\n", f.id, src.id, k, b.consumedBy); continue; }
                 }
             }
             ResolvedTarget rt;
             if (!resolveTarget(snap, done, {src.id, k}, rt) || !rt.shape) continue;
+            if (dbg) std::fprintf(stderr, "AT %u: %u:%u alive '%s' hidden %d\n", f.id, src.id, k, rt.name.c_str(), (int)hiddenNow);
             for (auto& t : tools) {
                 if (kernel::shapesTouch(t, glm::mat4(1.f), rt.shape, rt.xform)) {
+                    if (dbg) std::fprintf(stderr, "AT %u:   touches\n", f.id);
                     out.push_back({src.id, k});
+                    if (hiddenOut) hiddenOut->push_back(hiddenNow);
                     break;
                 }
             }
@@ -929,6 +1007,22 @@ std::string findImportFile(const Document& snap, const std::string& stored) {
     for (auto& d : dirs)
         if (std::filesystem::exists(d / u8path(name), ec)) return pathToU8(d / u8path(name));
     return stored;
+}
+
+// A body name nobody else has: copies and pattern instances must be told apart by name (tools and
+// people pick bodies by name). Bodies this feature made before do not count.
+std::string freeBodyName(const Document& snap, uint32_t fid, const std::vector<std::string>& made, const std::string& want) {
+    auto taken = [&](const std::string& c) {
+        for (auto& [bid, b] : snap.bodies)
+            if (b.featureId != fid && b.name == c) return true;
+        return std::find(made.begin(), made.end(), c) != made.end();
+    };
+    if (!taken(want)) return want;
+    for (int k = 2; k < 1000; ++k) {
+        std::string c = want + " (" + std::to_string(k) + ")";
+        if (!taken(c)) return c;
+    }
+    return want;
 }
 
 void computeFeature(const Document& snap, const std::vector<App::RecomputeResults::Item>& done,
@@ -1274,7 +1368,7 @@ void computeFeature(const Document& snap, const std::vector<App::RecomputeResult
                     }
                     item.shapes.push_back(nullptr);
                     item.meshes.push_back(nullptr);
-                    item.names.push_back(ix == 0 ? base : base + ":" + std::to_string(ix));
+                    item.names.push_back(ix == 0 ? base : freeBodyName(snap, f.id, item.names, base + ":" + std::to_string(ix)));
                     item.xforms.push_back(x * rt.xform);
                     item.instanceRefs.push_back(ref);
                 }
@@ -1318,7 +1412,7 @@ void computeFeature(const Document& snap, const std::vector<App::RecomputeResult
                     }
                     item.shapes.push_back(nullptr);   // instances share the target part: no new geometry
                     item.meshes.push_back(nullptr);
-                    item.names.push_back(n == 0 ? base : base + ":" + std::to_string(n));
+                    item.names.push_back(n == 0 ? base : freeBodyName(snap, f.id, item.names, base + ":" + std::to_string(n)));
                     item.xforms.push_back(x * rt.xform);   // copies move in world space
                     item.instanceRefs.push_back(ref);
                     ++n;
@@ -1348,7 +1442,16 @@ void computeFeature(const Document& snap, const std::vector<App::RecomputeResult
             ShapePtr out = kernel::mirrorShape(rt.shape, lo, ln);
             item.shapes.push_back(out);
             item.meshes.push_back(kernel::tessellate(*out));
-            item.names.push_back(rt.name.empty() ? f.name : rt.name);
+            // The mirrored copy sits beside its source, so it gets its own name: Right and Left swap,
+            // otherwise "Body (1)" like a pasted copy.
+            std::string base = rt.name.empty() ? f.name : rt.name, want = base;
+            for (auto [a, b] : {std::pair<const char*, const char*>{"Right", "Left"}, {"Left", "Right"},
+                                {"right", "left"}, {"left", "right"}}) {
+                size_t p = base.find(a);
+                if (p != std::string::npos) { want = base.substr(0, p) + b + base.substr(p + std::strlen(a)); break; }
+            }
+            if (want == base) want = base + " (1)";
+            item.names.push_back(freeBodyName(snap, f.id, item.names, want));
             item.xforms.push_back(rt.xform);
             item.instanceRefs.push_back(ref);   // keeps the source component; the shape itself is new
         }
@@ -1397,7 +1500,9 @@ void computeFeature(const Document& snap, const std::vector<App::RecomputeResult
             for (auto& pc : pieces) {
                 item.shapes.push_back(pc);
                 item.meshes.push_back(kernel::tessellate(*pc));
-                item.names.push_back((rt.name.empty() ? f.name : rt.name) + " " + std::to_string(++k));
+                // The first piece keeps the body's name (splits used to stack " 1 1 1" on it).
+                std::string base = rt.name.empty() ? f.name : rt.name;
+                item.names.push_back(k++ == 0 ? base : freeBodyName(snap, f.id, item.names, base + " " + std::to_string(k)));
                 item.xforms.push_back(rt.xform);
             }
             item.consumed.push_back(ref);
@@ -1456,29 +1561,45 @@ void computeFeature(const Document& snap, const std::vector<App::RecomputeResult
     if (f.type == FeatureType::Align) {
         const AlignParams& a = *f.align;
         if (!a.from.ref.first || !a.to.ref.first) return;
-        auto snapOf = [&](const AlignParams::Pick& pk, glm::dvec3& p, glm::dvec3& dir, bool& hasDir) {
+        // oppose: two flat faces mate (normals end up opposite). Circles and round faces line their axes up.
+        auto snapOf = [&](const AlignParams::Pick& pk, glm::dvec3& p, glm::dvec3& dir, bool& hasDir, bool& oppose) {
+            hasDir = false;
+            oppose = false;
             ResolvedTarget rt;
             resolve(pk.ref, rt);
+            glm::dmat4 xf(rt.xform);
             if (pk.kind == 0) {
                 if (pk.total && kernel::faceCount(rt.shape) != pk.total)
                     throw std::runtime_error("The body changed shape, so the align face no longer matches. Edit Align and pick again.");
+                glm::dvec3 axO, axD;
+                if (kernel::faceRoundAxis(rt.shape, pk.sub, axO, axD)) {
+                    p = glm::dvec3(xf * glm::dvec4(axO, 1.0));
+                    dir = glm::normalize(glm::dmat3(xf) * axD);
+                    hasDir = true;
+                    return;
+                }
                 glm::dvec3 c, n;
                 bool planar = false;
                 if (!kernel::faceInfo(rt.shape, pk.sub, c, n, planar))
                     throw std::runtime_error("The align face is gone. Edit Align and pick again.");
-                glm::dmat4 xf(rt.xform);
                 p = glm::dvec3(xf * glm::dvec4(c, 1.0));
                 dir = glm::normalize(glm::dmat3(xf) * n);
                 hasDir = true;
+                oppose = planar;
             } else {
+                if (std::getenv("KESTRAL_CHECK")) std::fprintf(stderr, "ALIGN %s ref %u:%u edges now %u saved %u\n", f.name.c_str(), pk.ref.first, pk.ref.second, kernel::edgeCount(rt.shape), pk.total);
                 if (pk.total && kernel::edgeCount(rt.shape) != pk.total)
                     throw std::runtime_error("The body changed shape, so the align edge no longer matches. Edit Align and pick again.");
                 kernel::EdgeGeom g;
                 if (!kernel::edgeGeom(rt.shape, rt.xform, pk.sub, g))
                     throw std::runtime_error("The align edge is gone. Edit Align and pick again.");
-                hasDir = false;
                 if (pk.kind == 2) {
                     p = pk.end == 2 ? g.b : g.a;
+                } else if (g.type == 1 || g.type == 2) {
+                    // The outline of a round face: the circle's own center, and its axis.
+                    p = g.center;
+                    dir = glm::length(g.normal) > 1e-9 ? glm::normalize(g.normal) : glm::dvec3(0, 0, 1);
+                    hasDir = true;
                 } else if (g.type == 0) {
                     p = (g.a + g.b) * 0.5;
                     dir = glm::normalize(g.b - g.a);
@@ -1491,28 +1612,39 @@ void computeFeature(const Document& snap, const std::vector<App::RecomputeResult
             }
         };
         glm::dvec3 fp, fd, tp, td;
-        bool fdir = false, tdir = false;
-        snapOf(a.from, fp, fd, fdir);
-        snapOf(a.to, tp, td, tdir);
-        glm::mat4 R(1.f);
-        bool sameKind = a.from.kind == a.to.kind && a.from.kind != 2;
-        if (sameKind && fdir && tdir) {
-            glm::dvec3 b = a.from.kind == 0 ? -td : td;   // faces mate; edges run the same way
+        bool fdir = false, tdir = false, fOpp = false, tOpp = false;
+        snapOf(a.from, fp, fd, fdir, fOpp);
+        snapOf(a.to, tp, td, tdir, tOpp);
+        // All in double precision: one rounding to float at the very end, on the final placement.
+        glm::dmat4 R(1.0);
+        glm::dvec3 axis = tdir ? glm::normalize(td) : glm::dvec3(0);
+        if (fdir && tdir && a.from.kind != 2 && a.to.kind != 2) {
+            glm::dvec3 b = (fOpp && tOpp) ? -td : td;   // flat faces mate; circles and edges run the same way
             if (a.flip) b = -b;
             glm::dvec3 u = glm::normalize(fd), v = glm::normalize(b);
             glm::dvec3 c = glm::cross(u, v);
-            double s = glm::length(c), d = glm::dot(u, v);
-            if (s < 1e-8) {
-                if (d < 0) {
+            double s = glm::length(c), dd = glm::dot(u, v);
+            if (s < 1e-12) {
+                if (dd < 0) {
+                    // Half turn about any axis square to u: take the one that disturbs the part least.
                     glm::dvec3 ax = std::abs(u.z) < 0.9 ? glm::dvec3(0, 0, 1) : glm::dvec3(1, 0, 0);
                     ax = glm::normalize(glm::cross(u, ax));
-                    R = glm::rotate(glm::mat4(1.f), 3.14159265f, glm::vec3(ax));
+                    R = glm::rotate(glm::dmat4(1.0), glm::pi<double>(), ax);
                 }
             } else {
-                R = glm::rotate(glm::mat4(1.f), (float)std::atan2(s, d), glm::vec3(glm::normalize(c)));
+                R = glm::rotate(glm::dmat4(1.0), std::atan2(s, dd), glm::normalize(c));
             }
+        } else if (a.flip && tdir) {
+            R = glm::rotate(glm::dmat4(1.0), glm::pi<double>(), std::abs(axis.z) < 0.9 ? glm::normalize(glm::cross(axis, glm::dvec3(0, 0, 1)))
+                                                                                       : glm::normalize(glm::cross(axis, glm::dvec3(1, 0, 0))));
         }
-        glm::mat4 T = glm::translate(glm::mat4(1.f), glm::vec3(tp)) * R * glm::translate(glm::mat4(1.f), glm::vec3(-fp));
+        double angle = a.angleExpr.empty() ? 0.0 : peval::eval(a.angleExpr, snap.params);
+        double offset = a.offsetExpr.empty() ? 0.0 : peval::eval(a.offsetExpr, snap.params);
+        if (std::abs(angle) > 1e-12 && !tdir) throw std::runtime_error("Angle needs a destination with a direction (a face, a circle or an edge)");
+        if (std::abs(offset) > 1e-12 && !tdir) throw std::runtime_error("Offset needs a destination with a direction (a face, a circle or an edge)");
+        glm::dmat4 spin = std::abs(angle) > 1e-12 ? glm::rotate(glm::dmat4(1.0), glm::radians(angle), axis) : glm::dmat4(1.0);
+        glm::dvec3 land = tp + axis * offset;
+        glm::dmat4 Td = glm::translate(glm::dmat4(1.0), land) * spin * R * glm::translate(glm::dmat4(1.0), -fp);
         for (const TargetRef& ref : a.targets) {
             if (ref == a.to.ref) continue;
             ResolvedTarget rt;
@@ -1520,7 +1652,7 @@ void computeFeature(const Document& snap, const std::vector<App::RecomputeResult
             item.shapes.push_back(nullptr);
             item.meshes.push_back(nullptr);
             item.names.push_back(rt.name.empty() ? f.name : rt.name);
-            item.xforms.push_back(T * rt.xform);
+            item.xforms.push_back(glm::mat4(Td * glm::dmat4(rt.xform)));
             item.instanceRefs.push_back(ref);
             item.consumed.push_back(ref);
         }
@@ -1569,6 +1701,8 @@ void computeFeature(const Document& snap, const std::vector<App::RecomputeResult
             tool = kernel::applyBool(kernel::BoolOp::Join, tool, ts)[0];
         }
         auto outs = kernel::applyBool(boolOpOf(cp.op), tool, {{target.shape, target.xform}});
+        if (f.rules >= 1)   // flush faces become one face (steps made from fix1064 on)
+            for (auto& o : outs) o = kernel::mergeFlushFaces(o);
         for (size_t i = 0; i < outs.size(); ++i) {
             item.shapes.push_back(outs[i]);
             item.meshes.push_back(kernel::tessellate(*outs[i]));
@@ -1667,7 +1801,9 @@ void computeFeature(const Document& snap, const std::vector<App::RecomputeResult
         std::vector<ShapePtr> probes;
         for (auto& h : holes) probes.push_back(cylinder(h.c, h.r, h.dir, 100000, true));
         ShapePtr probe = fuseAll(probes);
-        std::vector<TargetRef> tids = hp.targets.empty() ? autoTargets(snap, done, f, {probe}) : hp.targets;
+        std::vector<bool> hiddenT;
+        std::vector<TargetRef> tids = hp.targets.empty() ? autoTargets(snap, done, f, {probe}, &hiddenT) : hp.targets;
+        if (!hp.targets.empty() && f.rules >= 1) for (auto& t : tids) hiddenT.push_back(!targetShown(snap, done, t));
         if (tids.empty()) throw std::runtime_error("The holes do not touch any body");
         std::vector<ResolvedTarget> rts(tids.size());
         for (size_t i = 0; i < tids.size(); ++i) resolve(tids[i], rts[i]);
@@ -1707,6 +1843,15 @@ void computeFeature(const Document& snap, const std::vector<App::RecomputeResult
         }
         ShapePtr tool = fuseAll(cutters);
         for (size_t i = 0; i < tids.size(); ++i) {
+            if (i < hiddenT.size() && hiddenT[i]) {
+                // A hidden part the hole line passes through: left as it was.
+                item.shapes.push_back(rts[i].shape);
+                item.meshes.push_back(rts[i].mesh ? rts[i].mesh : kernel::tessellate(*rts[i].shape));
+                item.names.push_back(rts[i].name.empty() ? f.name : rts[i].name);
+                item.xforms.push_back(rts[i].xform);
+                item.consumed.push_back(tids[i]);
+                continue;
+            }
             auto outs = kernel::applyBool(kernel::BoolOp::Cut, tool, {{rts[i].shape, rts[i].xform}});
             if (hp.tapped) {
                 const threads::Family& fam = threads::families()[0];
@@ -1715,7 +1860,29 @@ void computeFeature(const Document& snap, const std::vector<App::RecomputeResult
                         kernel::ThreadCut tc;
                         tc.origin = holes[hi].c;
                         tc.dir = drillDir[hi];
-                        double reach = through ? std::min(kernel::shapeDiag(rts[i].shape), pitch * 180.0) : depth;
+                        // A through thread only needs to reach the far side of this body: a long helix
+                        // cut into a big body takes minutes.
+                        double reach = depth;
+                        if (through) {
+                            reach = std::min(kernel::shapeDiag(rts[i].shape), pitch * 180.0);
+                            // The material around the hole line: a slim cylinder kept where it is inside the body.
+                            Aabb bb;
+                            try {
+                                ShapePtr probeCyl = cylinder(holes[hi].c - tc.dir * pitch, holes[hi].r * 1.6, tc.dir, reach + pitch, false);
+                                auto near = kernel::applyBool(kernel::BoolOp::Intersect, probeCyl, {{o, glm::mat4(1.f)}});
+                                for (auto& n : near) if (n) bb.add(kernel::shapeBounds(n, glm::mat4(1.f)));
+                            } catch (...) {}
+                            if (!bb.valid()) bb = kernel::shapeBounds(o, glm::mat4(1.f));
+                            if (bb.valid()) {
+                                double far = 0;
+                                for (int c = 0; c < 8; ++c) {
+                                    glm::dvec3 p((c & 1) ? bb.max.x : bb.min.x, (c & 2) ? bb.max.y : bb.min.y,
+                                                 (c & 4) ? bb.max.z : bb.min.z);
+                                    far = std::max(far, glm::dot(p - holes[hi].c, glm::normalize(tc.dir)));
+                                }
+                                reach = std::min(reach, far + pitch);
+                            }
+                        }
                         tc.length = std::max(reach, pitch);
                         tc.pitch = pitch;
                         tc.starts = 1;
@@ -1903,7 +2070,8 @@ void computeFeature(const Document& snap, const std::vector<App::RecomputeResult
         for (auto& pc : pieces) {
             item.shapes.push_back(pc);
             item.meshes.push_back(kernel::tessellate(*pc));
-            item.names.push_back((rt.name.empty() ? f.name : rt.name) + " " + std::to_string(++k));
+            std::string base = rt.name.empty() ? f.name : rt.name;
+            item.names.push_back(k++ == 0 ? base : freeBodyName(snap, f.id, item.names, base + " " + std::to_string(k)));
             item.xforms.push_back(glm::mat4(1.f));
         }
         item.consumed.push_back(sp.targets[0]);
@@ -2169,7 +2337,20 @@ void computeFeature(const Document& snap, const std::vector<App::RecomputeResult
         }
         glm::mat4 sharedW(1.f);
         bool useShared = false;
-        if (!extra.empty()) {
+        if (mv.together && !mv.hasMat && !pivotGiven) {
+            // One turn for all of them, about the center of their combined bounds.
+            Aabb all;
+            for (const TargetRef& ref : refs) {
+                ResolvedTarget rt;
+                if (!resolveTarget(snap, done, ref, rt)) continue;
+                if (rt.mesh && rt.mesh->bounds.valid()) all.add(rt.mesh->bounds.transformed(rt.xform));
+                else if (rt.shape) all.add(kernel::shapeBounds(rt.shape, rt.xform));
+            }
+            glm::vec3 pv = all.valid() ? all.center() : glm::vec3(0.f);
+            sharedW = T * glm::translate(glm::mat4(1.f), pv) * R * S * glm::translate(glm::mat4(1.f), -pv);
+            useShared = true;
+            refs.insert(refs.end(), extra.begin(), extra.end());
+        } else if (!extra.empty()) {
             ResolvedTarget first;
             if (!resolveTarget(snap, done, refs[0], first)) throw std::runtime_error("A grouped body is gone");
             glm::dvec3 pivot = given;
@@ -2222,7 +2403,20 @@ void computeFeature(const Document& snap, const std::vector<App::RecomputeResult
                 item.meshes.push_back(nullptr);
                 item.xforms.push_back(M);
             }
-            item.names.push_back(mv.copy ? nm + " (1)" : nm);   // Fusion names a pasted copy "Body1 (1)"
+            if (mv.copy) {
+                // Fusion names a pasted copy "Body1 (1)"; the next copy of Body1 is "Body1 (2)", so
+                // every copy can be told apart by its name.
+                auto taken = [&](const std::string& c) {
+                    for (auto& [bid, b] : snap.bodies)
+                        if (b.featureId != f.id && b.name == c) return true;
+                    return std::find(item.names.begin(), item.names.end(), c) != item.names.end();
+                };
+                int k = 1;
+                while (k < 1000 && taken(nm + " (" + std::to_string(k) + ")")) ++k;
+                item.names.push_back(nm + " (" + std::to_string(k) + ")");
+            } else {
+                item.names.push_back(nm);
+            }
             item.instanceRefs.push_back(ref);
             if (!mv.copy) item.consumed.push_back(ref);
         }
@@ -2322,6 +2516,18 @@ void computeFeature(const Document& snap, const std::vector<App::RecomputeResult
                     throw std::runtime_error(x.profilePts.empty() ? "The sketch has no closed profile"
                                                                   : "The picked profiles no longer exist. Edit the feature and pick them again.");
                 for (auto& rg : regions) tools.push_back(kernel::extrudeRegion(rg, dir, dist, x.symmetric, taper));
+                // Profiles from other sketches: same distance, each along its own sketch's normal
+                // (the flip follows the main sketch: a sketch facing the other way flips too).
+                for (auto& [msid, mpts] : x.moreSketches) {
+                    auto mit = snap.sketches.find(msid);
+                    if (mit == snap.sketches.end()) throw std::runtime_error("A sketch this extrude uses is missing");
+                    glm::dvec3 mdir = mit->second.plane.normal();
+                    if (glm::dot(mdir, sk.plane.normal()) < 0) mdir = -mdir;
+                    if (reverse) mdir = -mdir;
+                    std::vector<RegionLoops> mr = sketchRegionsAt(mit->second, mpts);
+                    if (mr.empty()) throw std::runtime_error("The picked profiles in " + mit->second.name + " no longer exist. Edit the feature and pick them again.");
+                    for (auto& rg : mr) tools.push_back(kernel::extrudeRegion(rg, mdir, dist, x.symmetric, taper));
+                }
             }
         }
     } else {
@@ -2364,6 +2570,7 @@ void computeFeature(const Document& snap, const std::vector<App::RecomputeResult
     // New Body: one body per disjoint profile region, like Fusion. Boolean ops: one fused tool.
     std::vector<ShapePtr> outs;
     std::vector<std::string> names;
+    std::vector<glm::mat4> outX;
     if (op == 0) {
         for (size_t i = 0; i < tools.size(); ++i) {
             outs.push_back(tools[i]);
@@ -2377,15 +2584,81 @@ void computeFeature(const Document& snap, const std::vector<App::RecomputeResult
             tool = kernel::applyBool(kernel::BoolOp::Join, tool, ts)[0];
         }
         std::vector<TargetRef> tids = f.type == FeatureType::Extrude ? f.extrude->targets : f.revolve->targets;
-        if (tids.empty()) tids = autoTargets(snap, done, f, {tool});
+        // Join from a body's own faces grows that body only: other parts it happens to touch stay
+        // separate (they used to be merged in).
+        if (tids.empty() && op == 1 && f.type == FeatureType::Extrude && !f.extrude->faces.empty())
+            for (auto& fr : f.extrude->faces) {
+                TargetRef r{fr.feature, fr.slot};
+                if (std::find(tids.begin(), tids.end(), r) == tids.end()) tids.push_back(r);
+            }
+        std::vector<bool> hiddenT;
+        if (tids.empty()) tids = autoTargets(snap, done, f, {tool}, &hiddenT);
+        else if (f.rules >= 1) for (auto& t : tids) hiddenT.push_back(!targetShown(snap, done, t));   // chosen ones too (steps made from fix1064 on)
+        if (op == 2) item.cutPreview = kernel::tessellate(*tool);
+        std::vector<TargetRef> passThrough;   // hidden parts it touches: left as they were
+        std::vector<TargetRef> allT = tids;
+        if (!hiddenT.empty()) {
+            std::vector<TargetRef> keep;
+            for (size_t i = 0; i < tids.size(); ++i) (i < hiddenT.size() && hiddenT[i] ? passThrough : keep).push_back(tids[i]);
+            tids = keep;
+            if (op == 1 && tids.empty()) { passThrough.clear(); allT.clear(); }
+        }
+        // Puts the untouched hidden parts back among the outputs, in their old places, so the
+        // step's outputs keep the numbers later steps know them by.
+        auto addPassThrough = [&](std::vector<ShapePtr>& o, std::vector<std::string>& nm, std::vector<glm::mat4>& xf) {
+            if (passThrough.empty()) return;
+            std::vector<ShapePtr> o2;
+            std::vector<std::string> n2;
+            std::vector<glm::mat4> x2;
+            size_t vi = 0;
+            bool perTarget = op != 1 && o.size() == tids.size();
+            for (auto& r : allT) {
+                bool hidden = std::find(passThrough.begin(), passThrough.end(), r) != passThrough.end();
+                if (hidden) {
+                    ResolvedTarget rt;
+                    resolve(r, rt);
+                    o2.push_back(rt.shape);
+                    n2.push_back(rt.name.empty() ? f.name : rt.name);
+                    x2.push_back(rt.xform);
+                } else if (perTarget && vi < o.size()) {
+                    o2.push_back(o[vi]);
+                    n2.push_back(vi < nm.size() ? nm[vi] : f.name);
+                    x2.push_back(glm::mat4(1.f));
+                    ++vi;
+                }
+            }
+            // Each output's source (its look and visibility come from it): hidden pass throughs
+            // name theirs in instanceRefs, the rest go by the consumed list.
+            if (perTarget) item.consumed = allT;
+            else for (auto& h : passThrough) item.consumed.push_back(h);
+            if (!perTarget) {
+                // A join (one result) or a cut that split something: results first, hidden parts after.
+                std::vector<ShapePtr> o3 = o;
+                std::vector<std::string> n3 = nm;
+                std::vector<glm::mat4> x3(o.size(), glm::mat4(1.f));
+                for (size_t i = 0; i < o2.size(); ++i) { o3.push_back(o2[i]); n3.push_back(n2[i]); x3.push_back(x2[i]); }
+                o = o3; nm = n3; xf = x3;
+            } else {
+                o = o2; nm = n2; xf = x2;
+            }
+            item.instanceRefs.assign(o.size(), TargetRef{0, 0});
+            size_t k = perTarget ? 0 : o.size() - passThrough.size();
+            for (size_t i = 0; i < allT.size() && k < o.size(); ++i) {
+                bool hidden = std::find(passThrough.begin(), passThrough.end(), allT[i]) != passThrough.end();
+                if (perTarget) { if (hidden) item.instanceRefs[k] = allT[i]; ++k; }
+                else if (hidden) item.instanceRefs[k++] = allT[i];
+            }
+        };
         if (tids.empty()) {
             if (op == 1) {
                 // Join with nothing to join: Fusion makes a new body.
                 outs.push_back(tool);
                 names.push_back(f.name);
-            } else {
+            } else if (passThrough.empty()) {
                 throw std::runtime_error(op == 2 ? "Nothing to cut: the cut does not touch any body"
                                                  : "Nothing to intersect: the shape does not touch any body");
+            } else {
+                item.warn = f.name + ": it only touches hidden parts, so they are left as they were.";
             }
         } else {
             std::vector<kernel::BoolTarget> targets;
@@ -2400,14 +2673,24 @@ void computeFeature(const Document& snap, const std::vector<App::RecomputeResult
             outs = kernel::applyBool(boolOpOf(op), tool, targets);
             for (size_t i = 0; i < outs.size(); ++i) names.push_back(i < tnames.size() ? tnames[i] : f.name);
         }
+        outX.assign(outs.size(), glm::mat4(1.f));
+        addPassThrough(outs, names, outX);
     }
 
     for (size_t i = 0; i < outs.size(); ++i) {
         item.shapes.push_back(outs[i]);
         item.meshes.push_back(kernel::tessellate(*outs[i]));
+        if (!outX.empty()) item.xforms.push_back(i < outX.size() ? outX[i] : glm::mat4(1.f));
     }
     item.names = std::move(names);
 }
+
+// When this file was built: cached results of an older build are never reused.
+const uint64_t kLogicStamp = [] {
+    uint64_t h = 1469598103934665603ull;
+    for (const char* c = __DATE__ " " __TIME__ " logic"; *c; ++c) h = (h ^ (uint8_t)*c) * 1099511628211ull;
+    return h;
+}();
 
 void runRecomputePass(const Document& snap, App::RecomputeResults& out, const CancelToken& cancel, JobSystem* jobs) {
     uint64_t running = kFnvSeed;
@@ -2415,14 +2698,40 @@ void runRecomputePass(const Document& snap, App::RecomputeResults& out, const Ca
     for (int i = 0; i < snap.markerPos && i < (int)snap.timeline.size(); ++i)
         if (!snap.timeline[i].suppressed) ++total;
     int done = 0;
+    // Which step used up which body, so a second step that changes the same body can be spotted.
+    // That happens when a step failed, was tried again as a new step, and the first try starts
+    // working later (a kernel fix): both then made a copy of the body, stacked in the same place.
+    std::map<TargetRef, std::vector<int>> takers;           // body -> timeline indexes of the steps that used it up
+    std::map<uint32_t, std::vector<TargetRef>> usedBefore;  // step id -> bodies it used up last time
+    for (auto& [bid, b] : snap.bodies) {
+        if (!b.consumedBy) continue;
+        std::vector<uint32_t> ids = snap.featureBodies(b.featureId);
+        for (uint32_t k = 0; k < ids.size(); ++k)
+            if (ids[k] == bid) usedBefore[b.consumedBy].push_back({b.featureId, k});
+    }
+    std::vector<uint64_t> chainAt(snap.timeline.size(), 0), ownAt(snap.timeline.size(), 0);
+    // Once a pinned result is used, the disk cache is off for the rest of the pass: its key only
+    // knows the steps' settings, not that a pin changed what they are built from, so a result
+    // cached before the pin existed would come back.
+    bool afterPin = false;
+    bool afterRebuiltFromSteps = false;
     for (int i = 0; i < snap.markerPos && i < (int)snap.timeline.size(); ++i) {
         if (cancel.isCancelled()) break;
         const Feature& f = snap.timeline[i];
         if (f.suppressed) continue;
         uint64_t own = ownSig(snap, f);
         uint64_t chain = mixU64(running, own);
+        chainAt[i] = chain;
+        ownAt[i] = own;
         ++done;
-        if (chain == f.chainSig && !f.failed) {
+        if (chain == f.chainSig && (!f.failed || f.type != FeatureType::Import)) {
+            auto ub = usedBefore.find(f.id);
+            if (ub != usedBefore.end())
+                for (auto& r : ub->second) takers[r].push_back(i);
+        }
+        // A step that failed with these same inputs fails again: skip it too (a failed slow thread
+        // was recomputed on every later change). Imports retry, the file may be back.
+        if (chain == f.chainSig && (!f.failed || f.type != FeatureType::Import)) {
             running = chain;
             continue;   // inputs unchanged since the last compute: keep the cached bodies
         }
@@ -2430,15 +2739,59 @@ void runRecomputePass(const Document& snap, App::RecomputeResults& out, const Ca
         item.featureId = f.id;
         item.sig = own;
         item.chainSig = chain;
+        if (std::getenv("KESTRAL_CHAINS")) std::fprintf(stderr, "CHAIN %u %s %016llx\n", f.id, f.name.c_str(), (unsigned long long)chain);
         auto t0 = std::chrono::steady_clock::now();
         std::string err;
         bool ok = false;
         bool fromDisk = false;
         if (f.type != FeatureType::Import && f.type != FeatureType::Sketch) {
             kernel::FeatureCacheData cd;
-            if (kernel::loadFeatureCache(chain, cd)) {
+            bool pinned = false;
+            if (!snap.path.empty() && !snap.skipSavedShapes) {
+                // Saved shapes first (kept with the design on every save, by the step's inputs). On
+                // the first build after opening, a step whose inputs read differently now (an
+                // imported file's date, a newer Kestral) still shows what was saved.
+                std::filesystem::path dp = u8path(snap.path);
+                std::filesystem::path gdir = dp.parent_path() / ".kestral_versions" / dp.stem() / "geo";
+                auto geoFile = [&](uint64_t c) {
+                    char nm[48];
+                    std::snprintf(nm, sizeof nm, "%u-%016llx.kfc", f.id, (unsigned long long)c);
+                    return pathToU8(gdir / nm);
+                };
+                pinned = kernel::loadPinnedResult(geoFile(chain), cd);
+                if (!pinned && snap.fromFile && f.savedChain && f.savedChain != chain && !afterRebuiltFromSteps) {
+                    pinned = kernel::loadPinnedResult(geoFile(f.savedChain), cd);
+                    if (pinned) {
+                        if (!out.keptSaved) out.keptFirst = f.name;
+                        ++out.keptSaved;
+                    }
+                }
+            }
+            if (!pinned && !snap.path.empty() && !snap.skipSavedShapes) {
+                std::filesystem::path dp = u8path(snap.path);
+                std::filesystem::path pdir = dp.parent_path() / ".kestral_versions" / dp.stem() / "pins";
+                std::string pin = pathToU8(pdir / (std::to_string(f.id) + ".kfc"));
+                // A pin holds while everything before the step is unchanged (its .chain file); edit
+                // anything upstream and the step computes normally again.
+                std::ifstream cf(pdir / (std::to_string(f.id) + ".chain"));
+                std::string want;
+                if (cf) cf >> want;
+                char have[24];
+                std::snprintf(have, sizeof have, "%016llx", (unsigned long long)chain);
+                // "auto": the pin was made elsewhere (file dates differ per computer): take this
+                // computer's chain on first use, so later upstream edits still drop it.
+                if (want == "auto") {
+                    cf.close();
+                    std::ofstream wf(pdir / (std::to_string(f.id) + ".chain"), std::ios::trunc);
+                    wf << have << "\n";
+                    want = have;
+                }
+                if (want.empty() || want == have) pinned = kernel::loadPinnedResult(pin, cd);
+            }
+            if (pinned) afterPin = true;
+            if (pinned || (!afterPin && kernel::loadFeatureCache(chain ^ kLogicStamp, cd))) {
                 fromDisk = ok = platform::guarded("feature cache", [&] {
-                    item.warn = cd.warn;
+                    if (!pinned) item.warn = cd.warn;
                     item.names = cd.names;
                     item.xforms = cd.xforms;
                     item.instanceRefs = cd.instanceRefs;
@@ -2449,12 +2802,19 @@ void runRecomputePass(const Document& snap, App::RecomputeResults& out, const Ca
                 if (!ok) { item = {}; item.featureId = f.id; item.sig = own; item.chainSig = chain; err.clear(); }
             }
         }
-        if (!fromDisk) ok = platform::guarded("feature", [&] { computeFeature(snap, out.items, f, item, cancel, jobs); }, err);
+        kernel::setCopyBeforeUnify(f.rules >= 2);
+        if (!fromDisk) {
+            ok = platform::guarded("feature", [&] { computeFeature(snap, out.items, f, item, cancel, jobs); }, err);
+            // A step built fresh (no saved shapes for it) feeds the ones after it: from here on
+            // older saved shapes would not fit what it made.
+            if (f.type != FeatureType::Sketch && f.type != FeatureType::Import) afterRebuiltFromSteps = true;
+        }
+        kernel::setCopyBeforeUnify(false);
         item.ok = ok;
         item.error = err;
         item.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         // Slow results go to the disk cache, so the next open of this design is quick.
-        if (ok && !fromDisk && !item.isImport && item.ms > 400 && !cancel.isCancelled()) {
+        if (ok && !fromDisk && !afterPin && !item.isImport && item.ms > 400 && !cancel.isCancelled()) {
             kernel::FeatureCacheData cd;
             cd.warn = item.warn;
             cd.shapes = item.shapes;
@@ -2463,7 +2823,7 @@ void runRecomputePass(const Document& snap, App::RecomputeResults& out, const Ca
             cd.instanceRefs = item.instanceRefs;
             cd.consumed = item.consumed;
             std::string e2;
-            platform::guarded("feature cache save", [&] { kernel::saveFeatureCache(chain, cd); }, e2);
+            platform::guarded("feature cache save", [&] { kernel::saveFeatureCache(chain ^ kLogicStamp, cd); }, e2);
         }
         if (std::getenv("KESTRAL_PROFILE")) std::fprintf(stderr, "FEATURE %s %.0f ms\n", f.name.c_str(), item.ms);
         if (std::getenv("KESTRAL_CHECK")) {
@@ -2474,10 +2834,45 @@ void runRecomputePass(const Document& snap, App::RecomputeResults& out, const Ca
                              kernel::solidVolume(item.shapes[k]));
             }
             if (!ok) std::fprintf(stderr, "CHECK %s failed: %s\n", f.name.c_str(), err.c_str());
+            for (auto& c : item.consumed) std::fprintf(stderr, "CHECK %s uses %u:%u\n", f.name.c_str(), c.first, c.second);
         }
+        if (item.ok)
+            for (const TargetRef& r : item.consumed) takers[r].push_back(i);
         out.items.push_back(std::move(item));
         jobs->setStatus("Recomputing " + std::to_string(done) + " / " + std::to_string(total));
         running = chain;
+    }
+    if (cancel.isCancelled()) return;
+    // Two steps that both change one body each made their own copy of it (stacked in one place).
+    // The try whose result nothing else builds on is left out; when neither is built on, the
+    // later one stays. When both are built on, both stay (nothing is broken to fix the other).
+    auto builtOn = [&](int idx) {
+        uint32_t fid = snap.timeline[(size_t)idx].id;
+        for (auto& [ref, who] : takers)
+            if (ref.first == fid && !who.empty()) return true;
+        return false;
+    };
+    std::set<int> leaveOut;
+    for (auto& [ref, who] : takers) {
+        std::vector<int> w = who;
+        std::sort(w.begin(), w.end());
+        w.erase(std::unique(w.begin(), w.end()), w.end());
+        if (w.size() < 2) continue;
+        std::vector<int> used;
+        for (int x : w) if (builtOn(x)) used.push_back(x);
+        int keep = used.empty() ? w.back() : -1;
+        for (int x : w)
+            if (x != keep && std::find(used.begin(), used.end(), x) == used.end()) leaveOut.insert(x);
+    }
+    for (int x : leaveOut) {
+        const Feature& a = snap.timeline[(size_t)x];
+        App::RecomputeResults::Item skip;
+        skip.featureId = a.id;
+        skip.sig = ownAt[(size_t)x];
+        skip.chainSig = chainAt[(size_t)x];
+        skip.ok = true;
+        skip.warn = a.name + " is left out: a later step changes the same body (it was an earlier try).";
+        out.items.push_back(std::move(skip));
     }
 }
 
@@ -2562,7 +2957,7 @@ void App::applyRecomputeResults() {
         uint32_t fid = 0;
         auto use = [&](uint32_t sid) {
             uint64_t key = ((uint64_t)fid << 32) | sid;
-            if (!sid || doc_.autoHidden.count(key)) return;
+            if (!sid || doc_.autoHidden.count(key) || !settings_.hideUsedSketches) return;
             auto it = doc_.sketches.find(sid);
             if (it == doc_.sketches.end()) return;
             it->second.visible = false;
@@ -2586,12 +2981,49 @@ void App::applyRecomputeResults() {
     }
     auto& res = *recomputeResults_;
     bool any = false;
+    bool frozeTargets = false;
     for (auto& item : res.items) {
         int fi = doc_.featureIndex(item.featureId);
         if (fi < 0 || fi >= doc_.markerPos) continue;   // deleted or rolled back while computing
         Feature& f = doc_.timeline[fi];
+        if (pendingDeleteFace_ == f.id) {
+            pendingDeleteFace_ = 0;
+            if (!item.ok) deleteFaceError_ = item.error.empty() ? std::string("Those faces could not be deleted.") : item.error;
+        }
+        if (dlg_.open && dlg_.featureId == f.id) {
+            cutPreview_ = item.cutPreview;
+            markSceneDirty();
+        }
+        if (freezeTargets_.count(f.id) && !(dlg_.open && dlg_.featureId == f.id)) {
+            freezeTargets_.erase(f.id);
+            if (item.ok && !item.consumed.empty()) {
+                // Only the parts it really changed: hidden ones it passed by stay out, or a later
+                // rebuild would cut them as chosen targets.
+                std::vector<TargetRef> used = item.consumed;
+                for (auto& h : item.instanceRefs)
+                    if (h.first) used.erase(std::remove(used.begin(), used.end(), h), used.end());
+                if (!used.empty()) {
+                    if (f.extrude && f.extrude->targets.empty()) { auto p = std::make_shared<ExtrudeParams>(*f.extrude); p->targets = used; f.extrude = p; }
+                    if (f.revolve && f.revolve->targets.empty()) { auto p = std::make_shared<RevolveParams>(*f.revolve); p->targets = used; f.revolve = p; }
+                }
+                frozeTargets = true;
+            }
+        }
         f.sig = item.sig;
         f.chainSig = item.chainSig;
+        if (item.ok && !item.isImport && !item.shapes.empty()) {
+            // Kept for the next save: every step's shapes go with the design (see saveStepShapes).
+            kernel::FeatureCacheData d;
+            d.warn = item.warn;
+            d.shapes = item.shapes;
+            d.names = item.names;
+            d.xforms = item.xforms;
+            d.instanceRefs = item.instanceRefs;
+            d.consumed = item.consumed;
+            auto& m = stepShapes_[f.id];
+            m[item.chainSig] = std::move(d);
+            while (m.size() > 4) m.erase(m.begin());
+        }
         f.lastMs = item.ms;
         f.failed = !item.ok;
         f.error = item.ok ? std::string() : item.error;
@@ -2754,6 +3186,36 @@ void App::applyRecomputeResults() {
             if (ft.type == FeatureType::ConstructAxis && ft.caxis) updateConstructAxis(ft);
             if (ft.type == FeatureType::ConstructPoint && ft.cpoint) updateConstructPoint(ft);
         }
+    }
+    // Fixing an extrude's bodies changes its inputs but not its result: record the new signatures
+    // so nothing recomputes for it.
+    if (frozeTargets) {
+        std::map<uint32_t, uint64_t> before;
+        for (auto& f : doc_.timeline) before[f.id] = f.chainSig;
+        refreshSignatures();
+        // Same shapes, new inputs (the bodies were fixed): the kept shapes follow the new chain.
+        for (auto& f : doc_.timeline) {
+            auto it = stepShapes_.find(f.id);
+            if (it == stepShapes_.end() || before[f.id] == f.chainSig) continue;
+            auto old = it->second.find(before[f.id]);
+            if (old != it->second.end()) it->second[f.chainSig] = old->second;
+        }
+        dirty_ = true;
+    }
+    if (doc_.fromFile || doc_.skipSavedShapes) {
+        doc_.fromFile = false;
+        doc_.skipSavedShapes = false;
+        if (res.keptSaved > 0)
+            toast("Showing the saved shapes of " + std::to_string(res.keptSaved) + " step" + (res.keptSaved > 1 ? "s" : "") +
+                  " (from " + res.keptFirst + " on): an imported file changed or Kestral was updated since the save, so building them "
+                  "again could come out different. Use Rebuild From Steps (Inspect) if you want them rebuilt.", ToastKind::Info);
+    }
+    if (!deleteFaceError_.empty()) {
+        // Nothing was deleted: say why, and leave no red step behind.
+        std::string why = deleteFaceError_;
+        deleteFaceError_.clear();
+        undo();
+        toast("Delete Face did not work: " + why, ToastKind::Warning);
     }
 }
 
@@ -3083,13 +3545,18 @@ void App::syncExtrudeFromSelection() {
 
     uint32_t sid = 0;
     std::vector<sk::Vec2> pts;
+    std::vector<std::pair<uint32_t, std::vector<sk::Vec2>>> more;   // profiles in other sketches
     for (auto& [skid, pi] : selProfiles_) {
         if (sid == 0) sid = skid;
-        if (skid != sid) continue;   // one sketch per extrude
         auto sit = doc_.sketches.find(skid);
         if (sit == doc_.sketches.end()) continue;
         const auto& profs = sketchProfiles(sit->second);
-        if (pi < profs.size()) pts.push_back(profileSamplePoint(profs[pi]));
+        if (pi >= profs.size()) continue;
+        if (skid == sid) { pts.push_back(profileSamplePoint(profs[pi])); continue; }
+        if (dlg_.isRevolve) continue;   // revolve: one sketch (its axis lives there)
+        auto mit = std::find_if(more.begin(), more.end(), [&](auto& m) { return m.first == skid; });
+        if (mit == more.end()) { more.push_back({skid, {}}); mit = more.end() - 1; }
+        mit->second.push_back(profileSamplePoint(profs[pi]));
     }
     std::vector<FaceRef> faces;
     if (!dlg_.isRevolve) {
@@ -3147,16 +3614,15 @@ void App::syncExtrudeFromSelection() {
             if (kernel::pointInside(pit->second.shape, b.xform, origin + normal * eps)) dlg_.inFront = true;
             if (kernel::pointInside(pit->second.shape, b.xform, origin - normal * eps)) dlg_.inBack = true;
         }
+        dlg_.probeO = origin;
+        dlg_.probeN = normal;
         // The distance stays 0 until the user drags the arrow or types a value (Fusion).
         (void)size;
     }
     if (dlg_.opAuto && !dlg_.editing) {
         double dv = 0;
         try { dv = peval::eval(dlg_.dist, doc_.params); } catch (const std::runtime_error&) {}
-        bool fwd = (dv >= 0) != dlg_.flip;
-        bool materialAhead = fwd ? dlg_.inFront : dlg_.inBack;
-        bool materialBehind = fwd ? dlg_.inBack : dlg_.inFront;
-        dlg_.op = materialAhead ? 2 : materialBehind ? 1 : 0;
+        extrudeAutoOp(dv);
         if (dlg_.isRevolve) dlg_.op = (dlg_.inFront || dlg_.inBack) ? 1 : 0;
     }
 
@@ -3180,6 +3646,7 @@ void App::syncExtrudeFromSelection() {
         auto p = std::make_shared<ExtrudeParams>(*f.extrude);
         p->sketchId = faces.empty() ? sid : 0;
         p->profilePts = faces.empty() ? pts : std::vector<sk::Vec2>{};
+        p->moreSketches = faces.empty() ? more : decltype(more){};
         p->faces = faces;
         if (dlg_.extent == 1 && !selFaces_.empty()) {
             auto picked = *selFaces_.begin();
@@ -3198,7 +3665,7 @@ void App::syncExtrudeFromSelection() {
         p->extent = dlg_.extent;
         p->to = dlg_.to;
         f.extrude = p;
-        if (have) setManip(1, origin, normal * (dlg_.flip ? -1.0 : 1.0), 0);
+        if (have) setManip(1, origin, normal * (dlg_.flip ? -1.0 : 1.0), 0, true);
         else manip_.active = false;
     }
     dlg_.hiddenSketch = sid;
@@ -3247,6 +3714,15 @@ void App::editFeature(uint32_t featureId) {
             }
         }
         if (!rev) {
+            for (auto& [msid, mpts] : f.extrude->moreSketches) {
+                auto mit = doc_.sketches.find(msid);
+                if (mit == doc_.sketches.end()) continue;
+                mit->second.visible = true;
+                const auto& mprofs = sketchProfiles(mit->second);
+                for (size_t i = 0; i < mprofs.size(); ++i)
+                    for (auto& q : mpts)
+                        if (sk::pointInProfile(mprofs[i], q)) { selProfiles_.insert({msid, (uint32_t)i}); break; }
+            }
             for (auto& fr : f.extrude->faces) {
                 std::vector<uint32_t> ids = doc_.featureBodies(fr.feature);
                 if (fr.slot < ids.size()) selFaces_.insert({ids[fr.slot], fr.face});
@@ -3299,11 +3775,7 @@ void App::applyDialogValues() {
             // A typed distance picks the operation the same way a drag does (into material = cut).
             try {
                 double d = peval::eval(dlg_.dist, doc_.params);
-                if (std::abs(d) > 1e-9) {
-                    bool fwd = (d >= 0) != dlg_.flip;
-                    bool ahead = fwd ? dlg_.inFront : dlg_.inBack, behind = fwd ? dlg_.inBack : dlg_.inFront;
-                    dlg_.op = ahead ? 2 : behind ? 1 : 0;
-                }
+                if (std::abs(d) > 1e-9) extrudeAutoOp(d);
             } catch (const std::runtime_error&) {}
         }
         auto p = std::make_shared<ExtrudeParams>(*f.extrude);
@@ -3328,15 +3800,35 @@ void App::applyDialogValues() {
     scheduleRecompute(fi);
 }
 
+void App::extrudeAutoOp(double d) {
+    bool fwd = (d >= 0) != dlg_.flip;
+    bool ahead = fwd ? dlg_.inFront : dlg_.inBack, behind = fwd ? dlg_.inBack : dlg_.inFront;
+    if (!ahead && !behind && std::abs(d) > 1e-6 && !dlg_.isRevolve) {
+        // Nothing touches the profile itself: material part way along the drag still means a cut.
+        glm::dvec3 dir = dlg_.probeN * ((d >= 0) != dlg_.flip ? 1.0 : -1.0);
+        double len = std::abs(d);
+        for (auto& [id, b] : doc_.bodies) {
+            if (ahead) break;
+            if (!bodyShown(b) || b.featureId == dlg_.featureId) continue;
+            auto pit = doc_.parts.find(b.partId);
+            if (pit == doc_.parts.end() || !pit->second.shape || !pit->second.mesh) continue;
+            Aabb bb = pit->second.mesh->bounds.transformed(b.xform);
+            for (int k = 1; k <= 12 && !ahead; ++k) {
+                glm::dvec3 q = dlg_.probeO + dir * (len * k / 12.0);
+                glm::vec3 q3(q);
+                if (q3.x < bb.min.x || q3.y < bb.min.y || q3.z < bb.min.z || q3.x > bb.max.x || q3.y > bb.max.y || q3.z > bb.max.z) continue;
+                if (kernel::pointInside(pit->second.shape, b.xform, q)) ahead = true;
+            }
+        }
+    }
+    dlg_.op = ahead ? 2 : behind ? 1 : 0;
+}
+
 void App::manipCommit(double v, bool final) {
     if (manip_.target == 1 && dlg_.open) {
         double d = dlg_.symmetric ? v * 2.0 : v;
         std::snprintf(dlg_.dist, sizeof dlg_.dist, "%s", fmtG(d).c_str());
-        if (dlg_.opAuto) {
-            bool fwd = (d >= 0) != dlg_.flip;
-            bool ahead = fwd ? dlg_.inFront : dlg_.inBack, behind = fwd ? dlg_.inBack : dlg_.inFront;
-            dlg_.op = ahead ? 2 : behind ? 1 : 0;
-        }
+        if (dlg_.opAuto) extrudeAutoOp(d);
         applyDialogValues();
     } else if (manip_.target == 2 && tdlg_.open) {
         std::snprintf(tdlg_.v1, sizeof tdlg_.v1, "%s", fmtG(v).c_str());
@@ -3357,6 +3849,8 @@ void App::closeFeatureDialog(bool ok) {
     if (!dlg_.open) return;
     dlg_.open = false;
     manip_ = Manip{};
+    manipShiftFid_ = UINT32_MAX;
+    if (cutPreview_) { cutPreview_.reset(); markSceneDirty(); }
     activePickFilter_ = PickBody | PickFace | PickEdge | PickProfile;
     int fi = doc_.featureIndex(dlg_.featureId);
     if (!ok) {
@@ -3394,9 +3888,13 @@ void App::closeFeatureDialog(bool ok) {
             return;
         }
         if (f.failed && !f.error.empty()) toast(f.name + ": " + f.error, ToastKind::Warning);
+        // The bodies it joins or cuts are fixed at OK, so later changes elsewhere never make it
+        // grab other parts on a recompute.
+        if (!dlg_.editing && ((f.extrude && f.extrude->op != 0 && f.extrude->targets.empty()) || (f.revolve && f.revolve->op != 0 && f.revolve->targets.empty())))
+            freezeTargets_.insert(f.id);
         // Fusion hides a sketch once a feature has used it.
         auto sit = doc_.sketches.find(dlg_.hiddenSketch);
-        if (sit != doc_.sketches.end() && !dlg_.editing) sit->second.visible = false;
+        if (sit != doc_.sketches.end() && !dlg_.editing && settings_.hideUsedSketches) sit->second.visible = false;
     }
     clearSelection();
     restoreMarkerAfterEdit();
@@ -3486,11 +3984,7 @@ void App::drawFeatureDialog() {
             try {
                 double v = peval::eval(dlg_.dist, doc_.params);
                 if (std::abs(v) > 1e-9) {
-                    if (dlg_.opAuto) {
-                        bool fwd = (v >= 0) != dlg_.flip;
-                        bool ahead = fwd ? dlg_.inFront : dlg_.inBack, behind = fwd ? dlg_.inBack : dlg_.inFront;
-                        dlg_.op = ahead ? 2 : behind ? 1 : 0;
-                    }
+                    if (dlg_.opAuto) extrudeAutoOp(v);
                     commit();
                 }
             } catch (const std::runtime_error&) {}
@@ -3563,7 +4057,13 @@ void App::drawFeatureDialog() {
         }
         ImGui::EndCombo();
     }
-    if (dlg_.op != 0) ImGui::TextDisabled("Bodies: every body the result touches");
+    if (dlg_.op != 0) {
+        bool fromFaces = dlg_.featureId && doc_.featureIndex(dlg_.featureId) >= 0 && doc_.timeline[doc_.featureIndex(dlg_.featureId)].extrude &&
+                         !doc_.timeline[doc_.featureIndex(dlg_.featureId)].extrude->faces.empty();
+        ImGui::TextDisabled(dlg_.op == 1 && fromFaces ? "Bodies: the body of the picked face" : "Bodies: the ones it touches now (kept after OK)");
+    }
+    ImGui::Checkbox("Snap to faces", &settings_.manipSnap);
+    ImGui::SetItemTooltip("Dragging the arrow near another flat face stops it on that face's plane.\nHold Alt while dragging to skip snapping.");
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -3780,6 +4280,13 @@ void App::saveDocumentNow() {
         saveDocumentAs();
         return;
     }
+    // Nothing changed since the last save: no new version (an older version opened can still be
+    // saved as the newest).
+    if (!dirty_ && doc_.version > 0 && doc_.version >= latestVersion(doc_.path)) {
+        toast("No changes to save (" + doc_.name + " v" + std::to_string(doc_.version) + ")");
+        saveStepShapes();   // still keeps any step shapes not stored yet (designs saved before fix1068)
+        return;
+    }
     // Every Ctrl+S is a new version. The file holds the newest; each version is also kept in the
     // hidden versions folder beside it, so older ones can be opened from the Data panel.
     int prevVersion = doc_.version;
@@ -3796,6 +4303,7 @@ void App::saveDocumentNow() {
         std::filesystem::copy_file(u8path(doc_.path), u8path(vdir + "/v" + std::to_string(doc_.version) + ".kst"),
                                    std::filesystem::copy_options::overwrite_existing, ec);
         toast("Saved " + doc_.name + "  v" + std::to_string(doc_.version), ToastKind::Success);
+        saveStepShapes();
         thumbFromDoc(doc_.path);
         settings_.addRecent(doc_.path);
         settings_.save(settingsPath_);
@@ -3806,6 +4314,40 @@ void App::saveDocumentNow() {
 }
 
 // <folder>/.kestral_versions/<design name>
+// Every step's shapes go with the design, stored by the step's inputs (so versions share them).
+// Opening a version shows exactly these shapes; nothing is rebuilt until you change something.
+void App::saveStepShapes() {
+    if (doc_.path.empty()) return;
+    std::filesystem::path gdir = u8path(versionsDir(doc_.path)) / "geo";
+    std::vector<std::pair<std::string, kernel::FeatureCacheData>> todo;
+    std::error_code ec;
+    for (int i = 0; i < doc_.markerPos && i < (int)doc_.timeline.size(); ++i) {
+        const Feature& f = doc_.timeline[i];
+        if (f.suppressed || f.failed || f.type == FeatureType::Import || f.type == FeatureType::Sketch || !f.chainSig) continue;
+        auto it = stepShapes_.find(f.id);
+        if (it == stepShapes_.end()) continue;
+        auto d = it->second.find(f.chainSig);
+        if (d == it->second.end()) continue;
+        char nm[48];
+        std::snprintf(nm, sizeof nm, "%u-%016llx.kfc", f.id, (unsigned long long)f.chainSig);
+        std::string file = pathToU8(gdir / nm);
+        if (std::filesystem::exists(u8path(file), ec)) continue;
+        todo.push_back({file, d->second});
+    }
+    if (todo.empty()) return;
+    jobs_->submit("saving shapes", [todo = std::move(todo)] {
+        for (auto& [file, d] : todo) kernel::saveStepResult(file, d);
+    });
+}
+
+void App::rebuildFromSteps() {
+    // Builds every step again from its settings, ignoring the saved shapes (they stay on disk).
+    doc_.skipSavedShapes = true;
+    for (auto& f : doc_.timeline) f.chainSig = 0;
+    toast("Rebuilding every step from its settings");
+    scheduleRecompute(0);
+}
+
 std::string App::versionsDir(const std::string& designPath) const {
     std::filesystem::path p = u8path(designPath);
     return pathToU8(p.parent_path() / ".kestral_versions" / p.stem());
@@ -3832,17 +4374,45 @@ std::vector<int> App::designVersions(const std::string& designPath) const {
     return out;
 }
 
-// Opens an older version in place of the design: the next Ctrl+S saves it as the newest version.
+// Opens an older version in place of the design, in the same tab. The tab and the Data panel show
+// that version; the next Ctrl+S saves it as the newest version. Unsaved changes are kept in the
+// versions folder first so nothing is lost.
 void App::openDesignVersion(const std::string& designPath, int v) {
     std::string file = versionsDir(designPath) + "/v" + std::to_string(v) + ".kst";
-    openDocumentPath(file);
-    if (doc_.path != file) return;
+    auto r = loadDocument(file);
+    if (!r.ok) {
+        toast("Could not open v" + std::to_string(v) + ": " + r.error, ToastKind::Error);
+        return;
+    }
+    std::string kept;
+    if (int t = designTabFor(designPath); t >= 0) {
+        if (t != designActive_) switchDesignTab(t);
+        if (dirty_) {
+            kept = versionsDir(designPath) + "/unsaved changes.kst";
+            if (!saveDocument(doc_, kept)) kept.clear();
+        }
+    } else if (docInUse()) {
+        newDesignTab();
+    }
+    leaveSketchMode();
+    sk_.active = false;
+    doc_ = std::move(r.doc);
     doc_.path = designPath;
     doc_.name = pathToU8(u8path(designPath).stem());
     doc_.components[doc_.rootId].name = doc_.name;
-    doc_.version = latestVersion(designPath);
-    dirty_ = true;
-    toast("Opened v" + std::to_string(v) + " of " + doc_.name + ". Ctrl+S saves it as v" + std::to_string(doc_.version + 1) + ".");
+    doc_.version = v;
+    undo_.clear();
+    selection_.clear();
+    isolated_.clear();
+    browserHover_.clear();
+    dirty_ = false;
+    markSceneDirty();
+    rebuildScene();
+    scheduleRecompute(0);
+    std::string msg = "Opened v" + std::to_string(v) + " of " + doc_.name + ". Ctrl+S saves it as v" +
+                      std::to_string(std::max(v, latestVersion(designPath)) + 1) + ".";
+    if (!kept.empty()) msg += " Your unsaved changes were kept in " + kept + ".";
+    toast(msg, ToastKind::Success);
 }
 
 std::string App::designFolder() const {

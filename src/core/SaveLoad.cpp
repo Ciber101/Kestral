@@ -297,6 +297,15 @@ bool serializeDocument(const Document& doc, std::string& out) {
                   << "|" << ft.extrude->extent << "|" << ft.extrude->to.feature << "|" << ft.extrude->to.slot
                   << "|" << ft.extrude->to.face << "|" << ft.extrude->to.faceTotal
                   << "|" << esc(ft.extrude->thinExpr) << "|" << ft.extrude->thinSide << "\n";
+            if (ft.type == FeatureType::Extrude && ft.extrude)
+                for (auto& [msid, mpts] : ft.extrude->moreSketches)
+                    f << "xmore|" << ft.id << "|" << msid << "|" << joinPts(mpts) << "\n";
+            if (ft.rules > 0) f << "frules|" << ft.id << "|" << ft.rules << "\n";
+            if (ft.chainSig) {
+                char hx[24];
+                std::snprintf(hx, sizeof hx, "%016llx", (unsigned long long)ft.chainSig);
+                f << "fgeo|" << ft.id << "|" << hx << "\n";
+            }
             if (ft.type == FeatureType::Revolve && ft.revolve)
                 f << "rpar|" << ft.id << "|" << ft.revolve->sketchId << "|" << esc(ft.revolve->angleExpr) << "|"
                   << ft.revolve->axis << "|" << ft.revolve->axisEnt << "|" << ft.revolve->op << "|"
@@ -402,7 +411,8 @@ bool serializeDocument(const Document& doc, std::string& out) {
                            std::to_string(q.sub) + "|" + std::to_string(q.total) + "|" + std::to_string(q.end);
                 };
                 f << "algn|" << ft.id << "|" << (a.flip ? 1 : 0) << "|" << pk(a.from) << "|" << pk(a.to) << "|"
-                  << esc(a.fromName) << "|" << esc(a.toName) << "|" << joinRefs(a.targets) << "\n";
+                  << esc(a.fromName) << "|" << esc(a.toName) << "|" << joinRefs(a.targets) << "|"
+                  << esc(a.angleExpr) << "|" << esc(a.offsetExpr) << "\n";
             }
             if (ft.type == FeatureType::Hole && ft.hole)
             {
@@ -442,7 +452,7 @@ bool serializeDocument(const Document& doc, std::string& out) {
                   << esc(m.sxExpr) << "|" << esc(m.syExpr) << "|" << esc(m.szExpr) << "|"
                   << (m.hasMat ? 1 : 0);
                 for (int i = 0; i < 16; ++i) f << "|" << m.mat[i];
-                f << "|" << m.op << "\n";
+                f << "|" << m.op << "|" << (m.together ? 1 : 0) << "\n";
             }
             if (ft.type == FeatureType::Remove && ft.remove)
                 f << "rmv|" << ft.id << "|" << joinRefs(ft.remove->targets) << "\n";
@@ -519,6 +529,17 @@ bool serializeDocument(const Document& doc, std::string& out) {
                   << num(j.origin.y) << " " << num(j.origin.z) << "|" << num(j.axis.x) << " " << num(j.axis.y) << " " << num(j.axis.z)
                   << "|" << num(j.lower) << "|" << num(j.upper) << "|" << num(j.effort) << "|" << num(j.velocity) << "|"
                   << num(j.stiffness) << "|" << num(j.damping) << "\n";
+        }
+        if (!doc.elec.empty()) {
+            f << "enext|" << doc.elec.nextId << "\n";
+            for (auto& ep : doc.elec.parts) {
+                std::string vals;
+                for (auto& [k, v] : ep.vals) vals += (vals.empty() ? "" : ";") + k + "=" + num(v);
+                f << "epart|" << ep.id << "|" << esc(ep.def) << "|" << esc(ep.label) << "|" << esc(ep.attach) << "|" << esc(vals) << "\n";
+            }
+            for (auto& w : doc.elec.wires)
+                f << "ewire|" << w.id << "|" << w.a << "|" << esc(w.aPin) << "|" << w.b << "|" << esc(w.bPin) << "|" << esc(w.color) << "|"
+                  << w.awg << "|" << esc(w.note) << "\n";
         }
         for (auto& [key, nm] : doc.compNames)
             f << "cname|" << (uint32_t)(key >> 32) << "|" << (uint32_t)key << "|" << esc(nm) << "\n";
@@ -684,6 +705,7 @@ LoadResult loadDocument(const std::string& path) {
                 curSketch = nullptr;
             } else if (k == "feat") {
                 Feature ft;
+                ft.rules = 0;   // made before rebuild rules were versioned, unless a frules line says so
                 ft.id = std::stoul(p.at(1));
                 std::string t = p.at(2);
                 ft.type = t == "import" ? FeatureType::Import : t == "sketch" ? FeatureType::Sketch :
@@ -714,6 +736,26 @@ LoadResult loadDocument(const std::string& path) {
                 ft.sketchId = std::stoul(p.at(5));
                 ft.importPath = unesc(p.at(6));
                 doc.timeline.push_back(std::move(ft));
+            } else if (k == "xmore") {
+                // Older Kestral skips this line: those extra sketches just do not extrude there.
+                uint32_t fid = std::stoul(p.at(1));
+                uint32_t msid = std::stoul(p.at(2));
+                std::vector<sk::Vec2> mpts = p.size() > 3 ? parsePts(p[3]) : std::vector<sk::Vec2>{};
+                for (auto& ft : doc.timeline)
+                    if (ft.id == fid && ft.extrude) {
+                        auto x = std::make_shared<ExtrudeParams>(*ft.extrude);
+                        x->moreSketches.push_back({msid, mpts});
+                        ft.extrude = x;
+                    }
+            } else if (k == "fgeo") {
+                uint32_t fid = std::stoul(p.at(1));
+                uint64_t c = std::stoull(p.at(2), nullptr, 16);
+                for (auto& ft : doc.timeline)
+                    if (ft.id == fid) ft.savedChain = c;
+            } else if (k == "frules") {
+                uint32_t fid = std::stoul(p.at(1));
+                for (auto& ft : doc.timeline)
+                    if (ft.id == fid) ft.rules = std::stoi(p.at(2));
             } else if (k == "xpar") {
                 uint32_t fid = std::stoul(p.at(1));
                 auto x = std::make_shared<ExtrudeParams>();
@@ -1001,6 +1043,10 @@ LoadResult loadDocument(const std::string& path) {
                 a->fromName = unesc(p.at(15));
                 a->toName = unesc(p.at(16));
                 a->targets = parseRefs(p.at(17));
+                if (p.size() > 19) {
+                    a->angleExpr = unesc(p[18]);
+                    a->offsetExpr = unesc(p[19]);
+                }
                 for (auto& ft : doc.timeline)
                     if (ft.id == fid) ft.align = a;
             } else if (k == "hpar") {
@@ -1076,6 +1122,7 @@ LoadResult loadDocument(const std::string& path) {
                 if (p.size() > 36)
                     for (int i = 0; i < 16; ++i) m->mat[i] = std::atof(p[21 + i].c_str());
                 if (p.size() > 37) m->op = std::stoi(p[37]);
+                if (p.size() > 38) m->together = p[38] == "1";
                 for (auto& ft : doc.timeline)
                     if (ft.id == fid) ft.move = m;
             } else if (k == "mcv") {
@@ -1276,6 +1323,37 @@ LoadResult loadDocument(const std::string& path) {
                 doc.robot.base = unesc(p.at(2));
                 doc.robot.density = std::stod(p.at(3));
                 if (p.size() > 4) doc.robot.front = std::clamp(std::stoi(p.at(4)), 0, 3);
+            } else if (k == "enext") {
+                doc.elec.nextId = std::stoul(p.at(1));
+            } else if (k == "epart") {
+                ElecPart ep;
+                ep.id = std::stoul(p.at(1));
+                ep.def = unesc(p.at(2));
+                ep.label = unesc(p.at(3));
+                ep.attach = unesc(p.at(4));
+                std::string vals = p.size() > 5 ? unesc(p[5]) : std::string();
+                for (size_t s = 0; s < vals.size();) {
+                    size_t e = vals.find(';', s);
+                    std::string kv = vals.substr(s, e == std::string::npos ? std::string::npos : e - s);
+                    size_t eq = kv.find('=');
+                    if (eq != std::string::npos) ep.vals[kv.substr(0, eq)] = std::atof(kv.c_str() + eq + 1);
+                    if (e == std::string::npos) break;
+                    s = e + 1;
+                }
+                doc.elec.parts.push_back(ep);
+                doc.elec.nextId = std::max(doc.elec.nextId, ep.id + 1);
+            } else if (k == "ewire") {
+                Wire w;
+                w.id = std::stoul(p.at(1));
+                w.a = std::stoul(p.at(2));
+                w.aPin = unesc(p.at(3));
+                w.b = std::stoul(p.at(4));
+                w.bPin = unesc(p.at(5));
+                w.color = unesc(p.at(6));
+                w.awg = std::stoi(p.at(7));
+                w.note = p.size() > 8 ? unesc(p[8]) : std::string();
+                doc.elec.wires.push_back(w);
+                doc.elec.nextId = std::max(doc.elec.nextId, w.id + 1);
             } else if (k == "rmass") {
                 doc.robot.massG[unesc(p.at(1))] = std::stod(p.at(2));
             } else if (k == "rjoint") {
@@ -1355,6 +1433,7 @@ LoadResult loadDocument(const std::string& path) {
     doc.markerPos = std::clamp(doc.markerPos, 0, (int)doc.timeline.size());
     std::string err;
     updateParamValues(doc.params, err);   // best effort; bad params surface in the dialog
+    doc.fromFile = true;
     r.ok = true;
     return r;
 }

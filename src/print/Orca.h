@@ -72,6 +72,8 @@ struct SliceResult {
     int plates = 0;
     std::string machine, process, filament, bedType;
     std::vector<std::string> warnings;
+    std::string filamentType;    // the filament profile's type ("PLA", "PETG")
+    std::string keySettings;     // walls, shells, infill, brim, supports the slice used ("wall_loops 2, ...")
     std::string log;             // OrcaSlicer's own output (last part), for troubleshooting
 };
 

@@ -747,6 +747,14 @@ void App::rebuildSliceScene() {
             auto addLook = [&](const MeshPtr& mp, uint32_t mat) {
                 if (!mp || mp->indices.empty()) return;
                 RenderInstance li;
+                if (sliceBedBelow_) {
+                    // Seen from under the plate: faint, so the part's underside shows through.
+                    MaterialGpu g = mats[mat];
+                    g.c0.a = 0.18f;
+                    mats.push_back(g);
+                    mat = (uint32_t)mats.size() - 1;
+                    li.transparent = true;
+                }
                 li.material = mat;
                 li.color = mats[mat].c0;
                 li.bodyId = id++;

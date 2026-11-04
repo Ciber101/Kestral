@@ -22,6 +22,8 @@
 #include <Bnd_Box.hxx>
 #include <GCPnts_TangentialDeflection.hxx>
 #include <Poly_Triangulation.hxx>
+#include <Poly_PolygonOnTriangulation.hxx>
+#include <TColStd_Array1OfInteger.hxx>
 #include <GeomAbs_SurfaceType.hxx>
 #include <Quantity_Color.hxx>
 #include <gp_Pln.hxx>
@@ -862,9 +864,33 @@ MeshPtr tessellate(const ShapeHandle& h, double rel, double ang) {
 
         TopTools_IndexedMapOfShape edges;
         TopExp::MapShapes(shape, TopAbs_EDGE, edges);
+        TopTools_IndexedDataMapOfShapeListOfShape e2f;
+        TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, e2f);
         for (int ei = 1; ei <= edges.Extent(); ++ei) {
             const TopoDS_Edge& e = TopoDS::Edge(edges(ei));
             if (BRep_Tool::Degenerated(e) || seams.Contains(e)) continue;
+            // The edge line follows the face mesh's own boundary, so it sits exactly on the
+            // shaded outline instead of floating beside it on curves.
+            bool done = false;
+            if (int k = e2f.FindIndex(e); k > 0) {
+                for (TopTools_ListIteratorOfListOfShape it(e2f(k)); it.More() && !done; it.Next()) {
+                    TopLoc_Location fl;
+                    Handle(Poly_Triangulation) ft = BRep_Tool::Triangulation(TopoDS::Face(it.Value()), fl);
+                    if (ft.IsNull()) continue;
+                    Handle(Poly_PolygonOnTriangulation) pt = BRep_Tool::PolygonOnTriangulation(e, ft, fl);
+                    if (pt.IsNull() || pt->NbNodes() < 2) continue;
+                    gp_Trsf tr = fl.Transformation();
+                    const TColStd_Array1OfInteger& ix = pt->Nodes();
+                    for (int i = ix.Lower(); i < ix.Upper(); ++i) {
+                        gp_Pnt a = ft->Node(ix(i)), b = ft->Node(ix(i + 1));
+                        if (!fl.IsIdentity()) { a.Transform(tr); b.Transform(tr); }
+                        m->edgeVerts.insert(m->edgeVerts.end(), {(float)a.X(), (float)a.Y(), (float)a.Z(), (float)b.X(), (float)b.Y(), (float)b.Z()});
+                    }
+                    m->edgeCount++;
+                    done = true;
+                }
+            }
+            if (done) continue;
             try {
                 BRepAdaptor_Curve c(e);
                 GCPnts_TangentialDeflection disc(c, ang * 0.5, lin);
@@ -1138,6 +1164,14 @@ constexpr uint32_t kFeatMagic = 0x5446454Bu;   // "KEFT"
 constexpr uint32_t kFeatVersion = 1;
 
 std::string featureCachePath(uint64_t key) {
+    // Results from another build of Kestral are never reused: a fix in how a feature computes
+    // would otherwise keep showing the old result (the cache is keyed by the feature's inputs).
+    static const uint64_t build = [] {
+        uint64_t h = 1469598103934665603ull;
+        for (const char* c = __DATE__ " " __TIME__; *c; ++c) h = (h ^ (uint8_t)*c) * 1099511628211ull;
+        return h;
+    }();
+    key ^= build ^ (featuresBuildStamp() * 31);
     char name[40];
     std::snprintf(name, sizeof name, "%016llx.kfc", (unsigned long long)key);
     return platform::tempDir() + "/featcache/" + name;
@@ -1178,10 +1212,22 @@ void pruneFeatureCache() {
 
 } // namespace
 
+namespace { bool writeFeatureFile(const std::string& file, uint64_t key, const FeatureCacheData& d); }
+
 bool saveFeatureCache(uint64_t key, const FeatureCacheData& d) {
+    if (!writeFeatureFile(featureCachePath(key), key, d)) return false;
+    pruneFeatureCache();
+    return true;
+}
+
+bool saveStepResult(const std::string& file, const FeatureCacheData& d) {
+    return writeFeatureFile(file, 0, d);
+}
+
+namespace {
+bool writeFeatureFile(const std::string& file, uint64_t key, const FeatureCacheData& d) {
     namespace fs = std::filesystem;
     std::error_code ec;
-    std::string file = featureCachePath(key);
     fs::create_directories(u8path(file).parent_path(), ec);
     std::string tmp = file + ".part";
     {
@@ -1220,20 +1266,30 @@ bool saveFeatureCache(uint64_t key, const FeatureCacheData& d) {
     }
     fs::rename(u8path(tmp), u8path(file), ec);
     if (ec) { fs::remove(u8path(tmp), ec); return false; }
-    pruneFeatureCache();
     return true;
 }
+} // namespace
+
+namespace { bool readFeatureFile(const std::string& file, uint64_t key, bool checkKey, FeatureCacheData& d); }
 
 bool loadFeatureCache(uint64_t key, FeatureCacheData& d) {
+    return readFeatureFile(featureCachePath(key), key, true, d);
+}
+
+bool loadPinnedResult(const std::string& file, FeatureCacheData& d) {
+    return readFeatureFile(file, 0, false, d);
+}
+
+namespace {
+bool readFeatureFile(const std::string& file, uint64_t key, bool checkKey, FeatureCacheData& d) {
     std::error_code ec;
-    std::string file = featureCachePath(key);
     if (!std::filesystem::exists(u8path(file), ec)) return false;
     try {
         std::ifstream in(u8path(file), std::ios::binary);
         if (!in || getU32(in) != kFeatMagic || getU32(in) != kFeatVersion) return false;
         uint64_t k2 = 0;
         in.read(reinterpret_cast<char*>(&k2), 8);
-        if (!in || k2 != key) return false;
+        if (!in || (checkKey && k2 != key)) return false;
         FeatureCacheData out;
         out.warn = getS(in);
         uint32_t n = getU32(in);
@@ -1264,14 +1320,15 @@ bool loadFeatureCache(uint64_t key, FeatureCacheData& d) {
             out.shapes.push_back(wrap(it.Value()));
             it.Next();
         }
-        // Touch it so pruning keeps the files in use.
-        std::filesystem::last_write_time(u8path(file), std::filesystem::file_time_type::clock::now(), ec);
+        // Touch it so pruning keeps the files in use (cache files only: a pinned result is left as is).
+        if (checkKey) std::filesystem::last_write_time(u8path(file), std::filesystem::file_time_type::clock::now(), ec);
         d = std::move(out);
         return true;
     } catch (...) {
         return false;
     }
 }
+} // namespace
 
 namespace {
 

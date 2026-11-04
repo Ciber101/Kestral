@@ -17,6 +17,7 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <set>
 #include <sstream>
 #include <thread>
 
@@ -57,16 +58,59 @@ std::string valueText(const Value& v) {
     return v.dump();
 }
 
+// The filament in the printer (AMS slots and the external spool), so an AI knows what it can print with.
+std::string loadedFilament(const print::PrintStatus& s) {
+    if (!s.ok) return {};
+    std::ostringstream o;
+    int n = 0;
+    auto one = [&](const print::PrintStatus::AmsTray& t, const std::string& where, bool inUse) {
+        if (!t.loaded) return;
+        o << (n++ ? "; " : "") << where << ": " << (t.name.empty() || t.name == t.type ? t.type : t.name + " (" + t.type + ")");
+        if (!t.color.empty()) o << " " << t.color;
+        if (t.remain >= 0) o << ", " << t.remain << "% left";
+        if (inUse) o << ", in use";
+    };
+    for (auto& t : s.trays) one(t, "AMS " + std::to_string(t.ams + 1) + "-" + std::to_string(t.slot + 1), s.trayNow == t.ams * 4 + t.slot);
+    if (s.hasExt) one(s.ext, "external spool", s.trayNow == 254 || s.trays.empty());
+    if (!n) return "The printer does not say which filament is loaded (for the external spool, the user can set it on the printer's screen).";
+    return "Filament in the printer: " + o.str() + ".";
+}
+
+// The filament types loaded in the printer ("PLA", "PETG"), upper case.
+std::set<std::string> loadedTypes(const print::PrintStatus& s) {
+    std::set<std::string> out;
+    auto add = [&](const print::PrintStatus::AmsTray& t) {
+        if (!t.loaded || t.type.empty()) return;
+        std::string u = t.type;
+        for (auto& ch : u) ch = (char)std::toupper((unsigned char)ch);
+        out.insert(u);
+    };
+    for (auto& t : s.trays) add(t);
+    if (s.hasExt) add(s.ext);
+    return out;
+}
+
 std::string statusLine(const print::PrintStatus& s) {
     if (!s.ok) return s.error;
+    std::string fil = loadedFilament(s);
+    std::string tail = fil.empty() ? std::string() : " " + fil;
     std::ostringstream o;
+    if (s.state == "finished" || s.state == "failed" || s.state == "cancelled") {
+        // Not busy: say so first, so nobody waits on an old job.
+        o << "The printer is free. Its last job" << (s.job.empty() ? std::string() : " (" + s.job + ")")
+          << (s.state == "finished" ? " finished" : s.state == "cancelled" ? " was cancelled" : " failed")
+          << "; a new print can start once the plate is clear";
+        if (s.nozzleC >= 0) o << ". Nozzle " << (int)std::lround(s.nozzleC) << " C";
+        if (s.bedC >= 0) o << ", bed " << (int)std::lround(s.bedC) << " C";
+        return o.str() + "." + tail;
+    }
     o << "The printer is " << s.state;
     if (s.percent >= 0 && (s.state == "printing" || s.state == "paused")) o << ", " << s.percent << "% done";
     if (s.minutesLeft > 0 && s.state == "printing") o << ", about " << print::formatDuration(s.minutesLeft * 60.0) << " left";
     if (!s.job.empty()) o << " (job: " << s.job << ")";
     if (s.nozzleC >= 0) o << ". Nozzle " << (int)std::lround(s.nozzleC) << " C";
     if (s.bedC >= 0) o << ", bed " << (int)std::lround(s.bedC) << " C";
-    return o.str() + ".";
+    return o.str() + "." + tail;
 }
 
 } // namespace
@@ -167,6 +211,10 @@ std::string App::aiPrintTool(const std::string& name, const std::string& argsJso
         kp.set("use_ams", Value(c.useAms));
         if (c.useAms) kp.set("ams_slot", Value(c.amsSlot + 1));
         o.set("kestral_printer", kp);
+        if (c.kind != print::PrinterKind::None) {   // what is loaded decides which filament profiles make sense
+            print::PrintStatus st = print::printerStatus(c, 5000);
+            o.set("filament_in_printer", Value(st.ok ? loadedFilament(st) : "Could not ask the printer: " + st.error));
+        }
         o.set("bambu_connect_installed", Value(platform::urlSchemeRegistered("bambu-connect")));
         {
             std::lock_guard lock(print_.m);
@@ -209,6 +257,7 @@ std::string App::aiPrintTool(const std::string& name, const std::string& argsJso
                 Pick p;
                 p.name = doc_.name.empty() ? "Kestral design" : doc_.name;
                 // What is on the Slice tab's plate, where it sits there (the user sees the same).
+                sliceFollowDesign();
                 plateSync();
                 for (auto& [id, o] : slice_.plate) {
                     if (!o.onPlate) continue;
@@ -289,6 +338,22 @@ std::string App::aiPrintTool(const std::string& name, const std::string& argsJso
         o << " Print time about " << print::formatDuration(res.seconds) << ", " << std::round(res.grams * 10) / 10 << " g of filament";
         if (res.meters > 0) o << " (" << std::round(res.meters * 100) / 100 << " m)";
         o << ".";
+        if (!res.keySettings.empty())
+            o << " Settings used: " << res.keySettings << ". Check they suit what the part is for before printing.";
+        {   // Does the filament profile match what is loaded?
+            print::PrinterConn c;
+            if (onMain<print::PrinterConn>(post, cancel, [this] { return printerConn(); }, c) && c.kind != print::PrinterKind::None) {
+                print::PrintStatus st = print::printerStatus(c, 4000);
+                std::string fil = loadedFilament(st);
+                if (!fil.empty()) o << " " << fil;
+                auto types = loadedTypes(st);
+                std::string ft = res.filamentType;
+                for (auto& ch : ft) ch = (char)std::toupper((unsigned char)ch);
+                if (!ft.empty() && !types.empty() && !types.count(ft))
+                    o << " WARNING: this was sliced for " << res.filamentType << " but the printer has no " << res.filamentType
+                      << " loaded. Slice with a filament profile for what is loaded, or ask the user to load " << res.filamentType << ".";
+            }
+        }
         if (!res.warnings.empty()) {
             o << " OrcaSlicer warnings: ";
             for (size_t i = 0; i < res.warnings.size() && i < 4; ++i) o << (i ? "; " : "") << res.warnings[i];
@@ -409,6 +474,7 @@ std::string App::aiPrintTool(const std::string& name, const std::string& argsJso
                     else sliceSetValue(key, val);
                 }
                 if (a["auto_orient"].isBool()) slice_.orient = a["auto_orient"].asBool();
+                sliceFollowDesign();
                 plateSync();
                 if (a["build_plates"].isNumber()) {
                     slice_.plates = std::clamp((int)a["build_plates"].asNumber(), 1, 36);
@@ -548,6 +614,8 @@ std::string App::aiPrintTool(const std::string& name, const std::string& argsJso
         if (!onMain<std::string>(post, cancel, [this, a] {
                 std::ostringstream note;
                 if (!sliceWs_) enterSliceWorkspace();
+                sliceFollowDesign();
+                plateSync();
                 auto partBy = [&](const std::string& nm) -> uint32_t {
                     std::string l = toLower(nm);
                     for (auto& [id, o] : slice_.plate) if (toLower(o.name) == l || std::to_string(id) == l) return id;
@@ -703,6 +771,11 @@ std::string App::aiPrintTool(const std::string& name, const std::string& argsJso
                 std::string sl3 = toLower(a["slice"].asString());
                 if (sl3 == "plate") startSliceJob();
                 else if (sl3 == "all") sliceAllPlates();
+                if (sl3 == "plate" || sl3 == "all") {
+                    // Slicing runs in the background: say whether it started (a warning toast says why not).
+                    if (slice_.slicing) note << "Slicing started in the background: call wait_for (until idle), then slice_tab again for the result. ";
+                    else note << "Slicing did not start" << (aiCaptured_.empty() ? std::string(".") : ": " + aiCaptured_.back() + ".") << " ";
+                }
                 sceneDirty_ = true;
                 activity();
                 // What the tab has now.
@@ -739,6 +812,14 @@ std::string App::aiPrintTool(const std::string& name, const std::string& argsJso
                         o << " " << i + 1 << "->" << (m == 254 ? std::string("Ext") : m < 0 ? std::string("none") : "A" + std::to_string(m / 4 + 1) + "-" + std::to_string(m % 4 + 1));
                     }
                     o << ".";
+                }
+                if (slice_.slicing) o << " Slicing now.";
+                else if (!slice_.error.empty()) o << " The last slice failed: " << slice_.error;
+                else {
+                    std::lock_guard lock(print_.m);
+                    if (print_.last.ok)
+                        o << " Last slice: " << print::formatDuration(print_.last.seconds) << ", " << std::round(print_.last.grams * 10) / 10
+                          << " g" << (print_.last.keySettings.empty() ? std::string() : "; settings used: " + print_.last.keySettings) << ".";
                 }
                 const auto& st = slice_.devStatus;
                 if (st.ok && (!st.trays.empty() || st.hasExt)) {

@@ -162,51 +162,29 @@ void App::syncToolFromSelection() {
         return std::hypot(p.x - (a.x + ab.x * u), p.y - (a.y + ab.y * u));
     };
     if (t == FeatureType::Align) {
-        if (clicked && (hov_.kind == HoverKind::Face || hov_.kind == HoverKind::Edge)) {
-            auto bit = doc_.bodies.find(hov_.body);
-            auto pit = bit != doc_.bodies.end() ? doc_.parts.find(bit->second.partId) : doc_.parts.end();
-            TargetRef ref = refOfBody(hov_.body);
-            if (bit != doc_.bodies.end() && pit != doc_.parts.end() && pit->second.shape && ref.first && ref.first != tdlg_.featureId) {
-                AlignParams::Pick pk;
-                pk.ref = ref;
-                std::string label;
-                ImVec2 m = ImGui::GetIO().MousePos;
-                if (hov_.kind == HoverKind::Face) {
-                    glm::dvec3 c, n;
-                    bool planar = false;
-                    if (kernel::faceInfo(pit->second.shape, hov_.index, c, n, planar)) {
-                        pk.kind = 0;
-                        pk.sub = hov_.index;
-                        pk.total = kernel::faceCount(pit->second.shape);
-                        label = std::string(planar ? "Center of " : "Center of curved ") + bit->second.name;
-                    }
-                } else {
-                    kernel::EdgeGeom g;
-                    if (kernel::edgeGeom(pit->second.shape, bit->second.xform, hov_.index, g)) {
-                        pk.sub = hov_.index;
-                        pk.total = kernel::edgeCount(pit->second.shape);
-                        ImVec2 sa, sb;
-                        bool enda = worldToScreen(g.a, sa), endb = worldToScreen(g.b, sb);
-                        float grab = 12.f * uiScale_;
-                        float da = enda ? std::hypot(m.x - sa.x, m.y - sa.y) : 1e9f;
-                        float db = endb ? std::hypot(m.x - sb.x, m.y - sb.y) : 1e9f;
-                        if (g.type == 0 && da < grab && da <= db) { pk.kind = 2; pk.end = 1; label = "Corner of " + bit->second.name; }
-                        else if (g.type == 0 && db < grab && db < da) { pk.kind = 2; pk.end = 2; label = "Corner of " + bit->second.name; }
-                        else { pk.kind = 1; label = "Middle of edge of " + bit->second.name; }
-                    }
-                }
+        // The click arrives here on mouse release (viewportClick), so IsMouseClicked has already passed.
+        bool clicked = !winSel_ && viewportHovered_ &&
+                       (ImGui::IsMouseClicked(ImGuiMouseButton_Left) || ImGui::IsMouseReleased(ImGuiMouseButton_Left));
+        AlignSnap snapPick;
+        if (clicked && alignSnapAt(snapPick, nullptr)) {
+            {
+                AlignParams::Pick pk = snapPick.pick;
+                std::string label = snapPick.label;
                 if (!label.empty()) {
                     AlignParams& a = tdlg_.align;
                     if (!a.from.ref.first) {
                         a.from = pk;
                         a.fromName = label;
+                        alignFromWorld_ = snapPick.world;
+                        alignFromShown_ = true;
                         if (std::find(a.targets.begin(), a.targets.end(), pk.ref) == a.targets.end()) a.targets.insert(a.targets.begin(), pk.ref);
-                        toast("Now click where it should land: a face center, an edge middle, or a corner");
+                        toast("Now click the circle or face it should land on");
                     } else if (pk.ref == a.from.ref) {
                         toast("Pick the destination on the body that stays where it is", ToastKind::Warning);
                     } else {
                         a.to = pk;
                         a.toName = label;
+                        alignFromShown_ = false;
                         a.targets.erase(std::remove(a.targets.begin(), a.targets.end(), pk.ref), a.targets.end());
                         if (a.targets.empty()) a.targets.push_back(a.from.ref);
                     }
@@ -448,7 +426,7 @@ void App::syncToolFromSelection() {
                 glm::dmat4 xf(bit->second.xform);
                 double v = 0;
                 try { v = peval::eval(tdlg_.v1, doc_.params); } catch (const std::runtime_error&) {}
-                setManip(2, glm::dvec3(xf * glm::dvec4(c, 1.0)), glm::normalize(glm::dvec3(xf * glm::dvec4(n, 0.0))), v);
+                setManip(2, glm::dvec3(xf * glm::dvec4(c, 1.0)), glm::normalize(glm::dvec3(xf * glm::dvec4(n, 0.0))), v, planar);
             }
         }
         // Fillet / chamfer: a drag arrow on the first edge pointing into the material, like Fusion:
@@ -505,6 +483,7 @@ void App::syncToolFromSelection() {
                 tdlg_.option = 3;
                 tdlg_.axisName = "Face of " + bit->second.name;
                 tdlg_.option2 = 0;
+                tdlg_.mirrorWaitPlane = false;
                 activePickFilter_ = PickBody;
             } else {
                 toast("Pick a flat face for the mirror plane", ToastKind::Warning);
@@ -693,6 +672,7 @@ void App::startToolFeature(FeatureType type) {
         f.hole = std::make_shared<HoleParams>();
     } else if (type == FeatureType::Move) {
         f.move = std::make_shared<MoveParams>();
+        f.move->together = true;
     } else if (type == FeatureType::Remove) {
         f.remove = std::make_shared<RemoveParams>();
     } else if (type == FeatureType::Gear) {
@@ -760,7 +740,7 @@ void App::startToolFeature(FeatureType type) {
     if (type == FeatureType::Gear || type == FeatureType::Wing || type == FeatureType::Blade) clearSelection();
     if (type == FeatureType::Align) {
         activePickFilter_ = PickFace | PickEdge;
-        toast("Click a face center, an edge middle, or a corner on the body to move");
+        toast("Click a circle, a face or a corner on the part to move");
     }
     // Faces picked for an edge tool become their edges; edges picked for a face tool are dropped.
     if (kind == 2 || kind == 3 || kind == 5 || kind == 6) selEdges_.clear();
@@ -833,8 +813,12 @@ void App::runPathPattern() {
 
 void App::runMirror() {
     startToolFeature(FeatureType::Mirror);
+    if (!tdlg_.open || tdlg_.type != FeatureType::Mirror) return;
+    // No copy lands on top of the original: it waits for the mirror plane (a face or an origin plane).
+    tdlg_.mirrorWaitPlane = true;
+    applyToolDialog();
     // Bodies already picked: go straight to the mirror plane, like Fusion's next selection box.
-    if (tdlg_.open && tdlg_.type == FeatureType::Mirror && !tdlg_.targets.empty()) {
+    if (!tdlg_.targets.empty()) {
         tdlg_.option2 = 1;
         activePickFilter_ = PickFace;
         toast("Click a flat face to mirror across, or choose an origin plane");
@@ -1709,6 +1693,8 @@ void App::fillToolDlgFromParams(const Feature& f) {
     } else if (f.type == FeatureType::Align && f.align) {
         tdlg_.align = *f.align;
         tdlg_.targets = f.align->targets;
+        std::snprintf(tdlg_.v1, sizeof tdlg_.v1, "%s", f.align->angleExpr.c_str());
+        std::snprintf(tdlg_.v2, sizeof tdlg_.v2, "%s", f.align->offsetExpr.c_str());
     } else if (f.type == FeatureType::Hole && f.hole) {
         std::snprintf(tdlg_.v1, sizeof tdlg_.v1, "%s", f.hole->diaExpr.c_str());
         std::snprintf(tdlg_.v2, sizeof tdlg_.v2, "%s", f.hole->depthExpr.c_str());
@@ -2017,7 +2003,7 @@ void App::applyToolDialog() {
     } else if (f.type == FeatureType::Mirror && f.mirror) {
         auto mp = std::make_shared<MirrorParams>(*f.mirror);
         mp->plane = tdlg_.option;
-        mp->targets = tdlg_.targets;
+        mp->targets = tdlg_.mirrorWaitPlane ? std::vector<TargetRef>{} : tdlg_.targets;
         mp->planeO = tdlg_.axisO;
         mp->planeN = tdlg_.axisD;
         mp->planeName = tdlg_.axisName;
@@ -2026,7 +2012,8 @@ void App::applyToolDialog() {
         auto cp = std::make_shared<CombineParams>(*f.combine);
         cp->op = std::clamp(tdlg_.option, 1, 3);
         cp->targets = tdlg_.targets;
-        cp->tools = tdlg_.tools;
+        // Nothing is combined while you are still picking: it happens on OK (or Enter).
+        cp->tools = combineFinal_ ? tdlg_.tools : std::vector<TargetRef>{};
         cp->tool = {0, 0};
         cp->keepTools = tdlg_.option2 != 0;
         f.combine = cp;
@@ -2050,6 +2037,10 @@ void App::applyToolDialog() {
     } else if (f.type == FeatureType::Align && f.align) {
         auto a = std::make_shared<AlignParams>(tdlg_.align);
         if (a->targets.empty()) a->targets = tdlg_.targets;
+        a->angleExpr = tdlg_.v1;
+        a->offsetExpr = tdlg_.v2;
+        tdlg_.align.angleExpr = a->angleExpr;
+        tdlg_.align.offsetExpr = a->offsetExpr;
         f.align = a;
     } else if (f.type == FeatureType::Hole && f.hole) {
         auto hp = std::make_shared<HoleParams>(*f.hole);
@@ -2181,8 +2172,18 @@ void App::applyToolDialog() {
 
 void App::closeToolDialog(bool ok) {
     if (!tdlg_.open) return;
+    if (ok && tdlg_.type == FeatureType::Mirror && tdlg_.mirrorWaitPlane) {
+        tdlg_.mirrorWaitPlane = false;   // OK without a face: the plane shown in the box
+        applyToolDialog();
+    }
+    if (ok && tdlg_.type == FeatureType::Combine) {
+        combineFinal_ = true;
+        applyToolDialog();
+        combineFinal_ = false;
+    }
     tdlg_.open = false;
     holePlace_.active = false;
+    manipShiftFid_ = UINT32_MAX;
     holePlace_.valid = false;
     manip_ = Manip{};
     activePickFilter_ = PickBody | PickFace | PickEdge | PickProfile;
@@ -2474,6 +2475,8 @@ void App::drawToolDialog() {
         label("Tangent Chain");
         ImGui::Checkbox("##tchain", &tangentChain_);
         ImGui::SetItemTooltip("Clicking an edge also picks the edges that flow smoothly from it");
+        ImGui::Checkbox("Snap to faces", &settings_.manipSnap);
+        ImGui::SetItemTooltip("Dragging the arrow near another flat face stops it on that face's plane.\nHold Alt while dragging to skip snapping.");
         if (kind == 0) ImGui::TextDisabled("Never crashes: if a radius is too big, Kestral\nrounds what fits and tells you the max.");
         }
     } else if (kind == 2) {
@@ -2491,6 +2494,8 @@ void App::drawToolDialog() {
     } else if (kind == 3) {
         picks("Faces", tdlg_.faces.size(), "face", "Select faces");
         exprField("Distance", tdlg_.v1, "mm");
+        ImGui::Checkbox("Snap to faces", &settings_.manipSnap);
+        ImGui::SetItemTooltip("Dragging the arrow near another flat face stops it on that face's plane.\nHold Alt while dragging to skip snapping.");
         ImGui::TextDisabled("Drag the arrow or type. Negative goes in.");
     } else if (f.type == FeatureType::Pattern) {
         picks("Objects", tdlg_.targets.size(), "body", "Select bodies");
@@ -2553,8 +2558,35 @@ void App::drawToolDialog() {
         }
     } else if (f.type == FeatureType::Mirror) {
         picks("Objects", tdlg_.targets.size(), "body", "Select bodies");
+        // The first body picked moves straight on to the plane: the next click is the face.
+        if (tdlg_.mirrorWaitPlane && !tdlg_.targets.empty() && tdlg_.option2 == 0 && !tdlg_.mirrorAsked) {
+            tdlg_.mirrorAsked = true;
+            tdlg_.option2 = 1;
+            activePickFilter_ = PickFace;
+        }
         const char* planes[] = {"XY Plane", "XZ Plane", "YZ Plane", "Picked face"};
-        combo("Mirror Plane", "##plane", tdlg_.option, planes, tdlg_.option == 3 ? 4 : 3);
+        const char* planesWait[] = {"XY Plane", "XZ Plane", "YZ Plane", "Click a face..."};
+        int before = tdlg_.option;
+        if (tdlg_.mirrorWaitPlane) {
+            int pick = -1;
+            label("Mirror Plane");
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::BeginCombo("##planew", "Click a face, or choose...")) {
+                for (int i = 0; i < 3; ++i)
+                    if (ImGui::Selectable(planesWait[i])) pick = i;
+                ImGui::EndCombo();
+            }
+            if (pick >= 0) {
+                tdlg_.option = pick;
+                tdlg_.mirrorWaitPlane = false;
+                tdlg_.option2 = 0;
+                activePickFilter_ = PickBody;
+                commit();
+            }
+        } else {
+            combo("Mirror Plane", "##plane", tdlg_.option, planes, tdlg_.option == 3 ? 4 : 3);
+        }
+        (void)before;
         if (tdlg_.option == 3) ImGui::TextDisabled("%*s%s", 26, "", tdlg_.axisName.c_str());
         label("");
         bool picking = tdlg_.option2 == 1;
@@ -2667,15 +2699,20 @@ void App::drawToolDialog() {
         row("To", tdlg_.align.toName);
         label("Flip");
         if (ImGui::Checkbox("##aflip", &tdlg_.align.flip)) commit();
-        ImGui::SetItemTooltip("Faces: point the same way instead of mating.\nEdges: run the opposite way.");
+        ImGui::SetItemTooltip("Flat faces point the same way instead of mating.\nCircles and edges turn the other way.");
+        exprField("Angle", tdlg_.v1, "deg");
+        ImGui::SetItemTooltip("Turns the part about the destination's axis after it lands\n(the face normal, the circle's axis or the edge).");
+        exprField("Offset", tdlg_.v2, "mm");
+        ImGui::SetItemTooltip("Leaves a gap along the destination's direction.");
         if (ImGui::Button("Pick again", ImVec2(-1, 0))) {
+            alignFromShown_ = false;
             tdlg_.align.from = {};
             tdlg_.align.to = {};
             tdlg_.align.fromName.clear();
             tdlg_.align.toName.clear();
             commit();
         }
-        ImGui::TextDisabled("Click a face for its center, an edge for its middle,\nor right on a corner. Faces mate and edges line up.");
+        ImGui::TextDisabled("Hover to see the snaps: face center or axis, circle\ncenter, edge middle and corners. The orange one is\nwhat a click takes. Flat faces mate, circles share\nan axis. Flip, Angle and Offset fine tune it.");
     } else if (f.type == FeatureType::Remove) {
         picks("Bodies", tdlg_.targets.size(), "body", "Select bodies to remove");
     } else if (f.type == FeatureType::Rib || f.type == FeatureType::Web) {
@@ -3040,7 +3077,9 @@ void App::drawToolDialog() {
                 exprField("X Angle", tdlg_.v4, "deg");
                 exprField("Y Angle", tdlg_.v5, "deg");
                 exprField("Z Angle", tdlg_.v6, "deg");
-                ImGui::TextDisabled("Turns about the body center, X first, then Y, then Z.");
+                ImGui::TextDisabled(f.move && f.move->together
+                    ? "Drag the rings to turn. All picked bodies turn as one,\nabout the center of all of them."
+                    : "Turns about the body center, X first, then Y, then Z.");
             }
         }
         bool copy = tdlg_.option2 != 0;
@@ -3169,6 +3208,137 @@ void App::drawToolDialog() {
     if (!open) cancel = true;
     if (ok) closeToolDialog(true);
     else if (cancel) closeToolDialog(false);
+}
+
+} // namespace kst
+
+namespace kst {
+
+// The snaps on what the mouse is over, and the one a click takes: the nearest snap on screen when
+// the mouse is close to it, else the face's center (or axis) or the edge's middle (or circle center).
+bool App::alignSnapAt(AlignSnap& out, std::vector<AlignSnap>* cands) {
+    if (!(hov_.kind == HoverKind::Face || hov_.kind == HoverKind::Edge)) return false;
+    uint32_t body = pickBodyFor(hov_.body);   // a preview body stands for the one it copies
+    auto bit = doc_.bodies.find(body);
+    if (bit == doc_.bodies.end()) return false;
+    auto pit = doc_.parts.find(bit->second.partId);
+    if (pit == doc_.parts.end() || !pit->second.shape) return false;
+    TargetRef ref = refOfBody(body);
+    if (!ref.first || ref.first == tdlg_.featureId) return false;
+    const ShapePtr& shape = pit->second.shape;
+    const glm::dmat4 xf(bit->second.xform);
+    const std::string& bn = bit->second.name;
+    std::vector<AlignSnap> all;
+    AlignSnap fallback;
+    bool haveFallback = false;
+    uint32_t eTotal = kernel::edgeCount(shape);
+    auto addEdge = [&](uint32_t e, bool asDefault) {
+        kernel::EdgeGeom g;
+        if (!kernel::edgeGeom(shape, bit->second.xform, e, g)) return;
+        AlignSnap s;
+        s.pick.ref = ref;
+        s.pick.sub = e;
+        s.pick.total = eTotal;
+        if (g.type == 1 || g.type == 2) {
+            s.pick.kind = 1;
+            s.label = (g.type == 1 ? "Center of circle on " : "Center of arc on ") + bn;
+            s.world = g.center;
+            all.push_back(s);
+            if (asDefault && !haveFallback) { fallback = s; haveFallback = true; }
+        } else {
+            s.pick.kind = 1;
+            s.label = "Middle of edge on " + bn;
+            s.world = g.type == 0 ? (g.a + g.b) * 0.5 : (!g.pts.empty() ? g.pts[g.pts.size() / 2] : (g.a + g.b) * 0.5);
+            all.push_back(s);
+            if (asDefault && !haveFallback) { fallback = s; haveFallback = true; }
+        }
+        if (g.type != 1) {
+            for (int end = 1; end <= 2; ++end) {
+                AlignSnap c;
+                c.pick.ref = ref;
+                c.pick.kind = 2;
+                c.pick.sub = e;
+                c.pick.total = eTotal;
+                c.pick.end = end;
+                c.label = "Corner of " + bn;
+                c.world = end == 1 ? g.a : g.b;
+                all.push_back(c);
+            }
+        }
+    };
+    if (hov_.kind == HoverKind::Face) {
+        glm::dvec3 c, n, axO, axD;
+        bool planar = false;
+        AlignSnap s;
+        s.pick.ref = ref;
+        s.pick.kind = 0;
+        s.pick.sub = hov_.index;
+        s.pick.total = kernel::faceCount(shape);
+        if (kernel::faceRoundAxis(shape, hov_.index, axO, axD)) {
+            s.label = "Axis of " + bn;
+            s.world = glm::dvec3(xf * glm::dvec4(axO, 1.0));
+        } else if (kernel::faceInfo(shape, hov_.index, c, n, planar)) {
+            s.label = std::string(planar ? "Center of face on " : "Center of curved face on ") + bn;
+            s.world = glm::dvec3(xf * glm::dvec4(c, 1.0));
+        } else {
+            return false;
+        }
+        all.push_back(s);
+        fallback = s;
+        haveFallback = true;
+        std::vector<uint32_t> fe = kernel::faceEdges(shape, hov_.index);
+        for (size_t i = 0; i < fe.size() && i < 200; ++i) addEdge(fe[i], false);
+    } else {
+        addEdge(hov_.index, true);
+    }
+    if (!haveFallback) return false;
+    // The nearest snap on screen wins when the mouse is right on it.
+    ImVec2 m = ImGui::GetIO().MousePos;
+    float best = 14.f * uiScale_;
+    const AlignSnap* pick = nullptr;
+    for (auto& s : all) {
+        ImVec2 q;
+        if (!worldToScreen(s.world, q)) continue;
+        float d = std::hypot(m.x - q.x, m.y - q.y);
+        if (d < best) { best = d; pick = &s; }
+    }
+    out = pick ? *pick : fallback;
+    if (cands) *cands = std::move(all);
+    return true;
+}
+
+// Fusion style snap glyphs while Align waits for a pick: every snap on the hovered face or edge,
+// the one a click takes in orange with its name, and the "from" point once it is chosen.
+void App::drawAlignSnaps() {
+    if (!tdlg_.open || tdlg_.type != FeatureType::Align) { alignFromShown_ = false; return; }
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    const float S = uiScale_;
+    if (alignFromShown_ && tdlg_.align.from.ref.first && !tdlg_.align.to.ref.first) {
+        ImVec2 q;
+        if (worldToScreen(alignFromWorld_, q)) {
+            dl->AddCircleFilled(q, 5.5f * S, IM_COL32(40, 160, 255, 240));
+            dl->AddCircle(q, 5.5f * S, IM_COL32(255, 255, 255, 240), 0, 1.5f * S);
+        }
+    }
+    if (!viewportHovered_ || (tdlg_.align.from.ref.first && tdlg_.align.to.ref.first)) return;
+    AlignSnap cur;
+    std::vector<AlignSnap> cands;
+    if (!alignSnapAt(cur, &cands)) return;
+    for (auto& s : cands) {
+        ImVec2 q;
+        if (!worldToScreen(s.world, q)) continue;
+        dl->AddCircleFilled(q, 3.f * S, IM_COL32(255, 255, 255, 200));
+        dl->AddCircle(q, 3.f * S, IM_COL32(40, 40, 40, 200), 0, 1.f * S);
+    }
+    ImVec2 q;
+    if (worldToScreen(cur.world, q)) {
+        dl->AddCircleFilled(q, 6.f * S, IM_COL32(255, 107, 53, 245));
+        dl->AddCircle(q, 6.f * S, IM_COL32(255, 255, 255, 245), 0, 1.5f * S);
+        ImVec2 tp(q.x + 10 * S, q.y - 22 * S);
+        ImVec2 ts = ImGui::CalcTextSize(cur.label.c_str());
+        dl->AddRectFilled(ImVec2(tp.x - 4 * S, tp.y - 2 * S), ImVec2(tp.x + ts.x + 4 * S, tp.y + ts.y + 2 * S), IM_COL32(25, 25, 28, 220), 3 * S);
+        dl->AddText(tp, IM_COL32(255, 255, 255, 255), cur.label.c_str());
+    }
 }
 
 } // namespace kst

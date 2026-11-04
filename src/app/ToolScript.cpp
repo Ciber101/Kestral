@@ -16,7 +16,9 @@
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
+#include <future>
 #include <map>
+#include <thread>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -31,6 +33,11 @@ void App::toolScriptStep() {
     static std::map<std::string, std::string> vars;
     static std::ofstream out;
     static int fails = 0;
+    static bool longJob = false;   // the last call runs in the background for a long time (the slicer sweep)
+    // Tools that run on a worker (slicing, printer, interference): their answer arrives later.
+    static std::shared_ptr<std::promise<std::string>> pending;
+    static std::shared_future<std::string> pendingFut;
+    static std::string pendingName, pendingArgs, pendingAs;
     activity();
     if (!loaded) {
         loaded = true;
@@ -44,8 +51,20 @@ void App::toolScriptStep() {
         out << lines.size() << " calls\n";
     }
     auto busy = [&] { return recomputeRunning_ || recomputeQueuedFrom_ >= 0 || (jobs_ && jobs_->active() > 0); };
+    if (pending) {
+        if (pendingFut.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) return;
+        std::string res = pendingFut.get();
+        pending.reset();
+        char tbuf[32];
+        std::snprintf(tbuf, sizeof tbuf, " [%.1f s]", time_);
+        out << "#" << idx << tbuf << " " << pendingName << " " << pendingArgs.substr(0, 300) << "\n   -> " << res.substr(0, 20000) << "\n";
+        out.flush();
+        waiting = true;
+        t0 = time_;
+        return;
+    }
     if (waiting) {
-        if (busy() && time_ - t0 < 1800) return;
+        if (busy() && (longJob || time_ - t0 < 1800)) return;
         waiting = false;
     }
     if (idx >= lines.size()) {
@@ -100,9 +119,31 @@ void App::toolScriptStep() {
         dirty_ = false;
         openDocumentPath(json::Value::parse(args)["path"].asString());
         res = "opened";
+    } else if (v["t"].asString() == "_slicer_sweep") {
+        res = slicerSweep(args);
+    } else if (aiIsPrintTool(v["t"].asString()) || v["t"].asString() == "interference") {
+        // Worker tools, the way the assistant and MCP run them: on a thread, reaching the main thread through post.
+        pending = std::make_shared<std::promise<std::string>>();
+        pendingFut = pending->get_future().share();
+        pendingName = v["t"].asString();
+        pendingArgs = args;
+        auto p = pending;
+        std::string nm = pendingName;
+        JobSystem* jobs = jobs_.get();
+        std::thread([this, p, nm, args, jobs] {
+            auto cancel = std::make_shared<std::atomic<bool>>(false);
+            PostFn post = [jobs](std::function<void()> fn) { jobs->post(std::move(fn)); glfwPostEmptyEvent(); };
+            std::string r;
+            try {
+                r = nm == "interference" ? interferenceTool(args, post, cancel) : aiPrintTool(nm, args, post, cancel);
+            } catch (const std::exception& e) { r = std::string("Error: ") + e.what(); }
+            p->set_value(r);
+        }).detach();
+        return;
     } else {
         res = aiRunTool(v["t"].asString(), args);
     }
+    longJob = v["t"].asString() == "_slicer_sweep";
     std::string as = v["as"].asString();
     if (!as.empty()) {
         std::string val;
@@ -120,6 +161,9 @@ void App::toolScriptStep() {
     }
     std::string low = res;
     for (auto& c : low) c = (char)std::tolower((unsigned char)c);
+    // Hints that only mention errors ("If a timeline error is appended, ...") are not failures.
+    for (const char* hint : {"if a timeline error is appended"})
+        for (size_t p; (p = low.find(hint)) != std::string::npos;) low.erase(p, std::strlen(hint));
     bool bad = low.find("error") != std::string::npos || low.find("failed") != std::string::npos || low.find("cannot") != std::string::npos ||
                low.find("unknown") != std::string::npos || low.find("not found") != std::string::npos;
     if (bad) ++fails;

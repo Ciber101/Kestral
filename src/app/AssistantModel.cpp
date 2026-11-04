@@ -199,7 +199,7 @@ bool App::aiModelTool(const std::string& name, const std::string& argsJson, std:
         "extrude", "revolve", "sweep", "loft", "rotate", "scale", "set_transform", "align", "combine",
         "circular_pattern", "rect_pattern", "pattern_on_path", "mirror", "shell", "thicken", "split_body", "gear", "blades", "thread", "wing",
         "dovetail", "interference", "measure", "offset_plane", "create_cylinder", "create_cone", "create_sphere",
-        "create_torus", "create_wedge", "create_tube", "create_coil", "pipe", "draft", "press_pull", "offset_face",
+        "create_torus", "create_wedge", "create_tube", "create_coil", "pipe", "draft", "press_pull", "delete_faces", "offset_face",
         "plane_at_angle", "midplane", "plane_3pt", "plane_tangent", "replace_face", "axis", "point", "split_face", "rib", "web", "emboss", "boss", "snap", "rest", "lip", "silhouette", "joint", "asbuilt_joint", "rigid_group"};
     bool mine = false;
     for (const char* n : kNames)
@@ -1544,6 +1544,13 @@ bool App::aiModelTool(const std::string& name, const std::string& argsJson, std:
         fill(tdlg_.align.from, src[0], a["source_kind"].asString("face"), (int)a["source_index"].asNumber(0), (int)a["source_end"].asNumber(1));
         fill(tdlg_.align.to, dst[0], a["target_kind"].asString("face"), (int)a["target_index"].asNumber(0), (int)a["target_end"].asNumber(1));
         tdlg_.align.flip = a["flip"].asBool(false);
+        auto exprOf = [&](const char* k) {
+            const auto& v = a[k];
+            if (v.isNumber()) { char b[48]; std::snprintf(b, sizeof b, "%.12g", v.asNumber()); return std::string(b); }
+            return v.asString();
+        };
+        std::snprintf(tdlg_.v1, sizeof tdlg_.v1, "%s", exprOf("angle").c_str());
+        std::snprintf(tdlg_.v2, sizeof tdlg_.v2, "%s", exprOf("offset").c_str());
         tdlg_.align.targets = {tdlg_.align.from.ref};
         tdlg_.align.fromName = doc_.bodies[src[0]].name;
         tdlg_.align.toName = doc_.bodies[dst[0]].name;
@@ -1871,17 +1878,9 @@ bool App::aiModelTool(const std::string& name, const std::string& argsJson, std:
             if (pit != doc_.parts.end() && pit->second.shape) items.push_back({bit->second.name, pit->second.shape, bit->second.xform});
         }
         if (items.size() < 2) { out = "Those bodies are not solids."; return true; }
-        std::string hits;
-        for (size_t i = 0; i < items.size(); ++i)
-            for (size_t j = i + 1; j < items.size(); ++j) {
-                if (!kernel::shapesTouch(items[i].shape, items[i].xf, items[j].shape, items[j].xf)) continue;
-                try {
-                    auto common = kernel::applyBool(kernel::BoolOp::Intersect, items[i].shape, {{items[j].shape, items[j].xf}});
-                    if (!common.empty() && kernel::shapeDiag(common[0]) > 1e-4)
-                        hits += (hits.empty() ? "" : ", ") + items[i].name + "/" + items[j].name;
-                } catch (const std::exception&) {}
-            }
-        out = hits.empty() ? "interference=none" : "interference=" + hits;
+        std::vector<InterferenceItem> list;
+        for (auto& it : items) list.push_back({it.name, it.shape, it.xf});
+        out = interferenceReport(list, nullptr);
         return true;
     }
 
@@ -2398,6 +2397,19 @@ bool App::aiModelTool(const std::string& name, const std::string& argsJson, std:
         applyToolDialog();
         std::string cerr = closedTool(draft ? "Draft" : "Press Pull");
         out = cerr.empty() ? (draft ? "Drafted the faces." : "Moved the faces.") : cerr;
+        return true;
+    }
+
+    if (name == "delete_faces") {
+        std::string err;
+        auto ids = idsFrom(a["names"], err);
+        if (!err.empty()) { out = err; return true; }
+        if (ids.empty() || !a["faces"].isArray() || !a["faces"].size()) { out = "Name the body and list face ids (get_body)."; return true; }
+        clearSelection();
+        for (auto& fv : a["faces"].items())
+            if (fv.isNumber()) selFaces_.insert({ids[0], (uint32_t)fv.asNumber()});
+        deleteSelection();
+        out = "Delete Face added; it heals the gap the faces leave.";
         return true;
     }
 

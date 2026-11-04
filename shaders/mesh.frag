@@ -85,6 +85,23 @@ void main() {
     int pattern = int(m1.a + 0.5);
     float metal = m2.x, rough = clamp(m2.y, 0.04, 1.0), scale = max(m2.z, 0.01), glow = m2.w;
 
+    // X-ray pass: the hovered or selected part where other bodies hide it, as a see-through tint.
+    if (pc.params.x > 1.5) {
+        uint xf = vInfo.y;
+        bool xHoverBody = (xf & 2u) != 0u || (pc.hover.z == 0u && pc.hover.x == vInfo.x);
+        bool xHoverFace = pc.hover.z == 1u && pc.hover.x == vInfo.x && pc.hover.y == face + 1u;
+        uint xCount = vInfo.w & 255u, xStart = vInfo.w >> 8;
+        bool xFaceSel = false;
+        for (uint i = 0u; i < xCount; ++i)
+            if (selFaces[xStart + i] == face) { xFaceSel = true; break; }
+        bool xSel = (xf & 1u) != 0u;
+        // Faces only: a whole body would show its own inside through itself.
+        if (!(xHoverFace || xFaceSel)) discard;
+        vec3 xc = (xHoverBody || xHoverFace) ? vec3(1.0, 0.62, 0.38) : vec3(1.0, 0.42, 0.21);
+        float xa = (xHoverFace || xFaceSel) ? 0.45 : 0.28;
+        outColor = vec4(xc * xa, xa);
+        return;
+    }
     // Two passes: solid things first, then see through things blended on top.
     bool transparentPass = pc.params.x > 0.5;
     if (transparentPass != (alpha < 0.999)) discard;

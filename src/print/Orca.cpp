@@ -4,6 +4,7 @@
 #include "core/Types.h"
 #include "platform/Embed.h"
 #include "print/Engine.h"
+#include "print/OrcaOptions.h"
 #include "platform/Platform.h"
 
 #include <zlib.h>
@@ -493,6 +494,27 @@ bool prepareProfiles(const OrcaSetup& s, const std::string& machine, const std::
         std::string v = value;
         if (key == "sparse_infill_density" && !v.empty() && v.back() != '%') v += "%";
         if (key == "enable_support") v = (toLower(v) == "true" || v == "1" || toLower(v) == "yes" || toLower(v) == "on") ? "1" : "0";
+        // Values the engine would refuse: say which and what is allowed, before it runs.
+        if (const OrcaOptionDef* d = orcaOption(key)) {
+            std::string t = d->type;
+            if ((t == "coEnum" || t == "coEnums") && d->values && *d->values) {
+                auto ch = splitChoices(d->values);
+                if (!v.empty() && std::find(ch.begin(), ch.end(), v) == ch.end()) {
+                    std::string list;
+                    for (auto& c : ch) list += (list.empty() ? "" : ", ") + c;
+                    error = key + " cannot be \"" + v + "\". It can be: " + list + ".";
+                    return false;
+                }
+            } else if (t == "coInt" || t == "coInts" || t == "coFloat" || t == "coFloats" || t == "coPercent" || t == "coPercents") {
+                double x = std::atof(v.c_str());
+                bool lo = d->min && *d->min && x < std::atof(d->min), hi = d->max && *d->max && x > std::atof(d->max);
+                if (!v.empty() && (lo || hi)) {
+                    error = key + " = " + v + " is outside what the slicer allows (" + (d->min && *d->min ? d->min : std::string("no minimum")) +
+                            " to " + (d->max && *d->max ? d->max : std::string("no maximum")) + ").";
+                    return false;
+                }
+            }
+        }
         Value* target = &p;
         if (!p.has(key)) {
             if (f.has(key) || key.rfind("filament_", 0) == 0) target = &f;
@@ -501,6 +523,41 @@ bool prepareProfiles(const OrcaSetup& s, const std::string& machine, const std::
         setOne(*target, key, v);
         if (target == &f)
             for (auto& fi : fils) setOne(fi, key, v);   // every filament gets the change
+    }
+
+    {   // A prime tower (several filaments, smooth timelapse) must sit on the bed. Some profiles keep it
+        // where a bigger printer has room (A1 mini: y 220 on a 180 mm bed) and the engine then refuses.
+        auto num0 = [](const Value& v) {
+            const Value& x = v.isArray() && v.size() ? v[(size_t)0] : v;
+            return x.isString() ? std::atof(x.asString().c_str()) : x.isNumber() ? x.asNumber() : 0.0;
+        };
+        double maxX = 0, maxY = 0;
+        for (auto& pt : m["printable_area"].items()) {
+            std::string t = pt.asString();
+            size_t xp = t.find('x');
+            if (xp == std::string::npos) continue;
+            maxX = std::max(maxX, std::atof(t.substr(0, xp).c_str()));
+            maxY = std::max(maxY, std::atof(t.substr(xp + 1).c_str()));
+        }
+        double w = p.has("prime_tower_width") ? num0(p["prime_tower_width"]) : 60;
+        const double depth = 50, margin = 5;
+        auto fix = [&](const char* key, double room) {
+            if (overrides.count(key) || room <= 0) return;
+            double v = p.has(key) ? num0(p[key]) : 1e9;   // not in the profile: the engine's default may be off this bed
+            if (v >= margin && v <= room) return;
+            char b[32];
+            std::snprintf(b, sizeof b, "%.1f", std::clamp(v, margin, std::max(margin, room)));
+            if (p.has(key)) setOne(p, key, b);
+            else {
+                Value arr = Value::array();
+                arr.push(Value(std::string(b)));
+                p.set(key, arr);
+            }
+        };
+        if (maxX > 0 && maxY > 0) {
+            fix("wipe_tower_x", maxX - w - margin);
+            fix("wipe_tower_y", maxY - depth - margin);
+        }
     }
 
     if (colors.size() == 1 && !colors[0].empty()) {   // one filament: its color (the preview and the AMS match use it)
@@ -592,9 +649,14 @@ SliceResult slice(const OrcaSetup& s, const SliceRequest& r, const std::atomic<b
             {-51, "Some settings are invalid for this print."}, {-52, "Part of the model is outside the printable area."},
             {-61, "This filament does not work with the chosen bed plate."}, {-65, "Some settings do not work with vase mode."},
             {-100, "Slicing failed."},
+            {-101, "Toolpaths of different parts or the prime tower run into each other. Move the parts or the prime tower apart."},
+            {-102, "Some of the print would go outside the printable area: usually supports, the brim or the skirt of a part near "
+                   "the edge or as long as the bed. Arrange the plate (or move the part to the middle), turn it diagonally, or use a "
+                   "smaller brim."},
         };
-        auto it = codes.find(pr.exitCode);
-        res.error = it != codes.end() ? it->second : (pr.error.empty() ? "OrcaSlicer stopped with code " + std::to_string(pr.exitCode) : pr.error);
+        int code = pr.exitCode > 127 && pr.exitCode < 256 ? pr.exitCode - 256 : pr.exitCode;   // Linux: -102 comes as 154
+        auto it = codes.find(code);
+        res.error = it != codes.end() ? it->second : (pr.error.empty() ? "OrcaSlicer stopped with code " + std::to_string(code) : pr.error);
         // Its own last words help (on Linux it prints the reason).
         std::string tail = res.log.size() > 600 ? res.log.substr(res.log.size() - 600) : res.log;
         if (!tail.empty()) res.error += " OrcaSlicer said: " + tail;
@@ -623,6 +685,54 @@ SliceResult slice(const OrcaSetup& s, const SliceRequest& r, const std::atomic<b
             if (!msg.empty()) res.warnings.push_back(msg);
         }
         pos = end == std::string::npos ? info.size() : end;
+    }
+    // The settings the slice really used (profile plus changes).
+    Value cfg = Value::parse(readZipEntry(res.gcode3mf, "Metadata/project_settings.config"));
+    auto text = [&](const char* k) -> std::string {
+        const Value& v = cfg[k];
+        const Value& x = v.isArray() && v.size() ? v[(size_t)0] : v;
+        if (x.isString()) return x.asString();
+        if (!x.isNumber()) return {};
+        char b[32];
+        std::snprintf(b, sizeof b, "%g", x.asNumber());
+        return b;
+    };
+    auto first = [&](const char* k) -> double {
+        std::string t = text(k);
+        return t.empty() ? -1 : std::atof(t.c_str());
+    };
+    {   // What decides strength, adhesion and supports, so the AI and the user can check them.
+        static const char* kKeys[] = {"layer_height", "wall_loops", "top_shell_layers", "bottom_shell_layers", "sparse_infill_density",
+                                      "sparse_infill_pattern", "brim_type", "brim_width", "enable_support", "support_type"};
+        std::string used;
+        for (const char* k : kKeys) {
+            std::string v = text(k);
+            if (!v.empty()) used += (used.empty() ? "" : ", ") + std::string(k) + " " + v;
+        }
+        res.keySettings = used;
+        res.filamentType = text("filament_type");
+    }
+    // Orca's bed warning is a bare key: say which temperatures it means, from the settings the slice used.
+    for (auto& w : res.warnings) {
+        if (w != "bed_temperature_too_high_than_filament") continue;
+        static const std::pair<const char*, const char*> kPlates[] = {
+            {"Cool Plate", "cool_plate_temp"}, {"Engineering Plate", "eng_plate_temp"}, {"High Temp Plate", "hot_plate_temp"},
+            {"Textured PEI Plate", "textured_plate_temp"}, {"Textured Cool Plate", "textured_cool_plate_temp"},
+            {"Supertack Plate", "supertack_plate_temp"}};
+        std::string plate = cfg["curr_bed_type"].asString();
+        double bed = -1, soft = first("temperature_vitrification");
+        for (auto& [name, key] : kPlates)
+            if (plate == name) bed = first(key);
+        std::ostringstream o;
+        o << "The bed";
+        if (bed > 0) o << " (" << std::lround(bed) << " C";
+        if (bed > 0 && !plate.empty()) o << " on the " << plate;
+        if (bed > 0) o << ")";
+        o << " is at or above this filament's softening temperature";
+        if (soft > 0) o << " (" << std::lround(soft) << " C)";
+        o << ". The bottom may soften or warp. Lower the plate temperature in the filament settings, or ignore this if "
+             "the profile already prints well.";
+        w = o.str();
     }
     res.ok = true;
     return res;

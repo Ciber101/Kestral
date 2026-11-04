@@ -109,11 +109,12 @@ void Camera::lookFrom(const glm::vec3& dir, float seconds) {
     glm::vec3 d = glm::normalize(dir);
     glm::vec3 upHint(0, 0, 1);
     if (std::abs(d.z) > 0.99f) {
-        // Top or bottom: keep the current screen orientation as much as possible.
+        // Top or bottom: keep the current screen orientation as much as possible, but square to
+        // the axes (the nearest of +X, -X, +Y, -Y), so the view lines up exactly.
         glm::vec3 u = up();
         u.z = 0;
-        upHint = glm::length(u) > 1e-3f ? glm::normalize(u) : glm::vec3(0, 1, 0);
-        if (d.z < 0) upHint = glm::length(u) > 1e-3f ? glm::normalize(u) : glm::vec3(0, -1, 0);
+        if (glm::length(u) < 1e-3f) u = d.z > 0 ? glm::vec3(0, 1, 0) : glm::vec3(0, -1, 0);
+        upHint = std::abs(u.x) > std::abs(u.y) ? glm::vec3(u.x > 0 ? 1.f : -1.f, 0, 0) : glm::vec3(0, u.y > 0 ? 1.f : -1.f, 0);
     }
     animateTo(target, distance, lookRotation(d, upHint), seconds);
 }

@@ -347,9 +347,12 @@ void App::drawDataPanel() {
             if (!it.dir && ImGui::MenuItem("Open")) openDocumentPath(it.path);
             if (!it.dir) {
                 auto vers = designVersions(it.path);
+                // A long version list scrolls instead of filling the window top to bottom.
+                ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(FLT_MAX, 420 * uiScale_));
                 if (ImGui::BeginMenu("Open an older version", vers.size() > 1)) {
                     for (int v : vers) {
-                        std::string lbl = "v" + std::to_string(v) + (v == vers.front() ? "  (newest)" : "");
+                        bool isOpen = doc_.path == it.path && v == doc_.version;
+                        std::string lbl = "v" + std::to_string(v) + (v == vers.front() ? "  (newest)" : "") + (isOpen ? "  (open)" : "");
                         std::error_code vec;
                         auto vt = std::filesystem::last_write_time(u8path(versionsDir(it.path) + "/v" + std::to_string(v) + ".kst"), vec);
                         char when2[64] = "";
@@ -423,6 +426,8 @@ void App::drawDataPanel() {
         bool hov = ImGui::IsItemHovered();
         bool sel = dataSel_ == it.path;
         bool current = !doc_.path.empty() && doc_.path == it.path;
+        // The open design shows the version that is open (an older one after "Open an older version").
+        int shownV = current && doc_.version > 0 ? doc_.version : it.version;
         dl->AddRectFilled(p, ImVec2(p.x + cw, p.y + ch), sel ? col::Selected : col::Card, 8 * S);
         if (hov || sel) dl->AddRect(p, ImVec2(p.x + cw, p.y + ch), col::Accent, 8 * S, 0, 1.5f * S);
         char when[64];
@@ -438,8 +443,8 @@ void App::drawDataPanel() {
             ImGui::PopFont();
             dl->AddText(ImVec2(p.x + 8 * S, t1.y + 21 * S), current ? col::Accent : col::TextDim, current ? "Open now" : when);
             dl->PopClipRect();
-            if (it.version > 0) {   // version badge on the preview, like Fusion's
-                std::string vs = "v" + std::to_string(it.version);
+            if (shownV > 0) {   // version badge on the preview, like Fusion's
+                std::string vs = "v" + std::to_string(shownV);
                 ImVec2 vz = ImGui::CalcTextSize(vs.c_str());
                 ImVec2 b0(t1.x - vz.x - 14 * S, t0.y + 4 * S);
                 dl->AddRectFilled(b0, ImVec2(t1.x - 4 * S, b0.y + vz.y + 4 * S), col::Accent, 8 * S);
@@ -454,7 +459,7 @@ void App::drawDataPanel() {
             float lh = ImGui::GetTextLineHeight();
             dl->PushClipRect(ImVec2(t1.x + 6 * S, p.y), ImVec2(p.x + cw - 4 * S, p.y + ch), true);
             dl->AddText(ImVec2(t1.x + 10 * S, p.y + ch * 0.5f - lh - 1 * S), col::Text, it.name.c_str());
-            std::string sub = (it.version > 0 ? "v" + std::to_string(it.version) + "   " : std::string()) + (current ? "Open now" : when);
+            std::string sub = (shownV > 0 ? "v" + std::to_string(shownV) + "   " : std::string()) + (current ? "Open now" : when);
             dl->AddText(ImVec2(t1.x + 10 * S, p.y + ch * 0.5f + 1 * S), current ? col::Accent : col::TextDim, sub.c_str());
             dl->PopClipRect();
         }

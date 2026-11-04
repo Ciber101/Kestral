@@ -53,6 +53,17 @@ for k, o in opts.items():
     if not o['vals'] and k in ('bottom_surface_pattern', 'internal_solid_infill_pattern') and 'top_surface_pattern' in opts:
         o['vals'], o['labs'] = opts['top_surface_pattern']['vals'], opts['top_surface_pattern']['labs']
 
+# What the engine really accepts (found by Kestral's slicer sweep, app/SlicerSweep.cpp): limits the
+# option table leaves out, and G-code flavors the command line engine refuses.
+for k, mx in (('wall_maximum_resolution', '0.5'), ('default_junction_deviation', '0.3')):
+    if k in opts and not opts[k]['max']:
+        opts[k]['max'] = mx
+if 'gcode_flavor' in opts:
+    o = opts['gcode_flavor']
+    keep = [i for i, v in enumerate(o['vals']) if v in ('marlin', 'klipper', 'reprapfirmware', 'repetier', 'marlin2')]
+    o['vals'] = [o['vals'][i] for i in keep]
+    o['labs'] = [o['labs'][i] for i in keep if i < len(o['labs'])]
+
 # ---- layout
 def tab_body(name):
     s = tab.index('void %s::build(' % name)

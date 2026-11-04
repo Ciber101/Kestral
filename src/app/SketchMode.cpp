@@ -404,7 +404,7 @@ void App::editSketch(uint32_t id) {
     selection_.clear();
     it->second.visible = true;
     sk::computeDof(it->second);
-    if (!already) sketchLookAt();
+    if (!already && settings_.sketchLookAt) sketchLookAt();   // Look At stays one click away
     markSceneDirty();
     doc_.touch();
     activity();
@@ -784,9 +784,15 @@ bool App::sketchKeys() {
         if (typed && (pressed(ImGuiKey_Enter) || pressed(ImGuiKey_KeypadEnter))) { sketchClick(); return true; }
     }
     if (pressed(ImGuiKey_Delete) || pressed(ImGuiKey_Backspace)) { sketchDelete(); return true; }
-    if (pressed(ImGuiKey_Enter) && sk_.tool == "line") { sk_.clicks.clear(); sk_.step = 0; sk_.chainStart = 0; return true; }
+    bool enterKey = pressed(ImGuiKey_Enter) || pressed(ImGuiKey_KeypadEnter);
+    if (enterKey && sk_.tool == "line" && (!sk_.clicks.empty() || sk_.step)) { sk_.clicks.clear(); sk_.step = 0; sk_.chainStart = 0; return true; }
     if (pressed(ImGuiKey_Enter) && (sk_.tool == "spline" || sk_.tool == "control_spline") && sk_.clicks.size() >= 2) {
         sketchCommitSpline(false, sk_.tool == "control_spline");
+        return true;
+    }
+    // Nothing being drawn: Enter finishes the sketch (like Finish Sketch).
+    if (enterKey && sk_.clicks.empty() && !sk_.step && sk_.picks.empty() && !sk_.dimPlacing && !sk_.dimEdit) {
+        finishSketch();
         return true;
     }
     return false;

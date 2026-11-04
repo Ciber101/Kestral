@@ -34,10 +34,15 @@
 #include <GProp_GProps.hxx>
 #include <BRepAdaptor_Surface.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
+#include <BRepPrimAPI_MakeHalfSpace.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRepTools.hxx>
 #include <gp_Pln.hxx>
 #include <gp_Cylinder.hxx>
+#include <gp_Cone.hxx>
+#include <gp_Sphere.hxx>
+#include <gp_Torus.hxx>
+#include <set>
 #include <BRepLProp_SLProps.hxx>
 #include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
 #include <TopTools_ListIteratorOfListOfShape.hxx>
@@ -65,6 +70,7 @@
 #include <Bnd_Box.hxx>
 #include <GC_MakeLine.hxx>
 #include <GCPnts_QuasiUniformDeflection.hxx>
+#include <GCPnts_TangentialDeflection.hxx>
 #include <Geom_TrimmedCurve.hxx>
 #include <gp_Ax1.hxx>
 #include <gp_Ax2.hxx>
@@ -92,6 +98,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include <string>
+#include <atomic>
 
 namespace kst::kernel {
 static constexpr double kPiK = 3.14159265358979323846;
@@ -181,11 +188,31 @@ TopoDS_Edge edgeFromSeg(const CurveSeg& c, const glm::dvec3& planeN) {
     return BRepBuilderAPI_MakeEdge(circ, 0.0, sweep).Edge();
 }
 
-TopoDS_Wire wireFromSegs(const std::vector<CurveSeg>& segs, const glm::dvec3& planeN) {
+TopoDS_Wire wireFromSegs(const std::vector<CurveSeg>& segsIn, const glm::dvec3& planeN) {
+    // Each segment starts exactly where the one before it ended: ends that differ by solver
+    // rounding (1e-5 mm) are not joined by OCCT, and the loop silently loses segments.
+    std::vector<CurveSeg> segs = segsIn;
+    auto startOf = [](CurveSeg& c) -> glm::dvec3& { return c.back ? c.b : c.a; };
+    auto endOf = [](CurveSeg& c) -> glm::dvec3& { return c.back ? c.a : c.b; };
+    for (size_t i = 0; i < segs.size(); ++i) {
+        CurveSeg& cur = segs[i];
+        if (cur.kind == CurveSeg::Kind::Circle || cur.kind == CurveSeg::Kind::Ellipse) continue;
+        CurveSeg& prev = segs[(i + segs.size() - 1) % segs.size()];
+        if (prev.kind == CurveSeg::Kind::Circle || prev.kind == CurveSeg::Kind::Ellipse || &prev == &cur) continue;
+        glm::dvec3& s0 = startOf(cur);
+        const glm::dvec3& e0 = endOf(prev);
+        double gap = glm::length(s0 - e0);
+        if (gap > 0 && gap < 1e-3) s0 = e0;
+    }
     BRepBuilderAPI_MakeWire mw;
     for (const CurveSeg& c : segs) {
         TopoDS_Edge e = edgeFromSeg(c, planeN);
         mw.Add(c.back ? TopoDS::Edge(e.Reversed()) : e);
+        if (std::getenv("KESTRAL_FACE_DEBUG")) {
+            GProp_GProps ge;
+            BRepGProp::LinearProperties(e, ge);
+            std::fprintf(stderr, "  add seg kind %d len %g -> error %d\n", (int)c.kind, ge.Mass(), (int)mw.Error());
+        }
     }
     if (!mw.IsDone()) throw std::runtime_error("Could not build a closed profile loop");
     return mw.Wire();
@@ -239,6 +266,12 @@ TopoDS_Shape loft(const TopoDS_Wire& a, const TopoDS_Wire& b) {
 
 // Merges coplanar faces and collinear edges a boolean leaves behind (seams where a press pull
 // or join meets the old body). Never fails: on any problem the input comes back unchanged.
+// Steps made from fix1066 on merge on a copy even when the solid is broken: merging in place changed
+// edges the inputs share, so another step built later from the same inputs (an undone first try,
+// then the real one) got different geometry than a rebuild from the file does. Older steps keep
+// the old way so their saved results rebuild as they were.
+std::atomic<bool> g_copyBeforeUnify{false};
+
 TopoDS_Shape unify(const TopoDS_Shape& s) {
     try {
         // Merging faces can break a solid that was fine: two halves of a hole wall (the hole through
@@ -247,7 +280,7 @@ TopoDS_Shape unify(const TopoDS_Shape& s) {
         // copy (it changes shared edges in place), and the unmerged solid is kept when the merged
         // one is broken.
         bool wasValid = BRepCheck_Analyzer(s).IsValid() != 0;
-        TopoDS_Shape work = wasValid ? BRepBuilderAPI_Copy(s, Standard_True, Standard_False).Shape() : s;
+        TopoDS_Shape work = (wasValid || g_copyBeforeUnify.load()) ? BRepBuilderAPI_Copy(s, Standard_True, Standard_False).Shape() : s;
         ShapeUpgrade_UnifySameDomain u(work, Standard_True, Standard_True, Standard_True);
         u.Build();
         TopoDS_Shape r = u.Shape();
@@ -335,6 +368,15 @@ ShapePtr buildFace(const RegionLoops& loops) {
         ShapeFix_Face fix(f);
         fix.FixOrientation();
         TopoDS_Face out = fix.Face();
+        if (std::getenv("KESTRAL_FACE_DEBUG")) {
+            GProp_GProps g0, g1;
+            BRepGProp::SurfaceProperties(f, g0);
+            BRepGProp::SurfaceProperties(out, g1);
+            std::fprintf(stderr, "buildFace: raw area %g, fixed area %g, loops %zu, segs %zu, n (%g,%g,%g)\n", g0.Mass(), g1.Mass(), loops.size(), loops[0].size(), n.x, n.y, n.z);
+            for (TopExp_Explorer ex(out, TopAbs_EDGE); ex.More(); ex.Next()) { GProp_GProps ge; BRepGProp::LinearProperties(ex.Current(), ge); std::fprintf(stderr, "  edge len %g\n", ge.Mass()); }
+            for (auto& c : loops[0])
+                std::fprintf(stderr, "  seg kind %d back %d a(%g,%g,%g) b(%g,%g,%g) c(%g,%g,%g)\n", (int)c.kind, (int)c.back, c.a.x, c.a.y, c.a.z, c.b.x, c.b.y, c.b.z, c.center.x, c.center.y, c.center.z);
+        }
         if (out.IsNull()) throw std::runtime_error("Could not build the profile face");
         auto h = std::make_shared<ShapeHandle>();
         h->shape = out;
@@ -1026,9 +1068,11 @@ void edgePolylines(const ShapePtr& shape, uint32_t maxEdges, std::vector<std::ve
                     pts = {{a.X(), a.Y(), a.Z()}, {b.X(), b.Y(), b.Z()}};
                     continue;
                 }
-                GCPnts_QuasiUniformDeflection disc(c, defl);
-                if (disc.IsDone() && disc.NbPoints() >= 2) {
-                    int np = disc.NbPoints(), stepN = std::max(1, np / 200);   // cap points per edge
+                // The angle limit keeps small circles round when zoomed in on a big design (the
+                // size-based deflection alone made a small hole a triangle).
+                GCPnts_TangentialDeflection disc(c, 0.1, defl, 2);
+                if (disc.NbPoints() >= 2) {
+                    int np = disc.NbPoints(), stepN = std::max(1, np / 400);   // cap points per edge
                     for (int k = 1; k <= np; k += stepN) { gp_Pnt p = disc.Value(k); pts.push_back({p.X(), p.Y(), p.Z()}); }
                     if ((np - 1) % stepN != 0) { gp_Pnt p = disc.Value(np); pts.push_back({p.X(), p.Y(), p.Z()}); }
                 } else {
@@ -1052,8 +1096,8 @@ bool edgePolyline(const ShapePtr& shape, uint32_t edgeIndex, std::vector<glm::dv
         BRepAdaptor_Curve c(e);
         double first = c.FirstParameter(), last = c.LastParameter();
         if (!(last > first)) return false;
-        GCPnts_QuasiUniformDeflection disc(c, 0.05);
-        if (disc.IsDone() && disc.NbPoints() >= 2) {
+        GCPnts_TangentialDeflection disc(c, 0.1, 0.05, 2);
+        if (disc.NbPoints() >= 2) {
             out.clear();
             out.reserve((size_t)disc.NbPoints());
             for (int i = 1; i <= disc.NbPoints(); ++i) {
@@ -1624,6 +1668,214 @@ bool planarNormal(const TopoDS_Face& f, gp_Dir& n, gp_Pnt& p) {
 
 } // namespace
 
+namespace {
+// Same round surface: one cylinder, cone, sphere or torus (a hole wall is often two half faces).
+bool sameRoundSurface(const TopoDS_Face& a, const TopoDS_Face& b) {
+    BRepAdaptor_Surface sa(a, Standard_False), sb(b, Standard_False);
+    if (sa.GetType() != sb.GetType()) return false;
+    const double tol = 1e-6;
+    auto sameAxis = [&](const gp_Ax1& p, const gp_Ax1& q) {
+        if (!p.Direction().IsParallel(q.Direction(), 1e-6)) return false;
+        gp_Vec d(p.Location(), q.Location());
+        return d.Crossed(gp_Vec(p.Direction())).Magnitude() < 1e-5;
+    };
+    switch (sa.GetType()) {
+    case GeomAbs_Cylinder:
+        return std::abs(sa.Cylinder().Radius() - sb.Cylinder().Radius()) < tol && sameAxis(sa.Cylinder().Axis(), sb.Cylinder().Axis());
+    case GeomAbs_Cone:
+        return std::abs(sa.Cone().SemiAngle() - sb.Cone().SemiAngle()) < 1e-9 && sa.Cone().Apex().Distance(sb.Cone().Apex()) < 1e-5 &&
+               sameAxis(sa.Cone().Axis(), sb.Cone().Axis());
+    case GeomAbs_Sphere:
+        return std::abs(sa.Sphere().Radius() - sb.Sphere().Radius()) < tol && sa.Sphere().Location().Distance(sb.Sphere().Location()) < 1e-5;
+    case GeomAbs_Torus:
+        return std::abs(sa.Torus().MajorRadius() - sb.Torus().MajorRadius()) < tol &&
+               std::abs(sa.Torus().MinorRadius() - sb.Torus().MinorRadius()) < tol && sameAxis(sa.Torus().Axis(), sb.Torus().Axis());
+    default:
+        return false;
+    }
+}
+
+// The picked faces grown to the whole feature they belong to: the rest of the same round wall, then
+// every face the set closes in (each of its edges touches the set), like a blind hole's bottom.
+std::vector<int> growToFeature(const TopoDS_Shape& shape, const TopTools_IndexedMapOfShape& fmap, const std::vector<uint32_t>& faces) {
+    TopTools_IndexedDataMapOfShapeListOfShape e2f;
+    TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, e2f);
+    std::set<int> in;
+    for (uint32_t fi : faces) in.insert((int)fi + 1);
+    auto neighbours = [&](int fi, auto&& fn) {
+        for (TopExp_Explorer ex(fmap(fi), TopAbs_EDGE); ex.More(); ex.Next()) {
+            int ei = e2f.FindIndex(ex.Current());
+            if (ei == 0) continue;
+            for (TopTools_ListIteratorOfListOfShape it(e2f(ei)); it.More(); it.Next()) {
+                int nj = fmap.FindIndex(it.Value());
+                if (nj > 0 && nj != fi) fn(nj);
+            }
+        }
+    };
+    for (bool grew = true; grew;) {
+        grew = false;
+        std::vector<int> cur(in.begin(), in.end());
+        for (int fi : cur)
+            neighbours(fi, [&](int nj) {
+                if (!in.count(nj) && sameRoundSurface(TopoDS::Face(fmap(fi)), TopoDS::Face(fmap(nj)))) { in.insert(nj); grew = true; }
+            });
+    }
+    for (bool grew = true; grew;) {
+        grew = false;
+        for (int fj = 1; fj <= fmap.Extent(); ++fj) {
+            if (in.count(fj)) continue;
+            bool closed = true, touches = false;
+            for (TopExp_Explorer ex(fmap(fj), TopAbs_EDGE); ex.More() && closed; ex.Next()) {
+                const TopoDS_Edge& e = TopoDS::Edge(ex.Current());
+                if (BRep_Tool::Degenerated(e)) continue;
+                int ei = e2f.FindIndex(e);
+                bool shared = false, self = true;
+                if (ei)
+                    for (TopTools_ListIteratorOfListOfShape it(e2f(ei)); it.More(); it.Next()) {
+                        int nj = fmap.FindIndex(it.Value());
+                        if (nj != fj) self = false;
+                        if (in.count(nj)) shared = true;
+                    }
+                if (self) continue;   // a seam: the face meets only itself there
+                if (shared) touches = true;
+                else closed = false;
+            }
+            if (closed && touches) { in.insert(fj); grew = true; }
+        }
+    }
+    std::vector<int> out;
+    for (int fi : in) out.push_back(fi);
+    return out;
+}
+
+// The solid with those faces gone and the gap healed, or a null shape.
+TopoDS_Shape tryDefeature(const TopoDS_Shape& shape, const TopTools_IndexedMapOfShape& fmap, const std::vector<int>& faces) {
+    BRepAlgoAPI_Defeaturing df;
+    df.SetShape(shape);
+    for (int fi : faces) df.AddFaceToRemove(fmap(fi));
+    df.SetRunParallel(false);
+    df.SetToFillHistory(false);
+    df.Build();
+    if (!df.IsDone() || df.HasErrors() || df.Shape().IsNull() || countSolids(df.Shape()) == 0) return {};
+    // Nothing actually removed means the gap could not be healed.
+    TopTools_IndexedMapOfShape rmap;
+    TopExp::MapShapes(df.Shape(), TopAbs_FACE, rmap);
+    if (rmap.Extent() >= fmap.Extent()) return {};
+    return df.Shape();
+}
+} // namespace
+
+namespace {
+// A flat face whose neighbours are all flat (a chamfer, a bevel, a sloped cut): the gap it leaves is
+// the space inside every neighbour's plane and past the face, so that wedge is built from half
+// spaces and joined on. This closes the cases where growing the neighbours fails.
+TopoDS_Shape fillFlatFace(const TopoDS_Shape& body, const TopTools_IndexedMapOfShape& fmap, int fi, std::string* why = nullptr) {
+    gp_Dir nF;
+    gp_Pnt pF;
+    const TopoDS_Face& F = TopoDS::Face(fmap(fi));
+    if (!planarNormal(F, nF, pF)) { if (std::getenv("KESTRAL_FACE_DEBUG")) std::fprintf(stderr, "fill: gave up at line %d\n", __LINE__); return {}; }
+    TopTools_IndexedDataMapOfShapeListOfShape e2f;
+    TopExp::MapShapesAndAncestors(body, TopAbs_EDGE, TopAbs_FACE, e2f);
+    std::vector<std::pair<gp_Dir, gp_Pnt>> planes;
+    std::set<int> seen;
+    for (TopExp_Explorer ex(F, TopAbs_EDGE); ex.More(); ex.Next()) {
+        int ei = e2f.FindIndex(ex.Current());
+        if (!ei) continue;
+        for (TopTools_ListIteratorOfListOfShape it(e2f(ei)); it.More(); it.Next()) {
+            int nj = fmap.FindIndex(it.Value());
+            if (nj <= 0 || nj == fi || seen.count(nj)) continue;
+            seen.insert(nj);
+            gp_Dir n;
+            gp_Pnt p;
+            if (!planarNormal(TopoDS::Face(fmap(nj)), n, p)) { if (std::getenv("KESTRAL_FACE_DEBUG")) std::fprintf(stderr, "fill: gave up at line %d\n", __LINE__); return {}; }
+            if (n.IsParallel(nF, 1e-6)) continue;   // a neighbour in the same plane adds no bound
+            planes.push_back({n, p});
+        }
+    }
+    if (planes.size() < 2) { if (std::getenv("KESTRAL_FACE_DEBUG")) std::fprintf(stderr, "fill: gave up at line %d\n", __LINE__); return {}; }
+    Bnd_Box bb;
+    BRepBndLib::Add(body, bb);
+    if (bb.IsVoid()) { if (std::getenv("KESTRAL_FACE_DEBUG")) std::fprintf(stderr, "fill: gave up at line %d\n", __LINE__); return {}; }
+    double x0, y0, z0, x1, y1, z1;
+    bb.Get(x0, y0, z0, x1, y1, z1);
+    double pad = std::sqrt(bb.SquareExtent()) * 0.5 + 1.0;
+    TopoDS_Shape wedge = BRepPrimAPI_MakeBox(gp_Pnt(x0 - pad, y0 - pad, z0 - pad), gp_Pnt(x1 + pad, y1 + pad, z1 + pad)).Shape();
+    auto keepSide = [&](const gp_Dir& n, const gp_Pnt& p, bool alongNormal) -> bool {
+        TopoDS_Face pf = BRepBuilderAPI_MakeFace(gp_Pln(p, n)).Face();
+        gp_Pnt ref = p.Translated(gp_Vec(n) * (alongNormal ? 1.0 : -1.0));
+        TopoDS_Shape hs = BRepPrimAPI_MakeHalfSpace(pf, ref).Solid();
+        BRepAlgoAPI_Common c(wedge, hs);
+        if (!c.IsDone() || c.HasErrors() || c.Shape().IsNull()) return false;
+        wedge = c.Shape();
+        return true;
+    };
+    if (!keepSide(nF, pF, true)) { if (std::getenv("KESTRAL_FACE_DEBUG")) std::fprintf(stderr, "fill: gave up at line %d\n", __LINE__); return {}; }
+    // Each neighbour bounds the gap on the side where the face itself lies: inside the part for an
+    // outside corner, outside it for an inside corner (a groove wall), so both kinds close.
+    GProp_GProps fg;
+    BRepGProp::SurfaceProperties(F, fg);
+    gp_Pnt fc = fg.CentreOfMass();
+    for (auto& [n, p] : planes)
+        if (!keepSide(n, p, gp_Vec(p, fc).Dot(gp_Vec(n)) > 0)) { if (std::getenv("KESTRAL_FACE_DEBUG")) std::fprintf(stderr, "fill: gave up at line %d\n", __LINE__); return {}; }
+    auto vol = [](const TopoDS_Shape& x) { GProp_GProps g; BRepGProp::VolumeProperties(x, g); return std::abs(g.Mass()); };
+    double vBody = vol(body), vWedge = vol(wedge);
+    if (std::getenv("KESTRAL_FACE_DEBUG")) {
+        std::fprintf(stderr, "fill: face %d, %zu planes, wedge %.3f, body %.3f\n", fi, planes.size(), vWedge, vBody);
+        for (auto& [n, p] : planes) std::fprintf(stderr, "  plane n %.3f %.3f %.3f p %.2f %.2f %.2f\n", n.X(), n.Y(), n.Z(), p.X(), p.Y(), p.Z());
+        std::fprintf(stderr, "  face n %.3f %.3f %.3f\n", nF.X(), nF.Y(), nF.Z());
+    }
+    // The neighbours must close the gap themselves: a fill that reaches the helper box is unbounded.
+    {
+        Bnd_Box wb;
+        BRepBndLib::Add(wedge, wb);
+        double tol = pad * 0.98;
+        double w0, w1, w2, w3, w4, w5;
+        if (wb.IsVoid()) return {};
+        wb.Get(w0, w1, w2, w3, w4, w5);
+        if (w0 < x0 - tol || w1 < y0 - tol || w2 < z0 - tol || w3 > x1 + tol || w4 > y1 + tol || w5 > z1 + tol) {
+            if (std::getenv("KESTRAL_FACE_DEBUG")) std::fprintf(stderr, "fill: wedge leaves the part\n");
+            if (why) *why = "That face is an outer side of the part: the faces around it never meet beyond it (they run side by side), so nothing can grow to close the gap. To move or remove that side, use Press Pull (Q) on it, or Extrude it as a Cut.";
+            return {};
+        }
+    }
+    if (!(vWedge > 1e-6) || vWedge > vBody * 0.5) { if (std::getenv("KESTRAL_FACE_DEBUG")) std::fprintf(stderr, "fill: gave up at line %d\n", __LINE__); return {}; }
+    BRepAlgoAPI_Fuse fu(body, wedge);
+    if (!fu.IsDone() || fu.HasErrors()) { if (std::getenv("KESTRAL_FACE_DEBUG")) std::fprintf(stderr, "fill: gave up at line %d\n", __LINE__); return {}; }
+    TopoDS_Shape r = fu.Shape();
+    if (countSolids(r) != 1 || !BRepCheck_Analyzer(r).IsValid()) { if (std::getenv("KESTRAL_FACE_DEBUG")) std::fprintf(stderr, "fill: gave up at line %d\n", __LINE__); return {}; }
+    TopTools_IndexedMapOfShape rmap;
+    TopExp::MapShapes(r, TopAbs_FACE, rmap);
+    TopoDS_Shape u = r;
+    try { u = unify(r); } catch (...) {}
+    TopTools_IndexedMapOfShape umap;
+    TopExp::MapShapes(u, TopAbs_FACE, umap);
+    if (umap.Extent() >= fmap.Extent() + 2) { if (std::getenv("KESTRAL_FACE_DEBUG")) std::fprintf(stderr, "fill: gave up at line %d\n", __LINE__); return {}; }   // it made a mess, not a clean fill
+    return u;
+}
+} // namespace
+
+void setCopyBeforeUnify(bool on) { g_copyBeforeUnify.store(on); }
+
+ShapePtr mergeFlushFaces(const ShapePtr& shape) {
+    // Parts placed with float matrices sit up to ~1e-5 mm off, so faces that are really flush
+    // (one part inside another) stayed two faces after a combine. Merged here with a small tolerance.
+    try {
+        TopoDS_Shape s = shape->shape;
+        TopoDS_Shape work = BRepBuilderAPI_Copy(s, Standard_True, Standard_False).Shape();
+        ShapeUpgrade_UnifySameDomain u(work, Standard_True, Standard_True, Standard_True);
+        u.SetLinearTolerance(1e-4);
+        u.SetAngularTolerance(1e-6);
+        u.Build();
+        TopoDS_Shape r = u.Shape();
+        if (r.IsNull() || countSolids(r) != countSolids(s) || !BRepCheck_Analyzer(r).IsValid()) return shape;
+        auto h = std::make_shared<ShapeHandle>();
+        h->shape = r;
+        return h;
+    } catch (...) {
+        return shape;
+    }
+}
+
 ShapePtr deleteFaces(const ShapePtr& shape, const std::vector<uint32_t>& faces) {
     if (faces.empty()) throw std::runtime_error("Select the faces to delete");
     try {
@@ -1632,23 +1884,55 @@ ShapePtr deleteFaces(const ShapePtr& shape, const std::vector<uint32_t>& faces) 
         for (uint32_t fi : faces)
             if ((int)fi >= fmap.Extent())
                 throw std::runtime_error("The body changed and the stored faces no longer match. Delete this step and pick the faces again.");
-        BRepAlgoAPI_Defeaturing df;
-        df.SetShape(shape->shape);
-        for (uint32_t fi : faces) df.AddFaceToRemove(fmap((int)fi + 1));
-        df.SetRunParallel(false);
-        df.SetToFillHistory(false);
-        df.Build();
-        bool ok = df.IsDone() && !df.HasErrors() && !df.Shape().IsNull() && countSolids(df.Shape()) > 0;
-        if (ok) {
-            // Nothing actually removed means the gap could not be healed.
-            TopTools_IndexedMapOfShape rmap;
-            TopExp::MapShapes(df.Shape(), TopAbs_FACE, rmap);
-            if (rmap.Extent() >= fmap.Extent()) ok = false;
+        std::string why;   // a specific reason, when the fill knows one
+        std::vector<int> picked;
+        for (uint32_t fi : faces) picked.push_back((int)fi + 1);
+        TopoDS_Shape res = tryDefeature(shape->shape, fmap, picked);
+        if (res.IsNull()) {
+            // Fusion heals a hole from one click on its wall: take the rest of the hole along.
+            std::vector<int> grown = growToFeature(shape->shape, fmap, faces);
+            if (grown.size() > picked.size()) res = tryDefeature(shape->shape, fmap, grown);
         }
-        if (!ok)
-            throw std::runtime_error("Those faces cannot be deleted: the faces around them cannot grow to close the gap. Try deleting the whole feature (all its faces) at once.");
+        if (res.IsNull()) {
+            // Flat faces between flat neighbours: fill the wedge they leave, one face at a time.
+            TopoDS_Shape cur = shape->shape;
+            bool all = true;
+            std::vector<uint32_t> order(faces.begin(), faces.end());
+            // Face numbers shift as faces go: fill from the original shape's planes, by position.
+            std::vector<std::pair<gp_Dir, gp_Pnt>> want;
+            for (uint32_t f : order) {
+                gp_Dir n; gp_Pnt p;
+                if (!planarNormal(TopoDS::Face(fmap((int)f + 1)), n, p)) { all = false; break; }
+                gp_Pnt c = p;
+                GProp_GProps g;
+                BRepGProp::SurfaceProperties(fmap((int)f + 1), g);
+                c = g.CentreOfMass();
+                want.push_back({n, c});
+            }
+            if (std::getenv("KESTRAL_FACE_DEBUG")) std::fprintf(stderr, "delete: fallback for %zu faces, planar %d\n", faces.size(), (int)all);
+            for (size_t k = 0; all && k < want.size(); ++k) {
+                TopTools_IndexedMapOfShape cm;
+                TopExp::MapShapes(cur, TopAbs_FACE, cm);
+                int hit = 0;
+                for (int j = 1; j <= cm.Extent() && !hit; ++j) {
+                    gp_Dir n; gp_Pnt p;
+                    if (!planarNormal(TopoDS::Face(cm(j)), n, p) || !n.IsParallel(want[k].first, 1e-6) || n.Dot(want[k].first) < 0) continue;
+                    GProp_GProps g;
+                    BRepGProp::SurfaceProperties(cm(j), g);
+                    if (g.CentreOfMass().Distance(want[k].second) < 1e-4) hit = j;
+                }
+                if (!hit) { if (std::getenv("KESTRAL_FACE_DEBUG")) std::fprintf(stderr, "delete: face not found again\n"); all = false; break; }
+                TopoDS_Shape r = fillFlatFace(cur, cm, hit, &why);
+                if (r.IsNull()) { all = false; break; }
+                cur = r;
+            }
+            if (all) res = cur;
+        }
+        if (res.IsNull() && !why.empty()) throw std::runtime_error(why);
+        if (res.IsNull())
+            throw std::runtime_error("Those faces cannot be deleted: the faces around them cannot grow to close the gap. A face whose neighbours meet only beyond the part (or a curved one in a complex spot) has nothing to grow into. Try deleting the whole feature at once, or Press Pull it instead.");
         auto h = std::make_shared<ShapeHandle>();
-        h->shape = unify(df.Shape());
+        h->shape = unify(res);
         return h;
     } catch (const Standard_Failure& e) {
         rethrowOcct(e, "delete face");
@@ -1951,6 +2235,33 @@ bool faceInfo(const ShapePtr& shape, uint32_t face, glm::dvec3& center, glm::dve
             if (f.Orientation() == TopAbs_REVERSED) n.Reverse();
         }
         normal = {n.X(), n.Y(), n.Z()};
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool faceRoundAxis(const ShapePtr& shape, uint32_t face, glm::dvec3& origin, glm::dvec3& dir) {
+    try {
+        TopTools_IndexedMapOfShape fmap;
+        TopExp::MapShapes(shape->shape, TopAbs_FACE, fmap);
+        if ((int)face >= fmap.Extent()) return false;
+        const TopoDS_Face& f = TopoDS::Face(fmap((int)face + 1));
+        BRepAdaptor_Surface s(f, Standard_False);
+        gp_Ax1 ax;
+        switch (s.GetType()) {
+        case GeomAbs_Cylinder: ax = s.Cylinder().Axis(); break;
+        case GeomAbs_Cone: ax = s.Cone().Axis(); break;
+        case GeomAbs_Torus: ax = s.Torus().Axis(); break;
+        default: return false;
+        }
+        // The surface origin can sit anywhere on the axis. The face's middle is the snap.
+        GProp_GProps g;
+        BRepGProp::SurfaceProperties(f, g);
+        gp_Vec along(ax.Direction());
+        gp_Pnt o = ax.Location().Translated(along * gp_Vec(ax.Location(), g.CentreOfMass()).Dot(along));
+        origin = {o.X(), o.Y(), o.Z()};
+        dir = {ax.Direction().X(), ax.Direction().Y(), ax.Direction().Z()};
         return true;
     } catch (...) {
         return false;
@@ -3401,6 +3712,12 @@ std::vector<ShapePtr> solidsOf(const ShapePtr& shape) {
         out.push_back(h);
     }
     return out;
+}
+
+uint64_t featuresBuildStamp() {
+    uint64_t h = 1469598103934665603ull;
+    for (const char* c = __DATE__ " " __TIME__; *c; ++c) h = (h ^ (uint8_t)*c) * 1099511628211ull;
+    return h;
 }
 
 } // namespace kst::kernel

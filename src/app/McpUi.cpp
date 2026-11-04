@@ -918,7 +918,7 @@ App::McpCall App::mcpRunUiTool(const std::string& client, const std::string& nam
 
     if (name == "wait_for") {
         std::string until = lowerS(a["until"].asString());
-        double limit = std::clamp(a["timeout_s"].asNumber(120), 1.0, 3600.0);
+        double limit = std::clamp(a["timeout_s"].asNumber(50), 1.0, 3600.0);   // some MCP apps drop a call after a minute
         auto t0 = std::chrono::steady_clock::now();
         auto elapsed = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
         auto idleNow = [this] {

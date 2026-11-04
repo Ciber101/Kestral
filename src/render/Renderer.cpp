@@ -12,7 +12,7 @@ namespace kst {
 
 namespace {
 
-enum PipeKind { kMesh = 0, kId = 1, kLine = 2, kBg = 3, kGrid = 4, kGlassBack = 5, kGlassFront = 6 };
+enum PipeKind { kMesh = 0, kId = 1, kLine = 2, kBg = 3, kGrid = 4, kGlassBack = 5, kGlassFront = 6, kXray = 7 };
 
 struct MeshPC {
     glm::mat4 viewProj;
@@ -184,7 +184,7 @@ VkPipeline Renderer::makePipeline(const uint32_t* vs, size_t vsSize, const uint3
         attrs.push_back({7, 1, VK_FORMAT_R32G32B32A32_UINT, 80});
         if (kind != kLine) attrs.push_back({8, 1, VK_FORMAT_R32G32B32A32_UINT, 96});
     };
-    const bool glass = kind == kGlassBack || kind == kGlassFront;
+    const bool glass = kind == kGlassBack || kind == kGlassFront || kind == kXray;
     if (kind == kMesh || kind == kId || glass) {
         bindings.push_back({0, 24, VK_VERTEX_INPUT_RATE_VERTEX});
         attrs.push_back({0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0});
@@ -230,6 +230,7 @@ VkPipeline Renderer::makePipeline(const uint32_t* vs, size_t vsSize, const uint3
     ds.depthTestEnable = kind == kBg ? VK_FALSE : VK_TRUE;
     ds.depthWriteEnable = depthWrite ? VK_TRUE : VK_FALSE;
     ds.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;   // reverse Z
+    if (kind == kXray) ds.depthCompareOp = VK_COMPARE_OP_LESS;   // only where something in front hides it
 
     VkPipelineColorBlendAttachmentState cb{};
     cb.colorWriteMask = kind == kId ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT)
@@ -347,7 +348,8 @@ bool Renderer::createPipelines(std::string& err) {
     gridPipe_ = makePipeline(spv::grid_vert, sizeof spv::grid_vert, spv::grid_frag, sizeof spv::grid_frag, gridLayout_, kGrid, msaa, cf, false);
     glassBackPipe_ = makePipeline(spv::mesh_vert, sizeof spv::mesh_vert, spv::mesh_frag, sizeof spv::mesh_frag, meshLayout_, kGlassBack, msaa, cf, false);
     glassFrontPipe_ = makePipeline(spv::mesh_vert, sizeof spv::mesh_vert, spv::mesh_frag, sizeof spv::mesh_frag, meshLayout_, kGlassFront, msaa, cf, false);
-    if (!meshPipe_ || !idPipe_ || !linePipe_ || !bgPipe_ || !gridPipe_ || !glassBackPipe_ || !glassFrontPipe_) {
+    xrayPipe_ = makePipeline(spv::mesh_vert, sizeof spv::mesh_vert, spv::mesh_frag, sizeof spv::mesh_frag, meshLayout_, kXray, msaa, cf, false);
+    if (!xrayPipe_ ||!meshPipe_ || !idPipe_ || !linePipe_ || !bgPipe_ || !gridPipe_ || !glassBackPipe_ || !glassFrontPipe_) {
         err = "Could not create GPU pipelines";
         return false;
     }
@@ -453,7 +455,7 @@ void Renderer::shutdown() {
     destroyBuffer(edgeVbo_);
     uploaded_.clear();
     destroyAttachments();
-    for (VkPipeline p : {meshPipe_, idPipe_, linePipe_, bgPipe_, gridPipe_, glassBackPipe_, glassFrontPipe_})
+    for (VkPipeline p : {meshPipe_, idPipe_, linePipe_, bgPipe_, gridPipe_, glassBackPipe_, glassFrontPipe_, xrayPipe_})
         if (p) vkDestroyPipeline(dev, p, nullptr);
     for (VkPipelineLayout l : {meshLayout_, bgLayout_, gridLayout_})
         if (l) vkDestroyPipelineLayout(dev, l, nullptr);
@@ -535,6 +537,10 @@ void Renderer::bindStorage(Frame& f, uint32_t binding, const GpuBuffer& b) {
 void Renderer::setScene(const std::vector<SceneBatch>& batches, const std::vector<uint32_t>& selFaces,
                         const std::vector<MaterialGpu>& mats, const std::vector<uint32_t>& faceMats) {
     selFaces_ = selFaces;
+    anyHighlight_ = !selFaces.empty();
+    for (auto& b : batches)
+        for (auto& in : b.instances)
+            if (in.flags & (kInstSelected | kInstHover)) anyHighlight_ = true;
     if (selFaces_.empty()) selFaces_.push_back(0xffffffffu);
     mats_ = mats;
     if (mats_.empty()) mats_.push_back(MaterialGpu{});
@@ -869,6 +875,16 @@ bool Renderer::drawFrame(const FrameParams& fp, ImDrawData* ui) {
                 vkCmdDrawIndexed(cmd, t.indexCount, 1, t.firstIndex, t.vertexOffset, t.instance);
                 stats.drawCalls += 2;
             }
+        }
+        // Hovered / selected parts show through whatever hides them (x-ray tint), so a pin that
+        // runs through a plate highlights end to end.
+        if (!meshCmds_.empty() && (fp.hoverBody != 0 || anyHighlight_)) {
+            MeshPC xp = pc;
+            xp.params.x = 2.f;
+            bindMeshState(xrayPipe_);
+            vkCmdPushConstants(cmd, meshLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof xp, &xp);
+            drawMeshes();
+            stats.drawCalls += ctx_->multiDrawIndirect ? 1 : (uint32_t)meshCmds_.size();
         }
         (void)zero;
         vkCmdEndRendering(cmd);

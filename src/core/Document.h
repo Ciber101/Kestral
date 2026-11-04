@@ -1,7 +1,9 @@
 #pragma once
+#include "core/Electronics.h"
 #include "core/Params.h"
 #include "core/Types.h"
 #include "sketch/Sketch.h"
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <unordered_map>
@@ -94,6 +96,9 @@ struct ExtrudeParams {
     FaceRef to;                     // extent 1: the flat face the extrude stops on
     std::string thinExpr;           // blank is a solid. A wall of this thickness from an open curve.
     int thinSide = 0;               // 0 centered, 1 all on the left, 2 all on the right
+    // Profiles picked in other sketches too (four hole sketches extruded at once): each sketch with
+    // a point inside each of its picked profiles. They extrude along their own sketch's normal.
+    std::vector<std::pair<uint32_t, std::vector<sk::Vec2>>> moreSketches;
 };
 
 struct RevolveParams {
@@ -296,6 +301,8 @@ struct AlignParams {
     };
     Pick from, to;
     bool flip = false;
+    std::string angleExpr;          // turn about the destination's axis after landing, degrees
+    std::string offsetExpr;         // gap along the destination's direction, mm
     std::vector<TargetRef> targets;
     std::string fromName, toName;
 };
@@ -342,6 +349,7 @@ struct MoveParams {
     std::string pxExpr, pyExpr, pzExpr;
     std::string sxExpr = "1", syExpr = "1", szExpr = "1";
     int op = 0;                        // 0 move, 1 scale (sx/sy/sz)
+    bool together = false;             // no pivot given: turn every body about the center of all of them
     bool hasMat = false;               // mat replaces the placement (row major, 16 numbers)
     double mat[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
 };
@@ -465,8 +473,16 @@ struct BladeParams {
     }
 };
 
+// How a step rebuilds can only change for steps made after the change: a saved step keeps the
+// rules it was made with, so opening a design in a newer Kestral never moves anything.
+//   0: before fix1064.  1: hidden parts are never cut, even as chosen targets (fix1064).
+//   2: face merging works on a copy, never on the inputs (fix1066).
+constexpr int kRulesNow = 2;
+
 struct Feature {
     uint32_t id = 0;
+    int rules = kRulesNow;          // rebuild rules this step was made with (see kRulesNow)
+    uint64_t savedChain = 0;        // the step's inputs when the design was saved: its saved shapes are stored under it
     FeatureType type = FeatureType::Other;
     std::string name;
     bool suppressed = false;
@@ -569,7 +585,14 @@ public:
 
     std::string name = "Untitled";
     std::string path;
+    // Tells designs apart while they have no file (two "Untitled" tabs). Copies (undo) keep it.
+    uint64_t uid = nextUid();
+    static uint64_t nextUid() { static std::atomic<uint64_t> n{1}; return n++; }
     int version = 0;                 // goes up on every Ctrl+S (v1, v2...); older ones in the versions folder
+    // Just read from a file and not built yet: the first build shows the saved shapes of each step,
+    // even when something outside (an imported file, Kestral itself) would now build it differently.
+    bool fromFile = false;
+    bool skipSavedShapes = false;    // "Rebuild from steps": the next build ignores saved shapes
     uint32_t rootId = 0;
 
     std::map<uint32_t, Part> parts;
@@ -591,6 +614,7 @@ public:
     std::map<uint32_t, glm::dvec3> constructPoints;
     SectionView section;
     RobotDef robot;
+    ElecDoc elec;               // parts, wires (Electronics)
 
     uint32_t newId() { return nextId_++; }
     void remapNextId(uint32_t maxUsedId) { nextId_ = std::max(nextId_, maxUsedId + 1); }
