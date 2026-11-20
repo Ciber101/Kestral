@@ -178,7 +178,7 @@ void App::drawSlicePanel() {
         sl::drawOIcon(dl, ImVec2(c0.x + 24 * S, c0.y + cardH * 0.5f), 30 * S, OIcon::Printer, col::Text);
         ImGui::SetCursorScreenPos(ImVec2(c0.x + 44 * S, c0.y + (cardH - ImGui::GetFrameHeight()) * 0.5f));
         if (slicePresetCombo("##printer", slice_.machine, slice_.printers, "Select a printer", mainW - 50 * S, true)) {
-            slice_.overrides.clear();
+            sliceDropMachineChanges();
             sliceLoadSettings();
         }
         ImGui::SetItemTooltip("%s", slice_.machine.c_str());
@@ -217,7 +217,7 @@ void App::drawSlicePanel() {
                     for (auto* p : list)
                         if (sl::menuRow(p->name.c_str(), p->name == slice_.machine, p->user ? "yours" : "built in")) {
                             slice_.machine = p->name;
-                            slice_.overrides.clear();
+                            sliceDropMachineChanges();
                             sliceLoadSettings();
                         }
                 }
@@ -408,7 +408,7 @@ void App::drawSlicePanel() {
                 if (hv) ImGui::SetTooltip("%s", tip);
                 return c;
             };
-            if (smallIcon("##psave", OIcon::Save, "Save these settings as your own process profile (Orca's Save preset)", false)) slice_.savePresetOpen = true;
+            if (smallIcon("##psave", OIcon::Save, "Save these settings as your own process profile (Orca's Save preset)", false)) sliceOpenSaveDialog("process");
             if (smallIcon("##pcmp", OIcon::Compare, "What is changed from the profile", slice_.compareOpen)) slice_.compareOpen = !slice_.compareOpen;
             if (smallIcon("##psearch", OIcon::Search, "Search the settings", slice_.searchOpen)) slice_.searchOpen = !slice_.searchOpen;
         }
@@ -476,6 +476,24 @@ void App::drawSlicePanel() {
         indent();
         ImGui::TextColored(sl::changed(), "%d changed from the profiles", (int)slice_.overrides.size());
         ImGui::SameLine();
+        if (ImGui::SmallButton("Save##allch")) {
+            std::vector<std::string> types;
+            for (const char* t : {"process", "filament", "machine"})
+                if (sliceUnsavedCount(t)) types.push_back(t);
+            if (types.size() == 1) sliceSaveCurrent(types[0]);
+            else ImGui::OpenPopup("##savewhich");
+        }
+        ImGui::SetItemTooltip("Save the changes into your profiles so they stay");
+        if (ImGui::BeginPopup("##savewhich")) {
+            for (const char* t : {"process", "filament", "machine"}) {
+                int n = sliceUnsavedCount(t);
+                if (!n) continue;
+                std::string lab = std::string(t[0] == 'p' ? "Process" : t[0] == 'f' ? "Filament" : "Printer") + " (" + std::to_string(n) + ")";
+                if (ImGui::MenuItem(lab.c_str())) sliceSaveCurrent(t);
+            }
+            ImGui::EndPopup();
+        }
+        ImGui::SameLine();
         if (ImGui::SmallButton("Reset all")) slice_.overrides.clear();
     }
     ImGui::PushTextWrapPos(w - 12 * S);
@@ -489,7 +507,6 @@ void App::drawSlicePanel() {
     ImGui::End();
     ImGui::PopStyleVar(2);
     ImGui::PopStyleColor();
-    drawSavePresetDialog();
 }
 
 // ===================================================================== Objects (Process > Objects)
@@ -815,22 +832,33 @@ void App::drawFlushDialog() {
 
 void App::drawSavePresetDialog() {
     const float S = uiScale_;
+    const std::string& type = slice_.savePresetType;
+    const char* what = type == "filament" ? "filament" : type == "machine" ? "printer" : "process";
     if (slice_.savePresetOpen) {
-        ImGui::OpenPopup("Save process preset");
+        ImGui::OpenPopup("Save preset###savepreset");
         slice_.savePresetOpen = false;
-        slice_.savePresetName = slice_.process + " (Kestral)";
+        const std::string& cur = sliceCurrentPreset(type);
+        const print::Preset* p = slice_.setup ? print::findPreset(*slice_.setup, type, cur) : nullptr;
+        slice_.savePresetName = p && p->user ? cur : cur + " (Kestral)";
     }
-    if (!ImGui::BeginPopupModal("Save process preset", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) return;
-    ImGui::TextUnformatted("Your own process profile: the current one with the changes you made.");
+    if (!ImGui::BeginPopupModal("Save preset###savepreset", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) return;
+    ImGui::Text("Save the %s profile with the changes you made (%d).", what, sliceUnsavedCount(type));
     ImGui::TextDisabled("It lands in OrcaSlicer's user presets, so OrcaSlicer sees it too.");
     ImGui::SetNextItemWidth(380 * S);
     if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
-    ImGui::InputText("Name", &slice_.savePresetName);
-    if (sl::orangeButton("Save", ImVec2(110 * S, 0))) {
-        std::string err = sliceSaveProcessPreset(slice_.savePresetName);
-        if (err.empty()) { toast("Saved " + slice_.savePresetName, ToastKind::Success); ImGui::CloseCurrentPopup(); }
+    bool enter = ImGui::InputText("Name", &slice_.savePresetName, ImGuiInputTextFlags_EnterReturnsTrue);
+    const print::Preset* same = slice_.setup ? print::findPreset(*slice_.setup, type, slice_.savePresetName) : nullptr;
+    bool builtIn = same && !same->user;
+    if (builtIn) ImGui::TextColored(ImVec4(1.f, 0.45f, 0.35f, 1.f), "That is a built in profile's name. Pick another.");
+    else if (same) ImGui::TextColored(sl::changed(), "Replaces your profile of that name.");
+    ImGui::BeginDisabled(builtIn || slice_.savePresetName.empty());
+    if (sl::orangeButton("Save", ImVec2(110 * S, 0)) || (enter && !builtIn)) {
+        std::string nm = slice_.savePresetName;
+        std::string err = sliceSavePreset(type, nm);
+        if (err.empty()) { toast("Saved " + nm, ToastKind::Success); ImGui::CloseCurrentPopup(); }
         else toast(err, ToastKind::Error);
     }
+    ImGui::EndDisabled();
     ImGui::SameLine();
     if (ImGui::Button("Cancel", ImVec2(110 * S, 0)) || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
     ImGui::EndPopup();

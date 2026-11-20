@@ -20,6 +20,21 @@
 
 namespace kst {
 
+namespace {
+// Measured values: up to 4 decimals, no trailing zeros (20, 13.5, 0.0254).
+std::string fmtNum(double v) {
+    char b[48];
+    std::snprintf(b, sizeof b, "%.4f", v);
+    std::string t = b;
+    if (t.find('.') != std::string::npos) {
+        while (!t.empty() && t.back() == '0') t.pop_back();
+        if (!t.empty() && t.back() == '.') t.pop_back();
+    }
+    if (t == "-0") t = "0";
+    return t;
+}
+} // namespace
+
 using namespace ui;
 
 namespace {
@@ -80,6 +95,7 @@ void App::drawUI() {
         if (!slice_.choicesLoaded) sliceLoadChoices();
     }
     if (slicePrewarmed_ && !sliceWs_ && slice_.choicesLoaded) sliceLoadBed();
+    sliceRememberTick();
     drawCloseAsk();
     drawAppBar();
     if (sliceWs_) {
@@ -90,6 +106,7 @@ void App::drawUI() {
         drawSettings();
         drawFusionMove();
         drawAssistant();   // the assistant works here too
+        drawAiControl();
         keepWindowsOnScreen();
         return;
     }
@@ -97,9 +114,12 @@ void App::drawUI() {
     if (startOpen_) {
         updateThumbnails();
         drawStartPage();
+        drawDataPanel();
+        drawRecoveryPrompt();   // unsaved work from last time shows on the start page too
         drawToasts();
         drawSettings();
         drawFusionMove();
+        drawAiControl();
         keepWindowsOnScreen();
         return;
     }
@@ -123,6 +143,7 @@ void App::drawUI() {
     drawIllustration();
     drawAssistant();
     drawAppearance();
+    drawAiControl();
     drawSketchPalette();
     drawDimensionEditor();
     drawFeatureDialog();
@@ -232,6 +253,7 @@ void App::drawAppBar() {
     ImGui::SameLine(0, 2 * S);
     std::string rt = undo_.canRedo() ? "Redo " + undo_.redoLabel() + " (Ctrl+Y)" : "Redo (Ctrl+Y)";
     if (iconButton("##redo", Icon::Redo, bs, undo_.canRedo(), rt.c_str())) redo();
+    const float redoRight = ImGui::GetItemRectMax().x;
 
     // Design tabs (center), like Fusion's document tabs, then the slice tabs after them.
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -245,8 +267,58 @@ void App::drawAppBar() {
         widths.push_back(w);
         total += w + 3 * S;
     }
-    float tx = std::max(260 * S, (vp->Size.x - total - 30 * S - 150 * S * std::max<size_t>(1, sliceDocs_.size())) * 0.5f);
-    ImVec2 t0(vp->Pos.x + tx, vp->Pos.y + 4 * S), t1(t0.x + 10 * S, vp->Pos.y + h);
+    // Two strips: the design tabs (with their +) start just right of Redo, the slice tabs after a gap
+    // and a divider. Each strip scrolls sideways with the wheel when its tabs do not fit.
+    const bool haveOwnSlice = sliceTabFor(sliceDocKey()) >= 0;
+    auto sliceLabel = [&](int i) {
+        std::string l = i == (int)sliceDocs_.size() ? std::string(haveOwnSlice ? "+ Slice" : "Slice") : sliceDocs_[(size_t)i].name;
+        if (l.size() > 22) l = l.substr(0, 21) + "...";
+        return l;
+    };
+    float sliceTotal = 0;
+    std::vector<float> sliceWs;
+    for (int i = 0; i <= (int)sliceDocs_.size(); ++i) {
+        bool isNew = i == (int)sliceDocs_.size();
+        sliceWs.push_back(ImGui::CalcTextSize(sliceLabel(i).c_str()).x + (isNew ? 44 : 62) * S);
+        sliceTotal += sliceWs.back() + 3 * S;
+    }
+    const float stripL = redoRight + 24 * S;
+    const float darkX = vp->Pos.x + vp->Size.x - 56 * S - 34 * S;
+    const float searchW = std::clamp(vp->Size.x * 0.17f, 150 * S, 290 * S);
+    const float stripR = std::max(stripL, darkX - 34 * S - searchW - 14 * S);
+    const float gapW = 22 * S;
+    const float designTotal = total + (startOpen_ ? 0.f : 32 * S);
+    const float roomW = stripR - stripL;
+    const float designVis = std::max(0.f, std::min(designTotal, std::max(roomW * 0.5f, roomW - sliceTotal - gapW)));
+    const float sliceX0 = stripL + designVis + gapW;
+    const float sliceVis = std::max(0.f, std::min(sliceTotal, stripR - sliceX0));
+    ImGuiIO& tio = ImGui::GetIO();
+    auto stripScroll = [&](float& scroll, float x0, float vis, float content, int active, int& shownFor,
+                           const std::vector<float>& ws) {
+        // Keep the tab in front in view when it changes.
+        if (active != shownFor && active >= 0 && active < (int)ws.size()) {
+            float a = 0;
+            for (int k = 0; k < active; ++k) a += ws[(size_t)k] + 3 * S;
+            float b = a + ws[(size_t)active];
+            if (a < scroll) scroll = a;
+            if (b > scroll + vis) scroll = b - vis;
+            shownFor = active;
+        }
+        ImVec2 m = tio.MousePos;
+        float wheel = tio.MouseWheel + tio.MouseWheelH;
+        if (wheel != 0.f && m.x >= x0 && m.x <= x0 + vis && m.y >= vp->Pos.y && m.y <= vp->Pos.y + h) scroll -= wheel * 60 * S;
+        scroll = std::clamp(scroll, 0.f, std::max(0.f, content - vis));
+    };
+    auto stripFades = [&](float x0, float vis, float scroll, float content) {
+        // A soft edge where more tabs hide, so it reads as scrollable.
+        ImU32 solid = col::AppBar, clear = col::AppBar & 0x00FFFFFF;
+        float fw = 18 * S, y0 = vp->Pos.y, y1 = vp->Pos.y + h;
+        if (scroll > 0.5f) dl->AddRectFilledMultiColor(ImVec2(x0, y0), ImVec2(x0 + fw, y1), solid, clear, clear, solid);
+        if (scroll < content - vis - 0.5f) dl->AddRectFilledMultiColor(ImVec2(x0 + vis - fw, y0), ImVec2(x0 + vis, y1), clear, solid, solid, clear);
+    };
+    stripScroll(designTabScroll_, stripL, designVis, designTotal, startOpen_ ? 0 : designActive_, designScrollFor_, widths);
+    ImVec2 t0(stripL - designTabScroll_, vp->Pos.y + 4 * S), t1(t0.x + 10 * S, vp->Pos.y + h);
+    ImGui::PushClipRect(ImVec2(stripL, vp->Pos.y), ImVec2(stripL + designVis, vp->Pos.y + h), true);
     {
         float x = t0.x;
         int closeD = -1;
@@ -305,9 +377,14 @@ void App::drawAppBar() {
             dl->AddLine(ImVec2(c.x, c.y - 5 * S), ImVec2(c.x, c.y + 5 * S), ph ? col::Text : col::TextDim, 1.5f * S);
             x = p1.x + 6 * S;
         }
+        stripFades(stripL, designVis, designTabScroll_, designTotal);
+        ImGui::PopClipRect();
         if (closeD >= 0) {
-            bool dirtyT = closeD == designActive_ ? dirty_ : designTabs_[(size_t)closeD].dirty;
-            if (dirtyT) { closeAskTab_ = closeD; ImGui::OpenPopup("Close design?"); }
+            if (tabUnsaved(closeD)) {
+                writeAllRecoverySync();   // safe on disk while the question is up
+                closeAskTab_ = closeD;
+                ImGui::OpenPopup("Close design?");
+            }
             else closeDesignTab(closeD);
         }
         if (ImGui::BeginPopupModal("Close design?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -316,17 +393,18 @@ void App::drawAppBar() {
             ImGui::Text("%s has changes that are not saved.", nm.c_str());
             if (ImGui::Button("Save", ImVec2(110 * S, 0))) {
                 if (ct != designActive_) switchDesignTab(ct);
-                saveDocumentNow();
+                saveDocumentNow();   // Save As when it has no file yet; a cancelled or failed save keeps the tab
+                syncDirty();
                 if (!dirty_) closeDesignTab(designActive_);
                 ImGui::CloseCurrentPopup();
             }
             ImGui::SameLine();
             if (ImGui::Button("Don't save", ImVec2(110 * S, 0))) {
-                if (ct == designActive_) dirty_ = false;
-                else if (ct >= 0 && ct < (int)designTabs_.size()) designTabs_[(size_t)ct].dirty = false;
+                discardDesignChanges(ct);   // a copy goes to the discarded folder
                 closeDesignTab(ct);
                 ImGui::CloseCurrentPopup();
             }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Closes without the changes. A copy is kept in the autosave\\discarded folder.");
             ImGui::SameLine();
             if (ImGui::Button("Cancel", ImVec2(110 * S, 0)) || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
             ImGui::EndPopup();
@@ -349,17 +427,19 @@ void App::drawAppBar() {
         }
         // One Slice tab per design you slice (each with its own plate and result), then "Slice" for
         // the open design when it has none yet.
-        x = t1.x + 4 * S;
+        // The divider between the two strips.
+        dl->AddLine(ImVec2(sliceX0 - gapW * 0.5f, vp->Pos.y + 9 * S), ImVec2(sliceX0 - gapW * 0.5f, vp->Pos.y + h - 9 * S), col::PanelBorder, 1.f * S);
+        stripScroll(sliceTabScroll_, sliceX0, sliceVis, sliceTotal, sliceWs_ ? sliceActive_ : -1, sliceScrollFor_, sliceWs);
+        ImGui::PushClipRect(ImVec2(sliceX0, vp->Pos.y), ImVec2(sliceX0 + sliceVis, vp->Pos.y + h), true);
+        x = sliceX0 - sliceTabScroll_;
         int closeTab = -1, mergeFrom = -1, mergeInto = -1;
-        bool haveOwn = sliceTabFor(sliceDocKey()) >= 0;
+        bool haveOwn = haveOwnSlice;
         std::vector<std::pair<ImVec2, ImVec2>> tabRects;
         for (int i = 0; i <= (int)sliceDocs_.size(); ++i) {
             bool isNew = i == (int)sliceDocs_.size();
-            if (isNew && haveOwn) break;
-            std::string lbl = isNew ? std::string("Slice") : sliceDocs_[(size_t)i].name;
-            if (lbl.size() > 22) lbl = lbl.substr(0, 21) + "...";
+            std::string lbl = sliceLabel(i);
             ImVec2 ss = ImGui::CalcTextSize(lbl.c_str());
-            float sw = ss.x + (isNew ? 44 : 62) * S;
+            float sw = sliceWs[(size_t)i];
             ImVec2 s0(x, t0.y), s1(x + sw, t1.y);
             bool on = sliceWs_ && i == sliceActive_;
             ImGui::PushID(i + 7000);
@@ -382,7 +462,12 @@ void App::drawAppBar() {
                 ImGui::EndPopup();
             }
             tabRects.push_back({s0, s1});
-            if (sh) ImGui::SetTooltip(isNew ? "Slice this design (OrcaSlicer, inside Kestral)" : "%s", isNew ? "" : sliceDocs_[(size_t)i].key.c_str());
+            if (sh) {
+                if (!isNew) ImGui::SetTooltip("%s", sliceDocs_[(size_t)i].key.c_str());
+                else if (sliceWs_) ImGui::SetTooltip("Slice another part: back to the design, select its bodies, then press this again");
+                else ImGui::SetTooltip(haveOwn ? "Slice the selected bodies in a new tab (the same bodies go back to their own tab)"
+                                               : "Slice this design (the selected bodies, or all of it)");
+            }
             bool xh = false;
             if (!isNew) {
                 ImGui::SetCursorScreenPos(ImVec2(s1.x - 20 * S, s0.y));
@@ -392,8 +477,20 @@ void App::drawAppBar() {
             }
             ImGui::PopID();
             if (clicked) {
-                if (isNew) enterSliceWorkspace();
-                else enterSliceTab(i);
+                if (!isNew) {
+                    enterSliceTab(i);
+                } else if (sliceWs_) {
+                    // A new part comes from the design: go there to pick it.
+                    leaveSliceWorkspace();
+                    toast("Select the bodies to slice, then press + Slice", ToastKind::Info);
+                } else {
+                    bool any = false;
+                    for (uint32_t id : selection_) any = any || doc_.bodies.count(id);
+                    for (auto& f : selFaces_) any = any || doc_.bodies.count(f.first);
+                    for (auto& e : selEdges_) any = any || doc_.bodies.count(e.first);
+                    if (haveOwn && !any) toast("Select the bodies to slice first (click them), then press + Slice", ToastKind::Info);
+                    else enterSliceWorkspace();
+                }
             }
             dl->AddRectFilled(s0, s1, on ? col::Card : (sh || xh ? col::Hover : col::AppBar), 5 * S, ImDrawFlags_RoundCornersTop);
             drawIcon(dl, ImVec2(s0.x + 14 * S, (s0.y + s1.y) * 0.5f), 16 * S, Icon::Slicer, true);
@@ -407,6 +504,8 @@ void App::drawAppBar() {
             }
             x = s1.x + 3 * S;
         }
+        stripFades(sliceX0, sliceVis, sliceTabScroll_, sliceTotal);
+        ImGui::PopClipRect();
         if (sliceTabDrag_ >= 0 && sliceTabDrag_ < (int)sliceDocs_.size()) {
             ImVec2 m = ImGui::GetIO().MousePos;
             int over = -1;
@@ -477,13 +576,8 @@ void App::drawAppBar() {
 
     if (confirmNew_) { ImGui::OpenPopup("New design?"); confirmNew_ = false; }
     if (ImGui::BeginPopupModal("New design?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::TextUnformatted("Start a new design? Unsaved changes are kept\nin the autosave and offered on the next start.");
+        ImGui::TextUnformatted("Start a new design? It opens in a new tab;\nthis one stays open with its changes.");
         if (ImGui::Button("New Design", ImVec2(120 * S, 0))) {
-            if (dirty_ && !doc_.timeline.empty()) {
-                std::error_code ec;
-                std::filesystem::create_directories(u8path(autosavePath()).parent_path(), ec);
-                saveDocument(doc_, autosavePath());
-            }
             newDocument();
             ImGui::CloseCurrentPopup();
         }
@@ -506,7 +600,8 @@ bool App::toolButton(int ti, float size, bool) {
     uiitems::nameLast(t.label);
     bool hov = ImGui::IsItemHovered();
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    bool active = sk_.active && !sk_.tool.empty() && (sk_.tool == t.id || (t.id == "sk_point" && sk_.tool == "point"));
+    bool active = (sk_.active && !sk_.tool.empty() && (sk_.tool == t.id || (t.id == "sk_point" && sk_.tool == "point"))) ||
+                  (t.id == "measure" && measureMode_);
     if (active) dl->AddRectFilled(p, ImVec2(p.x + size, p.y + size), col::Active, 4.f);
     if (hov) dl->AddRectFilled(p, ImVec2(p.x + size, p.y + size), col::Hover, 4.f);
     drawIcon(dl, ImVec2(p.x + size * 0.5f, p.y + size * 0.5f), size * 0.74f, t.icon, t.available());
@@ -993,6 +1088,7 @@ void App::drawBrowser() {
                             syncBodyOverride(r.id);
                         }
                         doc_.touch();
+                        dirty_ = true;
                     }
                     renameId_ = 0;
                 }
@@ -1343,10 +1439,36 @@ void App::drawTimeline() {
     if (iconButton("##tl4", Icon::ToEnd, bs, doc_.markerPos < n, "Go to end")) { playing_ = false; setMarker(n); }
     ImGui::SameLine(0, 12 * S);
 
-    // Feature cells
-    ImVec2 c0 = ImGui::GetCursorScreenPos();
+    // Feature cells. A long timeline scrolls sideways: mouse wheel over it, the thin bar under it, or
+    // dragging the marker to an edge. The marker is kept in view when it moves.
+    ImVec2 c00 = ImGui::GetCursorScreenPos();
     float cell = 26 * S, gap = 3 * S;
     timelineHover_ = -1;
+    const float stripL = c00.x, stripR = wp.x + vp->Size.x - 10 * S;
+    const float visW = std::max(10.f, stripR - stripL);
+    // The strip ends exactly at its last thing: the marker's right edge (2 + 6 px past its slot), or the
+    // last step when the marker sits earlier (steps after it are pushed 10 px right). Scrolled to the
+    // end, that lands on the strip's right edge, which is where the scroll bar ends too.
+    const float markerEnd = n * (cell + gap) + 8 * S;
+    const float lastStepEnd = n > 0 ? (n - 1) * (cell + gap) + (doc_.markerPos < n ? 10 * S : 0.f) + cell : 0.f;
+    const float contentW = std::max(markerEnd, lastStepEnd);
+    const float maxScroll = std::max(0.f, contentW - visW);
+    {
+        ImGuiIO& tio = ImGui::GetIO();
+        ImVec2 mp = tio.MousePos;
+        bool over = mp.x >= stripL && mp.x <= stripR && mp.y >= wp.y && mp.y <= wp.y + h;
+        float wheel = tio.MouseWheel + tio.MouseWheelH;
+        if (over && wheel != 0.f) timelineScroll_ -= wheel * (cell + gap) * 3;
+        if (doc_.markerPos != timelineMarkerShown_) {   // the marker moved (step, play, undo): show it
+            float mxp = doc_.markerPos * (cell + gap);
+            if (mxp < timelineScroll_ + cell) timelineScroll_ = mxp - cell;
+            if (mxp > timelineScroll_ + visW - 2 * cell) timelineScroll_ = mxp - visW + 2 * cell;
+            timelineMarkerShown_ = doc_.markerPos;
+        }
+        timelineScroll_ = std::clamp(timelineScroll_, 0.f, maxScroll);
+    }
+    ImVec2 c0(c00.x - timelineScroll_, c00.y);
+    ImGui::PushClipRect(ImVec2(stripL, wp.y), ImVec2(stripR, wp.y + h), true);
     for (int i = 0; i < n; ++i) {
         const Feature& f = doc_.timeline[i];
         ImVec2 p(c0.x + i * (cell + gap) + (i >= doc_.markerPos ? 10 * S : 0), c0.y);
@@ -1423,13 +1545,50 @@ void App::drawTimeline() {
     bool mh = ImGui::IsItemHovered() || ImGui::IsItemActive();
     if (mh) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
     if (ImGui::IsItemActive()) {
-        float rel = ImGui::GetIO().MousePos.x - c0.x;
-        int pos = (int)std::round(rel / (cell + gap));
+        // Near either edge the strip scrolls along with the marker.
+        float mxs = ImGui::GetIO().MousePos.x;
+        if (mxs > stripR - 24 * S) timelineScroll_ = std::min(maxScroll, timelineScroll_ + 6 * S);
+        if (mxs < stripL + 24 * S) timelineScroll_ = std::max(0.f, timelineScroll_ - 6 * S);
+        float rel = mxs - c0.x;
+        int pos = std::clamp((int)std::round(rel / (cell + gap)), 0, n);
         playing_ = false;
         setMarker(pos);
+        timelineMarkerShown_ = doc_.markerPos;   // the user is placing it: no jump
+        activity();
     }
     dl->AddRectFilled(m0, m1, mh ? IM_COL32(30, 100, 210, 255) : col::Accent, 2 * S);
     if (n == 0) dl->AddText(ImVec2(c0.x + 20 * S, c0.y + 5 * S), col::TextDim, "Timeline: features appear here as you model");
+    // Soft edges where more steps are hidden.
+    {
+        ImU32 solid = col::Timeline, clear = col::Timeline & 0x00FFFFFF;
+        float fw = 16 * S;
+        if (timelineScroll_ > 0.5f) dl->AddRectFilledMultiColor(ImVec2(stripL, wp.y + 1), ImVec2(stripL + fw, wp.y + h), solid, clear, clear, solid);
+        if (timelineScroll_ < maxScroll - 0.5f) dl->AddRectFilledMultiColor(ImVec2(stripR - fw, wp.y + 1), ImVec2(stripR, wp.y + h), clear, solid, solid, clear);
+    }
+    ImGui::PopClipRect();
+    // The scroll bar: a thin thumb along the bottom, only when the steps do not fit.
+    if (maxScroll > 0.f) {
+        float barY = wp.y + h - 4 * S, barH = 3 * S;
+        float thumbW = std::max(30 * S, visW * visW / contentW);
+        float thumbX = stripL + (visW - thumbW) * (timelineScroll_ / maxScroll);
+        ImGui::SetCursorScreenPos(ImVec2(stripL, barY - 3 * S));
+        ImGui::InvisibleButton("##tlbar", ImVec2(visW, barH + 4 * S));
+        bool bh = ImGui::IsItemHovered() || ImGui::IsItemActive();
+        ImVec2 mp = ImGui::GetIO().MousePos;
+        if (ImGui::IsItemActivated()) {
+            timelineBarDrag_ = true;
+            // Grabbing the thumb keeps the grab point; clicking elsewhere centers the thumb there.
+            timelineBarGrab_ = (mp.x >= thumbX && mp.x <= thumbX + thumbW) ? mp.x - thumbX : thumbW * 0.5f;
+        }
+        if (timelineBarDrag_ && ImGui::IsItemActive()) {
+            float tx = std::clamp(mp.x - timelineBarGrab_, stripL, stripL + visW - thumbW);
+            timelineScroll_ = (visW - thumbW) > 0 ? (tx - stripL) / (visW - thumbW) * maxScroll : 0.f;
+            activity();
+        }
+        if (!ImGui::IsItemActive()) timelineBarDrag_ = false;
+        // Kestral orange, a little brighter when hovered or dragged.
+        dl->AddRectFilled(ImVec2(thumbX, barY), ImVec2(thumbX + thumbW, barY + barH), bh ? IM_COL32(255, 140, 90, 255) : col::Print, barH * 0.5f);
+    }
 
     ImGui::End();
     ImGui::PopStyleVar(2);
@@ -1750,16 +1909,16 @@ void App::drawToasts() {
 
 bool App::allowClose() {
     if (quitting_) return true;
-    bool unsaved = dirty_ && (!doc_.timeline.empty() || !doc_.bodies.empty());
+    bool unsaved = tabUnsaved(designActive_);
     if (!unsaved) {
         // Another tab with unsaved work: bring it in front and ask about it.
         for (int i = 0; i < (int)designTabs_.size(); ++i) {
             if (i == designActive_) continue;
-            const DesignTab& t = designTabs_[(size_t)i];
-            if (t.dirty && (!t.doc.timeline.empty() || !t.doc.bodies.empty())) { switchDesignTab(i); unsaved = true; break; }
+            if (tabUnsaved(i)) { switchDesignTab(i); unsaved = true; break; }
         }
     }
     if (!unsaved) return true;
+    writeAllRecoverySync();   // whatever happens next (even a forced close), the work is on disk
     closeAsk_ = true;
     activity();
     return false;
@@ -1782,7 +1941,7 @@ void App::drawCloseAsk() {
     ImGui::Spacing();
     auto quit = [&] {
         ImGui::CloseCurrentPopup();
-        dirty_ = false;   // this one is handled; the next tab with changes asks too
+        // This design is handled (saved or discarded); the next tab with changes asks too.
         if (allowClose()) {
             quitting_ = true;
             glfwSetWindowShouldClose(window_, GLFW_TRUE);
@@ -1794,14 +1953,16 @@ void App::drawCloseAsk() {
     bool save = ImGui::Button("Save", ImVec2(120 * S, 0));
     ImGui::PopStyleColor(3);
     if (save) {
-        if (doc_.path.empty()) saveDocumentAs();
-        else saveDocumentNow();
-        if (!dirty_) quit();   // a cancelled Save As keeps Kestral open
+        saveDocumentNow();   // Save As when it has no file yet
+        syncDirty();
+        if (!dirty_) quit();   // a cancelled or failed save keeps Kestral open (and this question up)
     }
     ImGui::SameLine();
     if (ImGui::Button("Don't Save", ImVec2(120 * S, 0))) {
+        discardDesignChanges(designActive_);   // a copy goes to the discarded folder
         quit();
     }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Closes without the changes. A copy is kept in the autosave\\discarded folder.");
     ImGui::SameLine();
     if (ImGui::Button("Cancel", ImVec2(120 * S, 0)) || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
     ImGui::EndPopup();
@@ -2128,7 +2289,8 @@ void App::handleViewportInput() {
         return;
     }
 
-    const bool inSketch = sk_.active || sk_.choosingPlane;
+    // Measuring inside a sketch: the sketch stays open but the clicks go to Measure.
+    const bool inSketch = (sk_.active || sk_.choosingPlane) && !measureMode_;
     if (inSketch) {
         sketchUpdate();
         if (sk_.active && sk_.tool == "project") updateHover();   // body edges / faces to project
@@ -2259,8 +2421,11 @@ void App::handleViewportInput() {
                 add = io.KeyShift || io.KeyCtrl;
                 windowSelect(winA_, m, add);
             } else if (drag_ == Drag::Select) {
-                if (measureMode_ && hoverBody_ != 0) {
-                    measureClick();
+                if (measureMode_) {
+                    // An edge counts even when the cursor is just off the part (a silhouette edge:
+                    // the face pick under the cursor is empty there). A click on empty space does
+                    // nothing while measuring (it used to fall through and change the selection).
+                    measureClick();   // a face, an edge or a sketch curve under the cursor (nothing: ignored)
                 } else {
                     viewportClick(add, selPressDouble_);
                 }
@@ -2373,85 +2538,333 @@ void App::beginOrbit(ImVec2 m) {
     }
 }
 
+void App::clearMeasure() {
+    bool hadPicks = !measurePicks_.empty();
+    measurePicks_.clear();
+    measureDist_ = -1;
+    measureLine_ = measureCenterLine_ = false;
+    measureLines_.clear();
+    ++measureGen_;
+    if (hadPicks) showMeasurePicks();   // its lit picks go; a selection from before measuring stays
+}
+
+// The picked faces and edges stay lit (the selection color) while you pick the next one.
+void App::showMeasurePicks() {
+    selection_.clear();
+    selFaces_.clear();
+    selEdges_.clear();
+    selProfiles_.clear();
+    selOrder_.clear();
+    for (auto& pk : measurePicks_) {
+        if (pk.sketch) continue;   // sketch curves are drawn lit by the measure panel
+        if (pk.edge) selEdges_.insert({pk.body, pk.edge - 1});
+        else if (pk.face) selFaces_.insert({pk.body, pk.face - 1});
+        else selection_.insert(pk.body);
+    }
+    markSceneDirty();
+}
+
 void App::measureClick() {
     bool onEdge = hov_.kind == HoverKind::Edge && doc_.bodies.count(hov_.body);
     uint32_t bodyId = onEdge ? hov_.body : hoverBody_;
+    // A sketch curve right under the cursor (sketches draw on top of the part). Against a body edge
+    // it wins only when it is the closer of the two.
+    uint32_t skS = 0, skE = 0;
+    float skD = 1e9f;
+    ImVec2 mpos = ImGui::GetIO().MousePos;
+    bool onSketch = sketchCurveAt(mpos.x, mpos.y, skS, skE, skD) && (!onEdge || skD < 5.f * uiScale_);
+    // A sketch point (a line's end, a circle's center) beats the curves it sits on.
+    bool onPoint = false;
+    {
+        uint32_t ps = 0, pe = 0;
+        float pd = 1e9f;
+        if (sketchPointUnder(mpos.x, mpos.y, ps, pe, pd) && (!onEdge || pd < 7.f * uiScale_)) {
+            onPoint = onSketch = true;
+            skS = ps;
+            skE = pe;
+        }
+    }
     auto bit = doc_.bodies.find(bodyId);
-    if (bit == doc_.bodies.end()) return;
-    int kind = std::clamp(measureKind_, 0, 4);
-    if (kind >= 1 && !onEdge && !hoverFace_) {
+    if (!onSketch && bit == doc_.bodies.end()) return;
+    int kind = std::clamp(measureKind_, 0, 5);
+    if (onPoint && kind != 0) {
+        toast("A sketch point can be measured with Distance", ToastKind::Warning);
+        return;
+    }
+    if (onSketch && (kind == 3 || kind == 4)) {
+        toast(kind == 3 ? "Area needs a face of a body" : "Loop needs a body face or edge", ToastKind::Warning);
+        return;
+    }
+    if (!onSketch && kind >= 1 && !onEdge && !hoverFace_) {
         toast(kind == 1 ? "Click an edge or a flat face" : "Click a face or an edge", ToastKind::Warning);
         return;
     }
-    int need = kind <= 1 ? 2 : 1;
-    if ((int)measurePicks_.size() >= need) {
-        measurePicks_.clear();
-        measureDist_ = -1;
-    }
+    int need = kind <= 1 || kind == 5 ? 2 : 1;
+    if ((int)measurePicks_.size() >= need) clearMeasure();
     MeasurePick mp;
-    mp.body = bodyId;
-    mp.face = onEdge ? 0 : hoverFace_;
-    mp.edge = onEdge ? hov_.index + 1 : 0;
-    mp.name = bit->second.name + (onEdge ? " (edge)" : hoverFace_ ? " (face)" : "");
+    if (onSketch) {
+        mp.sketch = skS;
+        mp.ent = skE;
+        const sk::Sketch& sk0 = doc_.sketches.at(skS);
+        sk::EntType t = sk0.ents.at(skE).type;
+        const char* what = t == sk::EntType::Point ? "point" : t == sk::EntType::Line ? "line" : t == sk::EntType::Circle ? "circle" : t == sk::EntType::Arc ? "arc" :
+                           t == sk::EntType::Ellipse || t == sk::EntType::EllipArc ? "ellipse" : "spline";
+        mp.name = sk0.name + " (" + what + ")";
+    } else {
+        mp.body = bodyId;
+        mp.face = onEdge ? 0 : hoverFace_;
+        mp.edge = onEdge ? hov_.index + 1 : 0;
+        mp.name = bit->second.name + (onEdge ? " (edge)" : hoverFace_ ? " (face)" : "");
+    }
     measurePicks_.push_back(mp);
+    showMeasurePicks();
+    measureLine_ = measureCenterLine_ = false;
+    measureLines_.clear();
+    measureDist_ = -1;
     activity();
-    if ((int)measurePicks_.size() != need) return;
     std::vector<ShapePtr> shapes;
     std::vector<glm::mat4> xfs;
     for (auto& pk : measurePicks_) {
+        if (pk.sketch) {
+            // The curve itself, exact (a spline as short pieces), in world space.
+            std::vector<glm::dvec3> poly;
+            std::vector<CurveSeg> segs;
+            glm::dvec3 n(0, 0, 1), pw;
+            ShapePtr cs = sketchPointWorld(pk.sketch, pk.ent, pw) ? kernel::pointShape(pw)
+                        : sketchCurveGeom(pk.sketch, pk.ent, poly, &segs, &n) ? kernel::curveShape(segs, n) : nullptr;
+            if (!cs) {
+                toast("That sketch curve cannot be measured", ToastKind::Warning);
+                clearMeasure();
+                return;
+            }
+            pk.face = 0;
+            pk.edge = segs.size() == 1 ? 1 : 0;   // one exact edge, or the whole spline (a point: whole)
+            shapes.push_back(cs);
+            xfs.push_back(glm::mat4(1.f));
+            continue;
+        }
         auto b2 = doc_.bodies.find(pk.body);
         if (b2 == doc_.bodies.end()) return;
         auto p2 = doc_.parts.find(b2->second.partId);
         if (p2 == doc_.parts.end() || !p2->second.shape) {
             toast("Measure needs solid bodies (mesh bodies have no exact faces)", ToastKind::Warning);
-            measurePicks_.clear();
+            clearMeasure();
             return;
         }
         shapes.push_back(p2->second.shape);
         xfs.push_back(b2->second.xform);
     }
     measureBusy_ = true;
-    measureDist_ = -1;
-    uint32_t f0 = measurePicks_[0].face, e0 = measurePicks_[0].edge;
-    uint32_t f1 = need > 1 ? measurePicks_[1].face : 0, e1 = need > 1 ? measurePicks_[1].edge : 0;
+    uint64_t gen = ++measureGen_;
+    size_t n = measurePicks_.size();
+    std::vector<uint32_t> faces, edges;
+    for (auto& pk : measurePicks_) { faces.push_back(pk.face); edges.push_back(pk.edge); }
     auto none = [](uint32_t v) { return v == 0 ? 0xffffffffu : v - 1; };
     JobSystem* jobs = jobs_.get();
-    jobs_->submit("measure", [this, jobs, shapes, xfs, f0, f1, e0, e1, kind, none] {
-        kernel::CurveMeasure r;
-        if (kind == 0) {
-            auto d = kernel::measureShapes(shapes[0], xfs[0], shapes[1], xfs[1], none(f0), none(f1), none(e0), none(e1));
-            r.ok = d.ok;
-            r.value = d.distance;
-        } else if (kind == 1) {
-            r = kernel::measureAngle(shapes[0], xfs[0], none(f0), none(e0), shapes[1], xfs[1], none(f1), none(e1));
-        } else if (kind == 2) {
-            r = kernel::measureRadius(shapes[0], xfs[0], none(f0), none(e0));
-        } else if (kind == 3) {
-            r = kernel::measureArea(shapes[0], xfs[0], none(f0));
-        } else {
-            r = kernel::measureLoop(shapes[0], xfs[0], none(f0), none(e0));
+    jobs_->submit("measure", [this, jobs, shapes, xfs, faces, edges, kind, need, n, gen, none] {
+        // The pick just made: what it is and its own sizes (shown at once, like Fusion).
+        kernel::PickInfo info = kernel::measurePick(shapes[n - 1], xfs[n - 1], none(faces[n - 1]), none(edges[n - 1]));
+        std::string infoText;
+        if (info.ok) {
+            infoText = info.what;
+            if (info.length >= 0) infoText += ",  length " + fmtNum(info.length) + " mm";
+            if (info.radius > 0) infoText += ",  R " + fmtNum(info.radius) + " (D " + fmtNum(info.radius * 2) + ") mm";
+            if (info.area >= 0) infoText += ",  area " + fmtNum(info.area) + " mm2";
         }
-        jobs->post([this, r, kind] {
+        kernel::CurveMeasure r;
+        kernel::PairMeasure pm;
+        std::vector<std::string> lines;
+        bool done = (int)n == need;
+        if (done) {
+            if (kind <= 1) {
+                pm = kernel::measurePair(shapes[0], xfs[0], none(faces[0]), none(edges[0]), shapes[1], xfs[1], none(faces[1]), none(edges[1]));
+                if (kind == 0) {
+                    r.ok = pm.ok;
+                    r.value = pm.distance;
+                    if (pm.ok) {
+                        glm::dvec3 dd = glm::abs(pm.pb - pm.pa);
+                        lines.push_back("dX " + fmtNum(dd.x) + "   dY " + fmtNum(dd.y) + "   dZ " + fmtNum(dd.z));
+                        if (pm.centers >= 0) {
+                            lines.push_back("Center to center  " + fmtNum(pm.centers) + " mm");
+                            glm::dvec3 dc = glm::abs(pm.cb - pm.ca);
+                            lines.push_back("dX " + fmtNum(dc.x) + "   dY " + fmtNum(dc.y) + "   dZ " + fmtNum(dc.z));
+                        }
+                        if (pm.angle >= 0) lines.push_back("Angle  " + fmtNum(pm.angle) + " deg");
+                        if (pm.distance < 1e-6)
+                            lines.push_back("0: the two picks touch (an edge on that face, or the same face). Click the edge line itself; it lights up when it is picked.");
+                    }
+                } else {
+                    r.ok = pm.ok && pm.angle >= 0;
+                    r.value = pm.angle;
+                    if (r.ok && pm.angleSigned) lines.push_back("Other side  " + fmtNum(180.0 - pm.angle) + " deg");
+                    if (r.ok && !pm.angleSigned) lines.push_back("Lines that do not meet: the smaller angle");
+                }
+            } else if (kind == 5) {
+                // Alignment: parallel, level (flat to flat) and centered, each with how far off it is.
+                kernel::AlignMeasure am = kernel::measureAlign(shapes[0], xfs[0], none(faces[0]), none(edges[0]), shapes[1], xfs[1], none(faces[1]), none(edges[1]));
+                r.ok = am.ok;
+                if (am.ok) {
+                    const double tolMM = 0.0005, tolDeg = 0.001;
+                    auto f4 = [](double v) { char b[32]; std::snprintf(b, sizeof b, "%.4f", v); return std::string(b); };
+                    bool good = true, any = false;
+                    std::vector<std::string> det;
+                    bool flatVsAxis = (am.whatA == "flat face" || am.whatA == "round flat face") != (am.whatB == "flat face" || am.whatB == "round flat face");
+                    if (am.tilt >= 0) {
+                        any = true;
+                        bool par = am.tilt < tolDeg;
+                        good = good && par;
+                        det.push_back(std::string(par ? "Parallel" : "Tilted") + ":  " + f4(am.tilt) + " deg off" +
+                                      (flatVsAxis && par ? "  (the axis stands square to the face)" : ""));
+                    }
+                    if (am.hasHeight) {
+                        any = true;
+                        bool lev = std::abs(am.height) < tolMM;
+                        good = good && lev;
+                        det.push_back(std::string(lev ? "Level" : "Not level") + ":  " + f4(std::abs(am.height)) + " mm apart in height" +
+                                      (lev ? "" : am.height > 0 ? "  (the 2nd is higher along the 1st's face)" : "  (the 2nd is lower along the 1st's face)"));
+                    }
+                    if (am.offCenter >= 0) {
+                        any = true;
+                        bool cen = am.offCenter < tolMM;
+                        good = good && cen;
+                        det.push_back(std::string(cen ? "Centered" : "Off center") + ":  " + f4(am.offCenter) + " mm sideways");
+                        glm::dvec3 dc = am.cb - am.ca;
+                        det.push_back("   centers dX " + f4(dc.x) + "   dY " + f4(dc.y) + "   dZ " + f4(dc.z));
+                    } else if (am.tilt >= 1.0) {
+                        det.push_back("(Not parallel, so there is no sideways offset to give)");
+                    }
+                    lines.push_back(!any ? "Nothing to compare on those two" : good ? "Lined up" : "Not lined up");
+                    for (auto& l : det) lines.push_back(l);
+                    lines.push_back("1: " + am.whatA + ",  2: " + am.whatB);
+                    pm.ca = am.ca;
+                    pm.cb = am.cb;
+                    pm.centers = am.offCenter >= 0 ? glm::length(am.cb - am.ca) : -1;
+                }
+            } else if (kind == 2) {
+                r = kernel::measureRadius(shapes[0], xfs[0], none(faces[0]), none(edges[0]));
+                if (r.ok) lines.push_back("Diameter  " + fmtNum(r.value * 2) + " mm");
+            } else if (kind == 3) {
+                r = kernel::measureArea(shapes[0], xfs[0], none(faces[0]));
+            } else {
+                r = kernel::measureLoop(shapes[0], xfs[0], none(faces[0]), none(edges[0]));
+            }
+        }
+        jobs->post([this, r, pm, lines, kind, done, gen, n, infoText] {
+            if (gen != measureGen_) return;   // a newer click took over
             measureBusy_ = false;
+            if (n - 1 < measurePicks_.size()) measurePicks_[n - 1].info = infoText;
+            if (!done) { activity(); return; }
             measureDist_ = r.ok ? r.value : -1;
+            measureLines_ = lines;
+            measureLine_ = r.ok && kind == 0;
+            measurePa_ = pm.pa;
+            measurePb_ = pm.pb;
+            measureCenterLine_ = r.ok && (kind == 0 || kind == 5) && pm.centers > 1e-9;
+            measureCa_ = pm.ca;
+            measureCb_ = pm.cb;
             if (!r.ok) {
                 const char* why[] = {
                     "Could not measure that distance",
-                    "Click two edges, or two flat faces",
+                    "An angle needs two straight edges, two flat faces, or one of each",
                     "That is not a circle, a cylinder, a sphere, or a torus",
                     "Click a face",
-                    "That pick has no loop"};
-                toast(why[std::clamp(kind, 0, 4)], ToastKind::Warning);
+                    "That pick has no loop",
+                    "Alignment needs faces or edges: flat, round, circle edges or straight edges"};
+                toast(why[std::clamp(kind, 0, 5)], ToastKind::Warning);
             }
             activity();
         });
-    }, [this](const std::string& err) {
-        measureBusy_ = false;
+    }, [this, gen](const std::string& err) {
+        if (gen == measureGen_) measureBusy_ = false;
         toast("Measure failed: " + err, ToastKind::Warning);
     });
 }
 
+bool App::aiHasControl() const {
+    if (!settings_.lockWhileAi) return false;
+    McpStatus ms = mcpStatus();
+    // Working = a call that can change something ran in the last 40 s (local models think a while
+    // between calls, and the design must not change under them meanwhile).
+    // An AI driving the window itself (clicks and keys) must get through, so no lock while that runs.
+    if (!ms.tool.empty() && mcpIsUiTool(ms.tool)) return false;
+    return ms.running && !ms.paused && ms.changeIdleSecs >= 0 && ms.changeIdleSecs < 40;
+}
+
+void App::drawAiControl() {
+    McpStatus ms = mcpStatus();
+    bool working = !ms.paused && ms.changeIdleSecs >= 0 && ms.changeIdleSecs < 40;
+    if (!ms.running || (!working && !ms.paused)) return;
+    const float S = uiScale_;
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    std::string who = ms.client.empty() ? std::string("An AI") : ms.client;
+    if (who.size() > 28) who = who.substr(0, 27) + "...";
+    bool locked = aiHasControl();
+    if (locked) {
+        // A see-through cover over everything below the tab bar: it takes the clicks, so the design
+        // only changes through the AI. Tabs, Preferences and popups stay usable.
+        float top = 34 * S;
+        ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, vp->Pos.y + top));
+        ImGui::SetNextWindowSize(ImVec2(vp->Size.x, vp->Size.y - top));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
+        ImGui::Begin("##ailock", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoBringToFrontOnFocus);
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 a(vp->Pos.x + 2 * S, vp->Pos.y + top + 2 * S), b(vp->Pos.x + vp->Size.x - 2 * S, vp->Pos.y + vp->Size.y - 2 * S);
+        float pulse = 0.55f + 0.45f * std::sin((float)time_ * 2.4f);
+        dl->AddRect(a, b, (col::Accent & 0x00FFFFFF) | ((ImU32)(90 + 110 * pulse) << 24), 6 * S, 0, 2.5f * S);
+        if (ImGui::IsWindowHovered() && (ImGui::IsMouseClicked(0) || ImGui::IsMouseClicked(1) || ImGui::IsMouseClicked(2)))
+            toast(who + " is working in Kestral. Press Stop (bottom right) to take over.", ToastKind::Info);
+        ImGui::End();
+        ImGui::PopStyleVar();
+        if (ImGuiWindow* w = ImGui::FindWindowByName("##ailock")) ImGui::BringWindowToDisplayFront(w);
+        if (settingsOpen_)
+            if (ImGuiWindow* w = ImGui::FindWindowByName("Preferences")) ImGui::BringWindowToDisplayFront(w);
+        activity();
+    }
+    // The card: who works and on what, with Stop (or, once stopped, Let AI continue).
+    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x - 14 * S, vp->Pos.y + vp->Size.y - 74 * S), ImGuiCond_Always, ImVec2(1.f, 1.f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8 * S);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12 * S, 10 * S));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImGui::ColorConvertU32ToFloat4(col::Card));
+    ImGui::Begin("##aictl", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 c = ImGui::GetCursorScreenPos();
+    float lh = ImGui::GetTextLineHeight();
+    if (ms.paused) {
+        dl->AddCircleFilled(ImVec2(c.x + 5 * S, c.y + lh * 0.5f), 4.5f * S, col::Warning);
+        ImGui::SetCursorScreenPos(ImVec2(c.x + 16 * S, c.y));
+        ImGui::TextUnformatted("AI stopped: you have control");
+        ImGui::TextDisabled("%s cannot change anything until you let it.", who.c_str());
+        ImGui::TextDisabled(" ");
+        if (ImGui::Button("Let AI continue", ImVec2(-1, 0))) mcpResumeAi();
+        uiitems::nameLast("Let AI continue");
+    } else {
+        float pulse = 0.5f + 0.5f * std::sin((float)time_ * 3.f);
+        dl->AddCircleFilled(ImVec2(c.x + 5 * S, c.y + lh * 0.5f), 4.5f * S, (col::Accent & 0x00FFFFFF) | ((ImU32)(120 + 135 * pulse) << 24));
+        ImGui::SetCursorScreenPos(ImVec2(c.x + 16 * S, c.y));
+        ImGui::Text("%s is working", who.c_str());
+        // Same lines every frame, so Stop never moves under the mouse.
+        ImGui::TextDisabled("%s", ms.tool.empty() ? "thinking about the next step" : ms.tool.c_str());
+        ImGui::TextDisabled("%s", settings_.lockWhileAi ? "The design is locked while it works." : "You can keep working alongside it.");
+        ImGui::PushStyleColor(ImGuiCol_Button, ImGui::ColorConvertU32ToFloat4(col::Error));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.92f, 0.32f, 0.32f, 1.f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.72f, 0.18f, 0.18f, 1.f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 1));
+        if (ImGui::Button("Stop", ImVec2(std::max(160 * S, ImGui::GetContentRegionAvail().x), 30 * S))) mcpStopAi();
+        uiitems::nameLast("Stop AI");
+        ImGui::PopStyleColor(4);
+        activity();
+    }
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
+    if (ImGuiWindow* w = ImGui::FindWindowByName("##aictl")) ImGui::BringWindowToDisplayFront(w);
+}
+
 void App::handleShortcuts() {
+    if (aiHasControl()) return;   // the AI is working: keys wait until Stop (Preferences still type)
     ImGuiIO& io = ImGui::GetIO();
     if (mm_.open || keyRec_ >= 0) return;
     if (ImGui::IsPopupOpen("##palette")) return;
@@ -2509,7 +2922,7 @@ void App::handleShortcuts() {
             return;
         }
     }
-    if (sketchKeys()) return;
+    if (!measureMode_ && sketchKeys()) return;   // Esc while measuring in a sketch ends Measure, not the sketch
 
     bool mods = io.KeyCtrl || io.KeyShift || io.KeyAlt;
     if (!mods && !sk_.active && (pressed(ImGuiKey_Delete) || pressed(ImGuiKey_Backspace))) { deleteSelection(); return; }

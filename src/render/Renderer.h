@@ -8,7 +8,7 @@ struct ImDrawData;
 
 namespace kst {
 
-enum InstanceFlags : uint32_t { kInstSelected = 1, kInstHover = 2 };
+enum InstanceFlags : uint32_t { kInstSelected = 1, kInstHover = 2, kInstGhost = 4 };   // ghost: a hidden part shown because it is picked
 
 // One appearance as the shader reads it (see shaders/mesh.frag).
 struct MaterialGpu {
@@ -121,6 +121,10 @@ private:
 
     GpuImage msaaColor_, msaaDepth_, idColor_, idDepth_;
     VkFormat depthFormat_ = VK_FORMAT_D32_SFLOAT;
+    // The viewport's own depth buffer: with stencil when the GPU has D32+S8, so the x-ray pass can
+    // leave out the pixels where the highlighted part itself is in front (no inside showing through).
+    VkFormat mainDepthFormat_ = VK_FORMAT_D32_SFLOAT;
+    bool stencil_ = false;
     VkFormat idFormat_ = VK_FORMAT_R32G32_UINT;
 
     VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
@@ -130,6 +134,7 @@ private:
     VkPipelineLayout meshLayout_ = VK_NULL_HANDLE, bgLayout_ = VK_NULL_HANDLE, gridLayout_ = VK_NULL_HANDLE;
     VkPipeline meshPipe_ = VK_NULL_HANDLE, idPipe_ = VK_NULL_HANDLE, linePipe_ = VK_NULL_HANDLE, bgPipe_ = VK_NULL_HANDLE, gridPipe_ = VK_NULL_HANDLE;
     VkPipeline glassBackPipe_ = VK_NULL_HANDLE, glassFrontPipe_ = VK_NULL_HANDLE;   // see through pass
+    VkPipeline xrayMaskPipe_ = VK_NULL_HANDLE;   // marks where the highlighted part is itself the front surface
     VkPipeline xrayPipe_ = VK_NULL_HANDLE;   // hovered / selected parts through what hides them
     bool anyHighlight_ = false;              // some instance is selected or has selected faces
 

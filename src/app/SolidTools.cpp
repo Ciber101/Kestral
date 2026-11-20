@@ -121,6 +121,15 @@ std::string defaultName(const Document& doc, FeatureType t) {
     return std::string(baseName(t)) + std::to_string(n + 1);
 }
 
+// What a pattern's first box picks: bodies, or faces when it copies faces. A circular pattern also
+// takes an edge for its axis straight away.
+int patternObjectFilter(bool faces, int kind) {
+    if (faces) return 2;        // App::PickFace: a hole's edge would only get in the way
+    int f = 1;                  // App::PickBody
+    if (kind == 1) f |= 4;      // App::PickEdge (a circular pattern takes it as the axis)
+    return f;
+}
+
 bool bodyPickTool(FeatureType t) {
     return t == FeatureType::Pattern || t == FeatureType::Mirror || t == FeatureType::Combine ||
            t == FeatureType::Split || t == FeatureType::SplitFace || t == FeatureType::Move || t == FeatureType::Remove || t == FeatureType::Dovetail ||
@@ -196,6 +205,11 @@ void App::syncToolFromSelection() {
         applyToolDialog();
         return;
     }
+    if (t == FeatureType::Loft) {
+        syncLoftPicks();
+        applyToolDialog();
+        return;
+    }
     if (t == FeatureType::Split && tdlg_.option2 == 1) {
         // Picks arrive from viewportClick on mouse release, so the press frame has passed.
         bool clk = (clicked || ImGui::IsMouseReleased(ImGuiMouseButton_Left)) && viewportHovered_;
@@ -227,6 +241,7 @@ void App::syncToolFromSelection() {
                     tdlg_.axisName = "Sketch line";
                     tdlg_.selA = (int)sid;
                     tdlg_.selB = (int)ent;
+                    tdlg_.axisR = 0;
                     took = true;
                 }
             } else if (!selFaces_.empty()) {
@@ -235,15 +250,30 @@ void App::syncToolFromSelection() {
                 auto pit = bit != doc_.bodies.end() ? doc_.parts.find(bit->second.partId) : doc_.parts.end();
                 glm::dvec3 c, n;
                 bool planar = false;
+                double rad = 0;
                 if (pit != doc_.parts.end() && pit->second.shape && kernel::faceInfo(pit->second.shape, fc.second, c, n, planar) && planar) {
                     glm::dmat4 xf(bit->second.xform);
                     tdlg_.option = 3;
                     tdlg_.axisO = glm::dvec3(xf * glm::dvec4(c, 1.0));
                     tdlg_.axisD = glm::normalize(glm::dmat3(xf) * n);
+                    tdlg_.axisR = 0;
                     tdlg_.axisName = "Face of " + bit->second.name;
                     tdlg_.selA = tdlg_.selB = 0;
                     took = true;
-                } else toast("Pick a flat face to split with", ToastKind::Warning);
+                } else if (pit != doc_.parts.end() && pit->second.shape && kernel::faceCylinder(pit->second.shape, fc.second, c, n, rad)) {
+                    // A round face: the cut follows that cylinder, carried on past the face's own ends
+                    // (Fusion's Split Body with a curved face), e.g. a liner cut free of its water jacket.
+                    glm::dmat4 xf(bit->second.xform);
+                    tdlg_.option = 3;
+                    tdlg_.axisO = glm::dvec3(xf * glm::dvec4(c, 1.0));
+                    tdlg_.axisD = glm::normalize(glm::dmat3(xf) * n);
+                    tdlg_.axisR = rad;
+                    char nm[96];
+                    std::snprintf(nm, sizeof nm, "Round face of %s (R %.2f)", bit->second.name.c_str(), rad);
+                    tdlg_.axisName = nm;
+                    tdlg_.selA = tdlg_.selB = 0;
+                    took = true;
+                } else toast("Pick a flat or round (cylinder) face to split with", ToastKind::Warning);
             } else if (!selEdges_.empty()) {
                 SubRef ed = *selEdges_.begin();
                 auto bit = doc_.bodies.find(ed.first);
@@ -272,6 +302,7 @@ void App::syncToolFromSelection() {
                         tdlg_.axisD = glm::normalize(sn);
                         tdlg_.axisName = "Edge of " + bit->second.name;
                         tdlg_.selA = tdlg_.selB = 0;
+                        tdlg_.axisR = 0;
                         took = true;
                     }
                 } else toast("Pick a straight edge to split along", ToastKind::Warning);
@@ -285,6 +316,60 @@ void App::syncToolFromSelection() {
         }
         applyToolDialog();
         return;
+    }
+    if (t == FeatureType::Pattern && tdlg_.option2 == 1 && tdlg_.pickWait &&
+        ImGui::IsMouseReleased(ImGuiMouseButton_Left) && viewportHovered_) {
+        // A sketch circle or arc (its center, square to its sketch) or a sketch line as the axis.
+        ImVec2 m = ImGui::GetIO().MousePos;
+        float best = 8.f * uiScale_;
+        bool hit = false;
+        glm::dvec3 ho(0), hd(0, 0, 1);
+        std::string hname;
+        for (auto& [id, s] : doc_.sketches) {
+            if (!sketchShown(s)) continue;
+            for (auto& [eid, e] : s.ents) {
+                if (e.type != sk::EntType::Line && e.type != sk::EntType::Circle && e.type != sk::EntType::Arc) continue;
+                if (e.locked) continue;
+                std::vector<glm::dvec3> w;
+                auto W = [&](sk::Vec2 p) { return s.plane.toWorld(p); };
+                if (e.type == sk::EntType::Line) {
+                    w = {W(s.pt(e.a)), W(s.pt(e.b))};
+                } else {
+                    sk::Sketch::ArcGeom g;
+                    if (!s.arcGeom(e, g)) continue;
+                    for (int i = 0; i <= 32; ++i) w.push_back(W(s.arcPoint(g, i / 32.0)));
+                }
+                for (size_t i = 1; i < w.size(); ++i) {
+                    ImVec2 sa, sb;
+                    if (!worldToScreen(w[i - 1], sa) || !worldToScreen(w[i], sb)) continue;
+                    float d = distSeg(m, sa, sb);
+                    if (d >= best) continue;
+                    best = d;
+                    hit = true;
+                    if (e.type == sk::EntType::Line) {
+                        ho = w.front();
+                        hd = w.back() - w.front();
+                        hname = "Sketch line";
+                    } else {
+                        ho = W(s.pt(e.c));
+                        hd = s.plane.normal();
+                        hname = e.type == sk::EntType::Circle ? "Center of a sketch circle" : "Center of a sketch arc";
+                    }
+                }
+            }
+        }
+        if (hit && glm::length(hd) > 1e-9) {
+            tdlg_.axisO = ho;
+            tdlg_.axisD = glm::normalize(hd);
+            tdlg_.option = 3;
+            tdlg_.axisName = hname;
+            tdlg_.pickWait = false;
+            activePickFilter_ = patternObjectFilter(tdlg_.patFaces, 1);
+            selFaces_ = tdlg_.patFaceSel;
+            selEdges_.clear();
+            applyToolDialog();
+            return;
+        }
     }
     if (t == FeatureType::Pattern && tdlg_.option2 == 2 && tdlg_.pickWait) {
         bool released = ImGui::IsMouseReleased(ImGuiMouseButton_Left) && viewportHovered_;
@@ -342,8 +427,9 @@ void App::syncToolFromSelection() {
             }
             if (took) {
                 tdlg_.pickWait = false;
-                activePickFilter_ = PickBody;
+                activePickFilter_ = patternObjectFilter(tdlg_.patFaces, 2);
                 selEdges_.clear();
+                selFaces_ = tdlg_.patFaceSel;
             } else toast("Pick a sketch curve or an edge", ToastKind::Warning);
         }
         applyToolDialog();
@@ -467,6 +553,41 @@ void App::syncToolFromSelection() {
             } else {
                 toast("That edge has no axis. Pick a round edge or a straight edge.", ToastKind::Warning);
             }
+            if (tdlg_.option == 3 && tdlg_.pickWait) {
+                tdlg_.pickWait = false;
+                activePickFilter_ = patternObjectFilter(tdlg_.patFaces, 1);
+            }
+        }
+        // ...or a face: a round one turns around its own axis, a flat one around its normal. While
+        // the axis box is waiting, the face just clicked (not one of the faces being copied) is it.
+        SubRef axisFace{0, 0};
+        bool haveAxisFace = false;
+        if (t == FeatureType::Pattern && tdlg_.option2 == 1 && tdlg_.pickWait) {
+            for (const SubRef& s : selFaces_)
+                if (!tdlg_.patFaceSel.count(s)) { axisFace = s; haveAxisFace = true; break; }
+            selFaces_ = tdlg_.patFaceSel;
+        }
+        if (t == FeatureType::Pattern && tdlg_.option2 == 1 && haveAxisFace) {
+            SubRef fc = axisFace;
+            auto bit = doc_.bodies.find(fc.first);
+            auto pit = bit != doc_.bodies.end() ? doc_.parts.find(bit->second.partId) : doc_.parts.end();
+            glm::dvec3 o, d;
+            bool planar = false, ok = false;
+            if (pit != doc_.parts.end() && pit->second.shape) {
+                ok = kernel::faceRoundAxis(pit->second.shape, fc.second, o, d);
+                if (!ok) ok = kernel::faceInfo(pit->second.shape, fc.second, o, d, planar) && planar;
+            }
+            if (ok) {
+                glm::dmat4 xf(bit->second.xform);
+                tdlg_.axisO = glm::dvec3(xf * glm::dvec4(o, 1.0));
+                tdlg_.axisD = glm::normalize(glm::dmat3(xf) * d);
+                tdlg_.option = 3;
+                tdlg_.axisName = (planar ? "Normal of a face of " : "Axis of a round face of ") + bit->second.name;
+                tdlg_.pickWait = false;
+                activePickFilter_ = patternObjectFilter(tdlg_.patFaces, 1);
+            } else {
+                toast("That face has no axis. Pick a round face (cylinder, cone, hole) or a flat face.", ToastKind::Warning);
+            }
         }
         // Mirror: a clicked flat face sets the mirror plane (Fusion's Mirror Plane box).
         if (t == FeatureType::Mirror && !selFaces_.empty()) {
@@ -509,6 +630,18 @@ void App::syncToolFromSelection() {
             }
             if (!ordered.empty()) tdlg_.targets.push_back(ordered[0]);
             for (size_t i = 1; i < ordered.size(); ++i) tdlg_.tools.push_back(ordered[i]);
+        } else if (t == FeatureType::Pattern && tdlg_.patFaces) {
+            // Faces to copy: what is picked now, unless the axis or path box has the clicks.
+            if (!tdlg_.pickWait) {
+                std::set<SubRef> keep;
+                for (const SubRef& s : selFaces_) {
+                    TargetRef r = refOfBody(s.first);
+                    if (r.first && r.first != tdlg_.featureId) keep.insert(s);
+                }
+                tdlg_.patFaceSel = keep;
+                selFaces_ = keep;
+            }
+            tdlg_.targets.clear();
         } else {
             tdlg_.targets = refs;
         }
@@ -624,6 +757,7 @@ void App::syncToolFromSelection() {
 // ===================================================================== command start
 
 void App::startToolFeature(FeatureType type) {
+    focusFieldBuf_ = nullptr;
     if (dlg_.open) closeFeatureDialog(true);
     if (tdlg_.open) closeToolDialog(true);
     if (sk_.active) finishSketch();
@@ -744,7 +878,13 @@ void App::startToolFeature(FeatureType type) {
     }
     // Faces picked for an edge tool become their edges; edges picked for a face tool are dropped.
     if (kind == 2 || kind == 3 || kind == 5 || kind == 6) selEdges_.clear();
-    if (bodyPickTool(type)) {
+    if (type == FeatureType::Pattern && selection_.empty() && !selFaces_.empty()) {
+        // Faces picked first (a hole's wall): the pattern copies those faces.
+        tdlg_.patFaces = true;
+        tdlg_.patFaceSel = selFaces_;
+        selEdges_.clear();
+        activePickFilter_ = PickFace;
+    } else if (bodyPickTool(type)) {
         // Faces and edges stand for their bodies.
         for (uint32_t b : selectedBodies()) {
             if (!selection_.count(b)) selOrder_.push_back(b);
@@ -758,6 +898,8 @@ void App::startToolFeature(FeatureType type) {
     syncToolFromSelection();
     if (kind >= 0 && tdlg_.targets.empty())
         toast(kind <= 1 ? "Click the edges (or faces) to round" : "Click the faces to use");
+    else if (type == FeatureType::Pattern && tdlg_.patFaces)
+        toast("Faces picked. Press Pick axis, then click what to go around");
     else if (bodyPickTool(type) && tdlg_.targets.empty())
         toast(type == FeatureType::Combine ? "Click the target body, then the tool bodies" : "Click the bodies to use");
 }
@@ -787,7 +929,12 @@ void App::runCircPattern() {
         std::snprintf(tdlg_.v1, sizeof tdlg_.v1, "6");
         std::snprintf(tdlg_.v2, sizeof tdlg_.v2, "360");
         tdlg_.option = 2;
-        activePickFilter_ = PickBody | PickEdge;   // bodies to copy, an edge for the axis
+        // Bodies (or faces) first; ones already picked go straight to the axis (a round or flat face, or an edge).
+        tdlg_.patFaces = tdlg_.targets.empty() && !selFaces_.empty();
+        tdlg_.patFaceSel = tdlg_.patFaces ? selFaces_ : std::set<SubRef>{};
+        tdlg_.pickWait = !tdlg_.targets.empty() || !tdlg_.patFaceSel.empty();
+        tdlg_.axisName.clear();
+        activePickFilter_ = tdlg_.pickWait ? (PickFace | PickEdge) : patternObjectFilter(tdlg_.patFaces, 1);
         applyToolDialog();
     }
 }
@@ -805,8 +952,10 @@ void App::runPathPattern() {
         tdlg_.pathBody = {0, 0};
         tdlg_.pathEdge = 0;
         tdlg_.axisName.clear();
-        tdlg_.pickWait = !tdlg_.targets.empty();
-        activePickFilter_ = tdlg_.pickWait ? PickEdge : PickBody;
+        tdlg_.patFaces = tdlg_.targets.empty() && !selFaces_.empty();
+        tdlg_.patFaceSel = tdlg_.patFaces ? selFaces_ : std::set<SubRef>{};
+        tdlg_.pickWait = !tdlg_.targets.empty() || !tdlg_.patFaceSel.empty();
+        activePickFilter_ = tdlg_.pickWait ? PickEdge : patternObjectFilter(tdlg_.patFaces, 2);
         applyToolDialog();
     }
 }
@@ -1120,11 +1269,6 @@ void App::runSweep() {
 }
 
 void App::runLoft() {
-    auto sk = sketchesBeforeMarker();
-    if (sk.empty()) {
-        toast("Loft needs a profile sketch", ToastKind::Warning);
-        return;
-    }
     if (dlg_.open) closeFeatureDialog(true);
     if (tdlg_.open) closeToolDialog(true);
     if (sk_.active) finishSketch();
@@ -1133,8 +1277,8 @@ void App::runLoft() {
     f.id = doc_.newId();
     f.type = FeatureType::Loft;
     f.name = defaultName(doc_, FeatureType::Loft);
+    // Fusion's Loft: click the sections in order, sketch profiles or flat faces of bodies.
     auto m = std::make_shared<MultiSketchParams>();
-    for (auto& [id, name] : sk) m->sketchIds.push_back(id);
     f.multi = m;
     int pos = std::clamp(doc_.markerPos, 0, (int)doc_.timeline.size());
     doc_.timeline.insert(doc_.timeline.begin() + pos, f);
@@ -1145,10 +1289,63 @@ void App::runLoft() {
     tdlg_.open = true;
     tdlg_.featureId = f.id;
     tdlg_.type = f.type;
-    tdlg_.sketchIds = m->sketchIds;
-    activePickFilter_ = 0;
+    activePickFilter_ = PickProfile | PickFace;
     clearSelection();
     applyToolDialog();
+}
+
+// The loft's sections follow the canvas picks, kept in the order they were clicked.
+void App::syncLoftPicks() {
+    std::vector<std::pair<int, SubRef>> now;
+    for (auto& r : selProfiles_) now.push_back({0, r});
+    for (auto& r : selFaces_) now.push_back({1, r});
+    auto has = [](const std::vector<std::pair<int, SubRef>>& v, const std::pair<int, SubRef>& x) {
+        return std::find(v.begin(), v.end(), x) != v.end();
+    };
+    for (size_t i = 0; i < tdlg_.loftSel.size();) {
+        if (!has(now, tdlg_.loftSel[i])) {
+            tdlg_.loftSel.erase(tdlg_.loftSel.begin() + (ptrdiff_t)i);
+            if (i < tdlg_.loftPicks.size()) tdlg_.loftPicks.erase(tdlg_.loftPicks.begin() + (ptrdiff_t)i);
+        } else {
+            ++i;
+        }
+    }
+    for (auto& it : now) {
+        if (has(tdlg_.loftSel, it)) continue;
+        LoftPick lp;
+        if (it.first == 0) {
+            auto sit = doc_.sketches.find(it.second.first);
+            if (sit == doc_.sketches.end()) continue;
+            const auto& profs = sketchProfiles(sit->second);
+            if (it.second.second >= profs.size()) continue;
+            lp.sketchId = it.second.first;
+            lp.pt = profileSamplePoint(profs[it.second.second]);
+        } else {
+            uint32_t bid = it.second.first;
+            auto bit = doc_.bodies.find(bid);
+            auto pit = bit != doc_.bodies.end() ? doc_.parts.find(bit->second.partId) : doc_.parts.end();
+            glm::dvec3 c, n;
+            bool planar = false;
+            TargetRef ref = refOfBody(bid);
+            if (ref.first == tdlg_.featureId) {   // the loft's own result: it cannot loft from itself
+                toast("That face belongs to this loft's own result. Pick faces of other bodies.", ToastKind::Warning);
+                selFaces_.erase(it.second);
+                continue;
+            }
+            if (pit == doc_.parts.end() || !pit->second.shape || !ref.first ||
+                !kernel::faceInfo(pit->second.shape, it.second.second, c, n, planar) || !planar) {
+                toast("Loft takes flat faces and sketch profiles (that face is curved)", ToastKind::Warning);
+                selFaces_.erase(it.second);
+                continue;
+            }
+            lp.face.feature = ref.first;
+            lp.face.slot = ref.second;
+            lp.face.face = it.second.second;
+            lp.face.faceTotal = kernel::faceCount(pit->second.shape);
+        }
+        tdlg_.loftPicks.push_back(lp);
+        tdlg_.loftSel.push_back(it);
+    }
 }
 
 void App::runDraft() { startToolFeature(FeatureType::Draft); }
@@ -1308,9 +1505,20 @@ std::string App::applySection(bool on) {
 
 void App::runMeasure() {
     measureMode_ = !measureMode_;
-    measurePicks_.clear();
-    measureDist_ = -1;
-    if (measureMode_) toast("Measure: Distance, Angle, Radius, Area, or Loop. Esc exits.");
+    clearMeasure();
+    if (measureMode_ && sk_.active) {
+        // In a sketch: whatever was being drawn stops (Fusion), the sketch stays open.
+        sk_.tool.clear();
+        sk_.step = 0;
+        sk_.clicks.clear();
+        sk_.picks.clear();
+        sk_.dimPlacing = false;
+        sk_.chainStart = 0;
+        sk_.hoverEnt = sk_.hoverCon = 0;
+        sk_.snapRefPoly.clear();
+    }
+    if (measureMode_) toast(sk_.active ? "Measure: click sketch points, lines, circles, or the part. Esc goes back to the sketch."
+                                       : "Measure: Distance, Angle, Radius, Area, or Loop. Esc exits.");
     activity();
 }
 
@@ -1395,41 +1603,112 @@ void App::convertToSolid(uint32_t bodyId) {
 void App::drawMeasurePanel() {
     if (!measureMode_) return;
     const float S = uiScale_;
+    auto num = [](double v) {
+        char b[48];
+        std::snprintf(b, sizeof b, "%.4f", v);
+        std::string t = b;
+        while (t.find('.') != std::string::npos && !t.empty() && t.back() == '0') t.pop_back();
+        if (!t.empty() && t.back() == '.') t.pop_back();
+        return t == "-0" ? std::string("0") : t;
+    };
+    // What was measured, in the viewport: the closest points (orange, with the value) and, for round
+    // picks, the line between their centers (blue).
+    {
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        auto seg = [&](const glm::dvec3& a, const glm::dvec3& b, ImU32 col, const std::string& label) {
+            ImVec2 sa, sb;
+            if (!worldToScreen(a, sa) || !worldToScreen(b, sb)) return;
+            dl->AddLine(sa, sb, IM_COL32(20, 20, 20, 160), 4.f * S);
+            dl->AddLine(sa, sb, col, 2.f * S);
+            dl->AddCircleFilled(sa, 4.f * S, col);
+            dl->AddCircleFilled(sb, 4.f * S, col);
+            if (label.empty()) return;
+            ImVec2 mid((sa.x + sb.x) * 0.5f + 8 * S, (sa.y + sb.y) * 0.5f - 8 * S);
+            ImVec2 ts = ImGui::CalcTextSize(label.c_str());
+            dl->AddRectFilled(ImVec2(mid.x - 4 * S, mid.y - 2 * S), ImVec2(mid.x + ts.x + 4 * S, mid.y + ts.y + 2 * S), IM_COL32(25, 27, 32, 220), 4 * S);
+            dl->AddText(mid, col, label.c_str());
+        };
+        // Sketch curves: the picked ones stay lit, the one under the cursor lights up.
+        for (auto& pk : measurePicks_)
+            if (pk.sketch) drawSketchCurve(pk.sketch, pk.ent, IM_COL32(70, 150, 255, 255), 3.5f * S);
+        if (viewportHovered_ && !measureBusy_) {
+            uint32_t hs = 0, he = 0;
+            float hd = 0;
+            ImVec2 mp = ImGui::GetIO().MousePos;
+            uint32_t ps = 0, pe = 0;
+            float pd = 0;
+            if (sketchPointUnder(mp.x, mp.y, ps, pe, pd) && (hov_.kind != HoverKind::Edge || pd < 7.f * S))
+                drawSketchCurve(ps, pe, IM_COL32(255, 190, 70, 255), 3.5f * S);
+            else if (sketchCurveAt(mp.x, mp.y, hs, he, hd) && (hov_.kind != HoverKind::Edge || hd < 5.f * S))
+                drawSketchCurve(hs, he, IM_COL32(255, 190, 70, 255), 3.5f * S);
+        }
+        if (measureCenterLine_) seg(measureCa_, measureCb_, IM_COL32(90, 170, 255, 255), "");
+        if (measureLine_ && measureDist_ >= 0) seg(measurePa_, measurePb_, IM_COL32(255, 140, 60, 255), num(measureDist_) + " mm");
+    }
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x - 150 * S, vp->Pos.y + 118 * S), ImGuiCond_Appearing, ImVec2(1.f, 0.f));
-    ImGui::SetNextWindowSize(ImVec2(280 * S, 0), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(320 * S, 0), ImGuiCond_Always);
     bool open = true;
     ImGui::Begin("MEASURE###measure", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoResize);
-    const char* kinds[] = {"Distance", "Angle", "Radius", "Area", "Loop"};
+    const char* kinds[] = {"Distance", "Angle", "Radius", "Area", "Loop", "Alignment (level, centered)"};
     int before = measureKind_;
     ImGui::SetNextItemWidth(-1);
-    if (ImGui::Combo("##mkind", &measureKind_, kinds, 5) && measureKind_ != before) {
-        measurePicks_.clear();
-        measureDist_ = -1;
+    if (ImGui::Combo("##mkind", &measureKind_, kinds, 6) && measureKind_ != before) {
+        clearMeasure();
         activity();
     }
     if (measurePicks_.empty()) {
-        if (measureKind_ == 0) ImGui::TextDisabled("Click two edges, faces or bodies");
-        else if (measureKind_ == 1) ImGui::TextDisabled("Click two edges, or two flat faces");
+        if (measureKind_ == 0) ImGui::TextDisabled("Click two edges, faces, bodies or sketch lines");
+        else if (measureKind_ == 1) ImGui::TextDisabled("Click two straight edges or flat faces");
         else if (measureKind_ == 2) ImGui::TextDisabled("Click a round face or a circular edge");
         else if (measureKind_ == 3) ImGui::TextDisabled("Click a face");
+        else if (measureKind_ == 5) {
+            ImGui::PushTextWrapPos(0.f);
+            ImGui::TextDisabled("Click two faces or edges. It tells you if they are parallel, level (two flat faces) and centered, and by how much they are off. A ring's flat face and a cylinder's top, or two round faces, show if they are on one axis.");
+            ImGui::PopTextWrapPos();
+        }
         else ImGui::TextDisabled("Click a face, or an edge of a loop");
-    } else ImGui::Text("1. %s", measurePicks_[0].name.c_str());
-    if (measurePicks_.size() > 1) ImGui::Text("2. %s", measurePicks_[1].name.c_str());
+    }
+    for (size_t i = 0; i < measurePicks_.size() && i < 2; ++i) {
+        ImGui::Text("%d. %s", (int)i + 1, measurePicks_[i].name.c_str());
+        if (!measurePicks_[i].info.empty()) {
+            ImGui::PushTextWrapPos(0.f);
+            ImGui::TextDisabled("   %s", measurePicks_[i].info.c_str());
+            ImGui::PopTextWrapPos();
+        }
+    }
     ImGui::Spacing();
     if (measureBusy_) ImGui::TextUnformatted("measuring...");
-    else if (measureDist_ >= 0) {
+    else if (measureDist_ >= 0 && measureKind_ == 5) {
+        // The verdict first (bold), then each check with its number.
+        ImGui::PushTextWrapPos(0.f);
+        for (size_t i = 0; i < measureLines_.size(); ++i) {
+            if (i == 0) {
+                ImGui::PushFont(fonts_.bold, 0.f);
+                bool good = measureLines_[0] == "Lined up";
+                ImGui::TextColored(good ? ImVec4(0.35f, 0.8f, 0.45f, 1.f) : ImVec4(1.f, 0.55f, 0.3f, 1.f), "%s", measureLines_[0].c_str());
+                ImGui::PopFont();
+            } else if (i + 1 == measureLines_.size()) {
+                ImGui::TextDisabled("%s", measureLines_[i].c_str());
+            } else {
+                ImGui::TextUnformatted(measureLines_[i].c_str());
+            }
+        }
+        ImGui::PopTextWrapPos();
+        if (measureCenterLine_) ImGui::TextDisabled("Blue: from one center to the other.");
+    } else if (measureDist_ >= 0) {
         const char* unit[] = {"mm", "deg", "mm", "mm2", "mm"};
         int k = std::clamp(measureKind_, 0, 4);
         ImGui::PushFont(fonts_.bold, 0.f);
-        ImGui::Text("%s  %s %s", kinds[k], fmtT(measureDist_).c_str(), unit[k]);
+        ImGui::Text("%s  %s %s", kinds[k], num(measureDist_).c_str(), unit[k]);
         ImGui::PopFont();
-    } else if (!measurePicks_.empty()) ImGui::TextUnformatted("-");
+        ImGui::PushTextWrapPos(0.f);
+        for (auto& l : measureLines_) ImGui::TextUnformatted(l.c_str());
+        ImGui::PopTextWrapPos();
+        if (measureKind_ == 0 && measureLine_) ImGui::TextDisabled("Orange: closest points. Blue: centers.");
+    } else if ((int)measurePicks_.size() >= (measureKind_ <= 1 || measureKind_ == 5 ? 2 : 1)) ImGui::TextUnformatted("-");
     ImGui::Spacing();
-    if (ImGui::Button("Clear")) {
-        measurePicks_.clear();
-        measureDist_ = -1;
-    }
+    if (ImGui::Button("Clear")) clearMeasure();
     ImGui::SameLine();
     if (ImGui::Button("Close")) open = false;
     ImGui::End();
@@ -1649,6 +1928,15 @@ void App::fillToolDlgFromParams(const Feature& f) {
         tdlg_.axisO = f.pattern->axisO;
         tdlg_.axisD = f.pattern->axisD;
         tdlg_.targets = f.pattern->targets;
+        tdlg_.patFaces = !f.pattern->faces.empty();
+        tdlg_.patFaceSel.clear();
+        for (auto& [ti, fc] : f.pattern->faces) {
+            if (ti >= f.pattern->faceTargets.size()) continue;
+            const TargetRef& r = f.pattern->faceTargets[ti];
+            std::vector<uint32_t> ids = doc_.featureBodies(r.first);
+            if (r.second < ids.size()) tdlg_.patFaceSel.insert({ids[r.second], fc});
+        }
+        if (tdlg_.patFaces) selFaces_ = tdlg_.patFaceSel;
         if (f.pattern->onPath) {
             std::snprintf(tdlg_.v2, sizeof tdlg_.v2, "%s", f.pattern->spacingExpr.c_str());
             tdlg_.option = f.pattern->distType;
@@ -1682,6 +1970,7 @@ void App::fillToolDlgFromParams(const Feature& f) {
         tdlg_.targets = f.split->targets;
         tdlg_.axisO = f.split->toolO;
         tdlg_.axisD = f.split->toolN;
+        tdlg_.axisR = f.split->toolR;
         tdlg_.axisName = f.split->toolName;
         tdlg_.selA = (int)f.split->sketchId;
         tdlg_.selB = (int)f.split->sketchEnt;
@@ -1717,6 +2006,8 @@ void App::fillToolDlgFromParams(const Feature& f) {
             tdlg_.option2 = f.multi->thinSide;
         }
         if (f.type == FeatureType::Loft) {
+            tdlg_.loftPicks = f.multi->picks;
+            tdlg_.loftSel.clear();   // rebuilt below with the canvas selection
             tdlg_.option2 = f.multi->pointEnd;
             std::snprintf(tdlg_.v1, sizeof tdlg_.v1, "%s", f.multi->pointX.c_str());
             std::snprintf(tdlg_.v2, sizeof tdlg_.v2, "%s", f.multi->pointY.c_str());
@@ -1848,6 +2139,30 @@ void App::editToolFeature(Feature& f) {
             if (uint32_t b = bodyOf(r)) { selection_.insert(b); selOrder_.push_back(b); }
     } else if (f.type == FeatureType::Thread && tdlg_.thread.face.feature) {
         if (uint32_t b = bodyOf({tdlg_.thread.face.feature, tdlg_.thread.face.slot})) selFaces_.insert({b, tdlg_.thread.face.face});
+    } else if (f.type == FeatureType::Loft) {
+        // The clicked sections again, in their order (a pick that no longer resolves is dropped).
+        activePickFilter_ = PickProfile | PickFace;
+        std::vector<LoftPick> kept;
+        tdlg_.loftSel.clear();
+        for (const LoftPick& lp : tdlg_.loftPicks) {
+            std::pair<int, SubRef> sel{-1, {0, 0}};
+            if (lp.sketchId) {
+                auto sit = doc_.sketches.find(lp.sketchId);
+                if (sit != doc_.sketches.end()) {
+                    const auto& profs = sketchProfiles(sit->second);
+                    for (size_t i = 0; i < profs.size(); ++i)
+                        if (sk::pointInProfile(profs[i], lp.pt)) { sel = {0, {lp.sketchId, (uint32_t)i}}; break; }
+                }
+                if (sel.first == 0) selProfiles_.insert(sel.second);
+            } else if (uint32_t b = bodyOf({lp.face.feature, lp.face.slot})) {
+                sel = {1, {b, lp.face.face}};
+                selFaces_.insert(sel.second);
+            }
+            if (sel.first < 0) continue;
+            kept.push_back(lp);
+            tdlg_.loftSel.push_back(sel);
+        }
+        if (!tdlg_.loftPicks.empty()) tdlg_.loftPicks = kept;
     }
     markSceneDirty();
     if (f.type == FeatureType::PressPull) syncToolFromSelection();
@@ -1978,7 +2293,18 @@ void App::applyToolDialog() {
         p->circular = tdlg_.option2 == 1;
         p->countYExpr = tdlg_.v3;
         p->spacingYExpr = tdlg_.v4;
-        p->targets = tdlg_.targets;
+        p->targets = tdlg_.patFaces ? std::vector<TargetRef>{} : tdlg_.targets;
+        p->faceTargets.clear();
+        p->faces.clear();
+        if (tdlg_.patFaces)
+            for (const SubRef& s : tdlg_.patFaceSel) {
+                TargetRef r = refOfBody(s.first);
+                if (!r.first || r.first == tdlg_.featureId) continue;
+                auto it = std::find(p->faceTargets.begin(), p->faceTargets.end(), r);
+                uint32_t idx = (uint32_t)(it - p->faceTargets.begin());
+                if (it == p->faceTargets.end()) p->faceTargets.push_back(r);
+                p->faces.push_back({idx, s.second});
+            }
         if (p->onPath) {
             p->spacingExpr = tdlg_.v2;
             p->distType = tdlg_.option == 1 ? 1 : 0;
@@ -2023,6 +2349,7 @@ void App::applyToolDialog() {
         sp->targets = tdlg_.targets;
         sp->toolO = tdlg_.axisO;
         sp->toolN = tdlg_.axisD;
+        sp->toolR = tdlg_.option == 3 ? tdlg_.axisR : 0.0;
         sp->toolName = tdlg_.axisName;
         sp->sketchId = tdlg_.option == 3 ? (uint32_t)std::max(0, tdlg_.selA) : 0;
         sp->sketchEnt = tdlg_.option == 3 ? (uint32_t)std::max(0, tdlg_.selB) : 0;
@@ -2074,6 +2401,7 @@ void App::applyToolDialog() {
                     m->railIds.push_back(id);
         }
         if (f.type == FeatureType::Loft) {
+            m->picks = tdlg_.loftPicks;
             m->pointEnd = tdlg_.option2;
             m->pointX = tdlg_.v1;
             m->pointY = tdlg_.v2;
@@ -2213,6 +2541,7 @@ void App::closeToolDialog(bool ok) {
         else if (kind == 2) empty = tdlg_.targets.empty();
         else if (f.type == FeatureType::Dovetail) empty = false;   // makes its own bodies without targets
         else if (f.type == FeatureType::Align) empty = tdlg_.align.from.ref.first == 0 || tdlg_.align.to.ref.first == 0;
+        else if (f.type == FeatureType::Pattern && tdlg_.patFaces) empty = tdlg_.patFaceSel.empty();
         else if (bodyPickTool(f.type)) empty = tdlg_.targets.empty();
         else if (f.type == FeatureType::Thread) empty = tdlg_.thread.face.feature == 0;
         else if (f.type == FeatureType::SplitFace && !tdlg_.editing && f.splitFace && f.splitFace->offsetExpr.empty() && f.splitFace->sketchId == 0) {
@@ -2393,7 +2722,13 @@ void App::drawToolDialog() {
         ImGui::PushID(l);
         label(l);
         ImGui::SetNextItemWidth(-40 * S);
-        if (tdlg_.focus) { ImGui::SetKeyboardFocusHere(); tdlg_.focus = false; }
+        // The Move arrow or ring just clicked puts the cursor in its own field, its value selected,
+        // so typing a number goes straight to that axis.
+        if (tdlg_.focus || (focusFieldBuf_ && focusFieldBuf_ == buf)) {
+            ImGui::SetKeyboardFocusHere();
+            tdlg_.focus = false;
+            focusFieldBuf_ = nullptr;
+        }
         ImGui::InputText("##v", buf, 64, ImGuiInputTextFlags_AutoSelectAll);
         if (live && ImGui::IsItemEdited()) {
             try { peval::eval(buf, doc_.params); commit(); } catch (const std::runtime_error&) {}
@@ -2498,7 +2833,27 @@ void App::drawToolDialog() {
         ImGui::SetItemTooltip("Dragging the arrow near another flat face stops it on that face's plane.\nHold Alt while dragging to skip snapping.");
         ImGui::TextDisabled("Drag the arrow or type. Negative goes in.");
     } else if (f.type == FeatureType::Pattern) {
-        picks("Objects", tdlg_.targets.size(), "body", "Select bodies");
+        {
+            // Fusion's Pattern Type: whole bodies, or faces (a hole, a pocket, a boss) copied within their body.
+            const char* objs[] = {"Bodies", "Faces"};
+            int ok = tdlg_.patFaces ? 1 : 0;
+            label("Objects");
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::Combo("##patobj", &ok, objs, 2) && (ok == 1) != tdlg_.patFaces) {
+                tdlg_.patFaces = ok == 1;
+                tdlg_.pickWait = false;
+                tdlg_.patFaceSel.clear();
+                selFaces_.clear();
+                selection_.clear();
+                selOrder_.clear();
+                tdlg_.targets.clear();
+                activePickFilter_ = patternObjectFilter(tdlg_.patFaces, tdlg_.option2);
+                commit();
+            }
+            ImGui::SetItemTooltip("Faces: click the faces of a hole, pocket or boss (a plain hole: its wall; a counterbore: both walls).\nThe copies are cut into, or added onto, that same body.");
+        }
+        if (tdlg_.patFaces) picks("Faces", tdlg_.patFaceSel.size(), "face", "Click the faces to copy");
+        else picks("Objects", tdlg_.targets.size(), "body", "Select bodies");
         const char* kinds[] = {"Rectangular", "Circular", "Along Path"};
         int k = tdlg_.option2;
         label("Type");
@@ -2510,7 +2865,8 @@ void App::drawToolDialog() {
                 std::snprintf(tdlg_.v1, sizeof tdlg_.v1, "6");
                 std::snprintf(tdlg_.v2, sizeof tdlg_.v2, "360");
                 tdlg_.option = 2;
-                activePickFilter_ = PickBody | PickEdge;
+                tdlg_.pickWait = !tdlg_.targets.empty() || !tdlg_.patFaceSel.empty();
+                activePickFilter_ = tdlg_.pickWait ? (PickFace | PickEdge) : patternObjectFilter(tdlg_.patFaces, 1);
             } else if (k == 2) {
                 std::snprintf(tdlg_.v1, sizeof tdlg_.v1, "4");
                 std::snprintf(tdlg_.v2, sizeof tdlg_.v2, "20");
@@ -2518,10 +2874,10 @@ void App::drawToolDialog() {
                 tdlg_.option3 = 0;
                 tdlg_.flag = false;
                 tdlg_.axisName.clear();
-                tdlg_.pickWait = !tdlg_.targets.empty();
-                activePickFilter_ = tdlg_.pickWait ? PickEdge : PickBody;
+                tdlg_.pickWait = !tdlg_.targets.empty() || !tdlg_.patFaceSel.empty();
+                activePickFilter_ = tdlg_.pickWait ? PickEdge : patternObjectFilter(tdlg_.patFaces, 2);
             } else {
-                activePickFilter_ = PickBody;
+                activePickFilter_ = patternObjectFilter(tdlg_.patFaces, 0);
                 std::snprintf(tdlg_.v1, sizeof tdlg_.v1, "3");
                 std::snprintf(tdlg_.v2, sizeof tdlg_.v2, "20");
             }
@@ -2537,7 +2893,7 @@ void App::drawToolDialog() {
             if (picking) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.f, 0.42f, 0.21f, 1.f));
             if (ImGui::Button(picking ? "Click a curve or an edge..." : "Pick path", ImVec2(-1, 0))) {
                 tdlg_.pickWait = !tdlg_.pickWait;
-                activePickFilter_ = tdlg_.pickWait ? PickEdge : PickBody;
+                activePickFilter_ = tdlg_.pickWait ? PickEdge : patternObjectFilter(tdlg_.patFaces, 2);
             }
             if (picking) ImGui::PopStyleColor();
             if (!tdlg_.axisName.empty()) ImGui::TextDisabled("%s", tdlg_.axisName.c_str());
@@ -2550,9 +2906,20 @@ void App::drawToolDialog() {
             label("Flip");
             if (ImGui::Checkbox("##pflip", &tdlg_.flag)) commit();
         } else {
-            const char* axes[] = {"X Axis", "Y Axis", "Z Axis", "Picked edge"};
+            // Fusion's two boxes: Objects (the bodies), then Axis (a face or edge to turn around).
+            bool picking = tdlg_.pickWait;
+            if (picking) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.f, 0.42f, 0.21f, 1.f));
+            if (ImGui::Button(picking ? "Click a face or edge to go around..." : "Pick axis (face or edge)", ImVec2(-1, 0))) {
+                tdlg_.pickWait = !tdlg_.pickWait;
+                activePickFilter_ = tdlg_.pickWait ? (PickFace | PickEdge) : patternObjectFilter(tdlg_.patFaces, 1);
+            }
+            if (picking) ImGui::PopStyleColor();
+            ImGui::SetItemTooltip("Pick the bodies (or faces) first, then this, then click a round face (a cylinder, a hole),\na flat face (turns around its normal) or an edge.");
+            if (!picking && (!tdlg_.targets.empty() || !tdlg_.patFaceSel.empty()) && tdlg_.option != 3)
+                ImGui::TextDisabled(tdlg_.patFaces ? "Faces picked. Now Pick axis." : "Bodies picked. Now the axis.");
+            const char* axes[] = {"X Axis", "Y Axis", "Z Axis", "Picked"};
             combo("Axis", "##pataxis", tdlg_.option, axes, tdlg_.option == 3 ? 4 : 3);
-            ImGui::TextDisabled("Or click a round or straight edge");
+            if (tdlg_.option == 3 && !tdlg_.axisName.empty()) ImGui::TextDisabled("%s", tdlg_.axisName.c_str());
             exprField("Quantity", tdlg_.v1, "");
             exprField("Total Angle", tdlg_.v2, "deg");
         }
@@ -2949,19 +3316,58 @@ void App::drawToolDialog() {
     } else if (f.type == FeatureType::Loft) {
         auto names = sketchesBeforeMarker();
         ImGui::TextUnformatted("Profiles (in order)");
-        for (auto& [sid, name] : names) {
-            bool on = std::find(tdlg_.sketchIds.begin(), tdlg_.sketchIds.end(), sid) != tdlg_.sketchIds.end();
-            ImGui::PushID((int)sid);
-            if (ImGui::Checkbox(name.c_str(), &on)) {
-                if (!on) tdlg_.sketchIds.erase(std::remove(tdlg_.sketchIds.begin(), tdlg_.sketchIds.end(), sid), tdlg_.sketchIds.end());
-                else tdlg_.sketchIds.push_back(sid);
-                commit();
+        // Fusion's way: click sketch profiles or flat faces in the canvas, one after another.
+        int removeAt = -1;
+        for (size_t i = 0; i < tdlg_.loftPicks.size(); ++i) {
+            const LoftPick& lp = tdlg_.loftPicks[i];
+            std::string what;
+            if (lp.sketchId) {
+                auto sit = doc_.sketches.find(lp.sketchId);
+                what = "Profile in " + (sit != doc_.sketches.end() ? sit->second.name : std::string("a sketch"));
+            } else {
+                std::vector<uint32_t> ids = doc_.featureBodies(lp.face.feature);
+                uint32_t b = lp.face.slot < ids.size() ? ids[lp.face.slot] : 0;
+                auto bit = doc_.bodies.find(b);
+                what = "Face of " + (bit != doc_.bodies.end() ? bit->second.name : std::string("a body"));
             }
+            ImGui::PushID((int)i + 300000);
+            ImGui::AlignTextToFramePadding();
+            ImGui::Text("%d. %s", (int)i + 1, what.c_str());
+            ImGui::SameLine(ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX() - 22 * S);
+            if (ImGui::SmallButton("x")) removeAt = (int)i;
+            ImGui::SetItemTooltip("Take this section out");
             ImGui::PopID();
         }
+        if (removeAt >= 0) {
+            if ((size_t)removeAt < tdlg_.loftSel.size()) {
+                auto it = tdlg_.loftSel[(size_t)removeAt];
+                if (it.first == 0) selProfiles_.erase(it.second);
+                else selFaces_.erase(it.second);
+                tdlg_.loftSel.erase(tdlg_.loftSel.begin() + removeAt);
+            }
+            tdlg_.loftPicks.erase(tdlg_.loftPicks.begin() + removeAt);
+            markSceneDirty();
+            commit();
+        }
+        if (tdlg_.loftPicks.empty() && tdlg_.sketchIds.empty())
+            ImGui::TextDisabled("Click sketch profiles or flat faces of bodies,\nin the order the loft goes through them.\n(A sketch must be visible to click its profile.)");
+        if (tdlg_.loftPicks.empty() && !tdlg_.sketchIds.empty()) {
+            // A loft made before picking: whole sketches, ticked here.
+            for (auto& [sid, name] : names) {
+                bool on = std::find(tdlg_.sketchIds.begin(), tdlg_.sketchIds.end(), sid) != tdlg_.sketchIds.end();
+                ImGui::PushID((int)sid);
+                if (ImGui::Checkbox(name.c_str(), &on)) {
+                    if (!on) tdlg_.sketchIds.erase(std::remove(tdlg_.sketchIds.begin(), tdlg_.sketchIds.end(), sid), tdlg_.sketchIds.end());
+                    else tdlg_.sketchIds.push_back(sid);
+                    commit();
+                }
+                ImGui::PopID();
+            }
+        }
+        size_t nSec = tdlg_.loftPicks.empty() ? tdlg_.sketchIds.size() : tdlg_.loftPicks.size();
         bool pointed = tdlg_.option2 == 1 || tdlg_.option2 == 2;
-        if (pointed && tdlg_.sketchIds.empty()) ImGui::TextDisabled("Pick a profile.");
-        else if (!pointed && tdlg_.sketchIds.size() < 2) ImGui::TextDisabled("Pick at least two.");
+        if (pointed && nSec == 0) ImGui::TextDisabled("Pick a profile.");
+        else if (!pointed && nSec == 1) ImGui::TextDisabled("Now click the next one.");
         const char* ends[] = {"None", "At start", "At end"};
         label("Point");
         ImGui::SetNextItemWidth(-1);
@@ -3000,6 +3406,9 @@ void App::drawToolDialog() {
         if (!pointed) {
         for (auto& [sid, name] : names) {
             if (std::find(tdlg_.sketchIds.begin(), tdlg_.sketchIds.end(), sid) != tdlg_.sketchIds.end()) continue;
+            bool usedByPick = false;
+            for (auto& lp : tdlg_.loftPicks) usedByPick = usedByPick || lp.sketchId == sid;
+            if (usedByPick) continue;
             anyRail = true;
             bool on = std::find(tdlg_.railIds.begin(), tdlg_.railIds.end(), sid) != tdlg_.railIds.end();
             ImGui::PushID((int)sid + 100000);

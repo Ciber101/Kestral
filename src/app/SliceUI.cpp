@@ -3,6 +3,7 @@
 // groups, labels and tooltips, Advanced switch, search); printer and filament settings windows; in
 // Preview the legend at the top left, the layer slider at the right and the move slider at the bottom.
 #include "app/App.h"
+#include "app/SliceStyle.h"
 #include "core/Log.h"
 #include "platform/Platform.h"
 #include "print/OrcaOptions.h"
@@ -14,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <iterator>
 #include <sstream>
 
 namespace kst {
@@ -298,6 +300,7 @@ void App::drawSliceWorkspace() {
         break;
     }
     drawSliceSettingsWindow();
+    drawSavePresetDialog();
     drawSliceSendDialog();
     drawFlushDialog();
 }
@@ -324,11 +327,40 @@ void App::drawSliceSettingsWindow() {
         ImGui::Checkbox("Advanced", &slice_.advanced);
         ImGui::EndChild();
         ImGui::SameLine();
+        ImGui::BeginGroup();
+        {   // Orca's preset bar: which profile, Save, Save as, and the changes not saved yet.
+            std::string type = printer ? "machine" : "filament";
+            const std::string& curName = sliceCurrentPreset(type);
+            const print::Preset* cur = slice_.setup ? print::findPreset(*slice_.setup, type, curName) : nullptr;
+            int unsaved = sliceUnsavedCount(type);
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted(curName.c_str());
+            ImGui::SameLine();
+            ImGui::TextDisabled(cur && cur->user ? "(yours)" : "(built in)");
+            float bw = 84 * S;
+            ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 8 * S, ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX() - bw * 3 - 16 * S));
+            ImGui::BeginDisabled(!unsaved && !(cur && !cur->user));
+            if (sl::orangeButton("Save", ImVec2(bw, 0))) sliceSaveCurrent(type);
+            ImGui::EndDisabled();
+            ImGui::SetItemTooltip(cur && cur->user ? "Save the changes into this profile of yours" : "A built in profile cannot change: save it as your own");
+            ImGui::SameLine();
+            if (ImGui::Button("Save as...", ImVec2(bw, 0))) sliceOpenSaveDialog(type);
+            ImGui::SetItemTooltip("Save as a new profile of yours, with its own name");
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!unsaved);
+            if (ImGui::Button("Reset", ImVec2(bw, 0))) {
+                for (auto it = slice_.overrides.begin(); it != slice_.overrides.end();)
+                    it = sliceOwnerOf(it->first) == type ? slice_.overrides.erase(it) : std::next(it);
+            }
+            ImGui::EndDisabled();
+            ImGui::SetItemTooltip("Undo the changes not saved yet (back to the profile)");
+            if (unsaved) ImGui::TextColored(sl::changed(), "%d change%s not saved into the profile yet (kept until you save or reset)", unsaved, unsaved == 1 ? "" : "s");
+            else ImGui::TextDisabled("No unsaved changes");
+        }
         ImGui::BeginChild("##opts", ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding);
         if (!pages.empty()) drawOrcaPage(tab, pages[(size_t)slice_.editPage], "");
-        ImGui::Dummy(ImVec2(0, 8 * S));
-        ImGui::TextDisabled("Changes apply to the next slice. The profile itself is not changed.");
         ImGui::EndChild();
+        ImGui::EndGroup();
     }
     ImGui::End();
     if (!open) slice_.editWin = 0;

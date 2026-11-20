@@ -9,7 +9,7 @@
 
 namespace kst {
 
-enum class SnapKind { None, Grid, Point, OnCurve, Midpoint, Horizontal, Vertical };
+enum class SnapKind { None, Grid, Point, OnCurve, Midpoint, Horizontal, Vertical, Intersection, Angle };
 
 // What the cursor locked onto and what a click there should create.
 struct SnapInfo {
@@ -17,7 +17,33 @@ struct SnapInfo {
     SnapKind kind = SnapKind::None;
     uint32_t point = 0;      // existing point to reuse
     uint32_t curve = 0;      // curve the new point lies on (OnCurve) or the line whose midpoint it is
+    uint32_t curve2 = 0;     // Intersection: the second curve the point lies on. Angle: the snapped angle in degrees
+    // Body edges (not yet in the sketch): curve / curve2 carry kRefBit, and these name the edges.
+    // A click projects them in. refPt: a body corner or circle center at pos.
+    struct Ref { uint32_t body = 0, edge = 0; };
+    Ref ref1, ref2;
+    int refPt = 0;           // 1 corner, 2 center
+    int guide = -1;          // OnCurve where the line's 0/45/90.. degree guide crosses the curve: that angle
 };
+
+constexpr uint32_t kRefBit = 0x80000000u;
+
+// The edges of every shown body, flattened onto the sketch plane, so drawing snaps to them
+// (like Fusion). Rebuilt when the plane, the bodies or their shapes change.
+struct RefCurve {
+    uint32_t body = 0, edge = 0;
+    int type = 3;                       // 0 line, 1 circle, 2 arc (ccw t0..t0+sw), 3 polyline
+    sk::Vec2 a{0, 0}, b{0, 0}, c{0, 0};
+    double r = 0, t0 = 0, sw = 0;
+    std::vector<sk::Vec2> poly;         // for every type
+    sk::Vec2 lo{0, 0}, hi{0, 0};        // bounding box
+};
+struct SketchRefs {
+    uint64_t key = 0;
+    std::vector<RefCurve> curves;
+    std::vector<std::pair<sk::Vec2, int>> pts;   // 1 corner, 2 center
+};
+double refClosest(const RefCurve& c, const sk::Vec2& p, sk::Vec2& q);
 
 // Everything the sketch editor remembers between frames (not part of the document).
 struct SketchState {
@@ -38,6 +64,8 @@ struct SketchState {
     sk::Vec2 raw{0, 0};
     SnapInfo snap;
     std::string snapLabel;
+    SketchRefs refs;                   // body edges to snap to
+    std::vector<sk::Vec2> snapRefPoly; // the body edge under the cursor (drawn while snapping)
 
     // options (Sketch Palette)
     bool optGrid = true, optSnap = true, optProfiles = true, optPoints = true, optDims = true, optCons = true;

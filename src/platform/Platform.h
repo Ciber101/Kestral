@@ -49,6 +49,10 @@ bool launch(const std::string& exe, const std::string& fileArg, std::string& err
 void revealInExplorer(const std::string& path);
 // Windows: mark a file or folder hidden (Explorer hides it). Elsewhere a dot name already does.
 void setHidden(const std::string& path);
+// A lock file this process holds until it ends (also when it crashes: the OS lets go). Another
+// Kestral asks lockHeld() to know whether the files of that instance belong to a running program.
+bool holdLock(const std::string& path);
+bool lockHeld(const std::string& path);
 void openUrl(const std::string& url);   // default browser
 // A desktop notification (Windows: from the tray icon; Linux: notify-send), a sound, and the taskbar
 // button flashing until the window is used. window: the app's native window (HWND), may be null.

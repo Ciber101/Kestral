@@ -39,6 +39,7 @@ struct MeshData {
     uint32_t faceCount = 0;
     uint32_t edgeCount = 0;
     Aabb bounds;
+    double lin = 0;                  // chord error it was made with, mm (0 unknown)
     size_t vertexCount() const { return verts.size() / 6; }
     size_t triCount() const { return indices.size() / 3; }
 };

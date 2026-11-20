@@ -191,16 +191,44 @@ void App::enterSliceWorkspace(int tab) {
     if (tdlg_.open) closeToolDialog(true);
     if (sk_.active) finishSketch();
     if (sliceWs_) { if (tab >= 0) sliceActivate(tab); return; }
-    // The tab: the one asked for, else the open design's own (made the first time).
-    if (tab < 0) {
-        tab = sliceTabFor(sliceDocKey());
-        if (tab < 0) {
-            SliceDocState d;
-            d.key = sliceDocKey();
-            d.name = doc_.name;
-            sliceDocs_.push_back(std::move(d));
-            tab = (int)sliceDocs_.size() - 1;
+    // Bodies selected in the design are the ones to print (picked through faces or edges counts too).
+    const std::string key = sliceDocKey();
+    std::set<uint32_t> want;
+    for (uint32_t id : selection_)
+        if (doc_.bodies.count(id)) want.insert(id);
+    if (want.empty()) {
+        for (auto& f : selFaces_) if (doc_.bodies.count(f.first)) want.insert(f.first);
+        for (auto& e : selEdges_) if (doc_.bodies.count(e.first)) want.insert(e.first);
+    }
+    // The tab: like OrcaSlicer projects, each set of bodies gets its own. The same bodies go back to
+    // their tab (sliced again after an edit); other bodies of the same design get a new tab, so
+    // slicing the piston never replaces the O-ring's plate and print. Nothing selected: the tab of
+    // this design used last (or a tab with the whole design).
+    if (tab < 0 || (sliceTabOwns(tab, key) && !want.empty())) {
+        auto onlyOf = [&](int i) -> const std::set<uint32_t>& { return i == sliceActive_ ? slice_.plateOnly : sliceDocs_[(size_t)i].plateOnly; };
+        int found = -1;
+        if (!want.empty()) {
+            for (int i = 0; i < (int)sliceDocs_.size() && found < 0; ++i)
+                if (sliceTabOwns(i, key) && onlyOf(i) == want) found = i;
+        } else if (tab >= 0) {
+            found = tab;
+        } else {
+            found = sliceActive_ >= 0 && sliceTabOwns(sliceActive_, key) ? sliceActive_ : sliceTabFor(key);
         }
+        if (found < 0) {
+            SliceDocState d;
+            d.key = key;
+            d.name = doc_.name;
+            if (!want.empty()) {
+                auto bit = doc_.bodies.find(*want.begin());
+                std::string first = bit != doc_.bodies.end() && !bit->second.name.empty() ? bit->second.name : "body";
+                d.name += ": " + first + (want.size() > 1 ? " +" + std::to_string(want.size() - 1) : std::string());
+            }
+            d.plateOnly = want;
+            sliceDocs_.push_back(std::move(d));
+            found = (int)sliceDocs_.size() - 1;
+        }
+        tab = found;
     }
     sliceActivate(tab);
     sliceWs_ = true;
@@ -208,25 +236,8 @@ void App::enterSliceWorkspace(int tab) {
     slice_.designCam = cam_;
     slice_.haveDesignCam = true;
     slice_.framed = false;
-    // Bodies selected in the design are the ones to print: the plate holds just those.
-    // An empty selection shows every visible body again. (A tab of a design not open stays as it was.)
-    if (slice_.live && sliceTabFor(sliceDocKey()) == sliceActive_) {
-    slice_.plateOnly.clear();
-    for (uint32_t id : selection_) slice_.plateOnly.insert(id);
-    for (auto it = slice_.plateOnly.begin(); it != slice_.plateOnly.end();)
-        it = doc_.bodies.count(*it) ? std::next(it) : slice_.plateOnly.erase(it);
-    if (slice_.plateOnly.empty()) {
-        // Nothing (valid) selected: fall back to whole bodies picked through faces and edges.
-        std::set<uint32_t> picked;
-        for (auto& f : selFaces_) picked.insert(f.first);
-        for (auto& e : selEdges_) picked.insert(e.first);
-        for (auto it = picked.begin(); it != picked.end();)
-            it = doc_.bodies.count(*it) ? std::next(it) : picked.erase(it);
-        slice_.plateOnly = std::move(picked);
-    }
     // The design changed since the last slice: show the design, the old preview is out of date.
-    if (slice_.slicedRev != doc_.revision) slice_.preview = false;
-    }
+    if (slice_.live && sliceTabOwns(sliceActive_, key) && slice_.slicedRev != doc_.revision) slice_.preview = false;
     if (!slice_.choicesLoaded) sliceLoadChoices();
     plateSync();
     if (!slice_.engineVersionAsked) {

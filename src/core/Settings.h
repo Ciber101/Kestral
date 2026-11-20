@@ -12,6 +12,7 @@ struct Settings {
     // Navigation
     bool reverseZoom = false;   // false: wheel forward zooms in
     bool constrainedOrbit = false;
+    bool lockWhileAi = true;        // while an AI works through MCP the design area takes no clicks or keys (Stop takes over)
     bool hideUsedSketches = false;  // a sketch hides once a feature uses it (Fusion). Off: it stays shown
     bool sketchLookAt = false;  // starting a sketch turns the view to face it (off: the camera stays put)
     bool orbitAtPress = false;  // true: every orbit turns around the point pressed (Fusion). false: around the view center

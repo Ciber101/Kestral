@@ -62,7 +62,12 @@ const char* kInstructions =
     "- You can also use the whole program like a person: screenshot shows the window, ui_input clicks, drags, scrolls and types "
     "anywhere (menus, dialogs, the browser, the timeline, the Slice tab, Preferences), get_ui_state says what is open, "
     "list_commands and run_command reach every command, and view, undo, redo, design_tabs, workspace, get_settings, set_setting, "
-    "assistant, get_log and window cover the rest. Prefer the modeling tools when one does the job; use ui_input for everything else.";
+    "assistant, get_log and window cover the rest. Prefer the modeling tools when one does the job; use ui_input for everything else.\n"
+    "- Work in small steps: one tool call, read its answer, then the next. An answer that starts with Failed means that step did "
+    "not work: fix it (often undo, then try again with other values) before going on.\n"
+    "- Delete bodies with delete {names: [...]} and sketches with delete {sketches: [name or id]}. Hide or show with set_visibility.\n"
+    "- Small mistakes in tool or argument names are fixed for you and the answer says how; follow the corrected form next time.\n"
+    "- If an answer says the user pressed Stop, stop calling tools and tell the user where you got to.";
 
 // ---------------------------------------------------------------- HTTP
 
@@ -212,6 +217,7 @@ struct App::McpServer {
     std::mutex mx;   // guards everything below
     std::string lastClient, runningTool, error;
     double lastUse = -1e9;
+    double lastChange = -1e9;   // last call that can change something (not a read only one)
     int calls = 0;
     std::map<std::string, std::shared_ptr<std::atomic<bool>>> inFlight;   // request id -> cancel
     std::map<std::string, std::string> clients;   // session -> client name
@@ -251,7 +257,7 @@ void writeInfo(bool enabled, int port, const std::string& token, const std::stri
 
 // ---------------------------------------------------------------- tool calls
 
-App::McpCall App::mcpRunTool(const std::string& client, const std::string& name, const std::string& args,
+App::McpCall App::mcpRunTool(const std::string& client, const std::string& name0, const std::string& args0,
                              const std::shared_ptr<std::atomic<bool>>& cancel) {
     PostFn post = [this](std::function<void()> fn) {
         jobs_->post(std::move(fn));
@@ -285,10 +291,35 @@ App::McpCall App::mcpRunTool(const std::string& client, const std::string& name,
         });
     };
     McpCall out;
+    // The user pressed Stop: nothing changes until they let the AI continue.
+    if (mcpPaused_.load() && name0 != "get_ui_state" && name0 != "wait_for") {
+        out.text = "Stopped by the user: they pressed Stop in Kestral and took over. Do not call more tools to get around it; "
+                   "tell the user where you got to and wait until they say to go on (they press Let AI continue in Kestral).";
+        out.error = true;
+        return out;
+    }
+    // Forgiving calls: fix the tool name and arguments where the meaning is clear, and say so.
+    std::string fixNote;
+    std::string name = name0;
+    std::string args = args0;
+    {
+        Value pa = Value::parse(args.empty() ? "{}" : args);
+        if (!pa.isObject()) pa = Value::object();
+        bool fatal = false;
+        fixNote = mcpFixCall(name, pa, fatal);
+        if (fatal) {
+            out.text = fixNote;
+            out.error = true;
+            post([this, who, name, t = out.text] { aiLog("mcp " + who + " " + name, t); });
+            return out;
+        }
+        args = pa.dump();
+    }
     if (mcpIsUiTool(name)) {
         Value pa = Value::parse(args.empty() ? "{}" : args);
         out = mcpRunUiTool(client, name, pa.isObject() ? pa : Value::object(), cancel);
         if (out.text.rfind("Error", 0) == 0 || out.text.rfind("Unknown", 0) == 0) out.error = true;
+        if (!fixNote.empty()) out.text = fixNote + out.text;
         post([this, who, name, t = out.text] { aiLog("mcp " + who + " " + name, t); });
         return out;
     }
@@ -362,7 +393,10 @@ App::McpCall App::mcpRunTool(const std::string& client, const std::string& name,
         auto fut = prom->get_future();
         auto before = std::make_shared<std::set<uint32_t>>();
         auto failedBefore = std::make_shared<std::set<uint32_t>>();
-        post([this, prom, name, a, before, failedBefore, who] {
+        // Opening or switching designs: the steps that fail were failing before this call.
+        bool freshDoc = name == "open_design" || name == "design_tabs" || name == "undo" || name == "redo";
+        post([this, prom, name, a, before, failedBefore, who, freshDoc] {
+            if (freshDoc) failedBefore->insert(0xFFFFFFFFu);   // marker: count every failure as old
             for (auto& [id, b] : doc_.bodies) if (doc_.isBodyAlive(b)) before->insert(id);
             for (auto& f : doc_.timeline) if (f.failed) failedBefore->insert(f.id);
             aiCaptured_.clear();
@@ -381,13 +415,21 @@ App::McpCall App::mcpRunTool(const std::string& client, const std::string& name,
             auto p2 = std::make_shared<std::promise<std::string>>();
             auto f2 = p2->get_future();
             post([this, p2, before, failedBefore] {
-                std::string made, failed, said, newFail;
+                // Short and about this call: new bodies (a few named), failures this call caused in
+                // full, older failures only counted. Long lists of old errors made weaker models
+                // think every step failed.
+                std::string made, said, newFail, oldNames;
+                int nMade = 0, nOld = 0;
+                bool allOld = failedBefore->count(0xFFFFFFFFu) > 0;
                 for (auto& [id, b] : doc_.bodies)
-                    if (doc_.isBodyAlive(b) && !before->count(id)) made += (made.empty() ? "" : ", ") + aiBodyPath(id);
+                    if (doc_.isBodyAlive(b) && !before->count(id)) {
+                        if (++nMade <= 12) made += (made.empty() ? "" : ", ") + aiBodyPath(id);
+                    }
+                if (nMade > 12) made += " and " + std::to_string(nMade - 12) + " more (get_design lists them)";
                 for (auto& f : doc_.timeline)
                     if (f.failed && !f.error.empty()) {
-                        failed += (failed.empty() ? "" : "; ") + f.name + ": " + f.error;
-                        if (!failedBefore->count(f.id)) newFail += (newFail.empty() ? "" : "; ") + f.name + ": " + f.error;
+                        if (!allOld && !failedBefore->count(f.id)) newFail += (newFail.empty() ? "" : "; ") + f.name + ": " + f.error;
+                        else if (++nOld <= 3) oldNames += (oldNames.empty() ? "" : ", ") + f.name;
                     }
                 for (auto& m : aiCaptured_) said += (said.empty() ? "" : " | ") + m;
                 aiCapture_ = false;
@@ -395,7 +437,9 @@ App::McpCall App::mcpRunTool(const std::string& client, const std::string& name,
                 std::string o;
                 if (!made.empty()) o += " Bodies now in the design from this step: " + made + ".";
                 if (!said.empty()) o += " Kestral showed the user: \"" + said + "\".";
-                if (!failed.empty()) o += " Timeline steps with errors: " + failed + ".";
+                if (nOld > 0)
+                    o += " (" + std::to_string(nOld) + " older timeline step" + (nOld > 1 ? "s" : "") + " already had errors before this call, e.g. " +
+                         oldNames + ". Not caused by you; leave them unless the user asks.)";
                 if (!newFail.empty()) o = std::string(kStepFailed) + newFail + "." + o;
                 p2->set_value(o);
             });
@@ -418,6 +462,7 @@ App::McpCall App::mcpRunTool(const std::string& client, const std::string& name,
     std::string low = lowerStr(out.text.substr(0, 200));
     if (low.rfind("error", 0) == 0 || low.rfind("unknown", 0) == 0 || low.rfind("not found", 0) == 0 || low.rfind("stopped", 0) == 0)
         out.error = true;
+    if (!fixNote.empty()) out.text = fixNote + out.text;
     post([this, who, name, t = out.text] { aiLog("mcp " + who + " " + name, t); });
     return out;
 }
@@ -623,6 +668,7 @@ void App::mcpServeConnection(std::shared_ptr<McpServer> srv, intptr_t csock) {
                     std::lock_guard<std::mutex> lk(srv->mx);
                     srv->runningTool = tool;
                     srv->lastUse = nowSec();
+                    if (!mcpReadOnlyTool(tool)) srv->lastChange = nowSec();
                     if (!client.empty()) srv->lastClient = client;
                 }
                 McpCall r;
@@ -644,6 +690,7 @@ void App::mcpServeConnection(std::shared_ptr<McpServer> srv, intptr_t csock) {
                     std::lock_guard<std::mutex> lk(srv->mx);
                     srv->runningTool.clear();
                     srv->lastUse = nowSec();
+                    if (!mcpReadOnlyTool(tool)) srv->lastChange = nowSec();
                     srv->calls++;
                 }
                 srv->app->mcpAudit(client, tool, args, r, (nowSec() - t0) * 1000.0, readOnly);
@@ -863,7 +910,25 @@ App::McpStatus App::mcpStatus() const {
     s.tool = mcp_->runningTool;
     s.calls = mcp_->calls;
     s.idleSecs = mcp_->lastUse > -1e8 ? nowSec() - mcp_->lastUse : -1;
+    s.changeIdleSecs = mcp_->lastChange > -1e8 ? nowSec() - mcp_->lastChange : -1;
+    s.paused = mcpPaused_.load();
     return s;
+}
+
+// The user's Stop: cancels what runs now and refuses changes until they let the AI continue.
+void App::mcpStopAi() {
+    mcpPaused_.store(true);
+    if (mcp_) {
+        std::lock_guard<std::mutex> lk(mcp_->mx);
+        for (auto& [id, c] : mcp_->inFlight) if (c) c->store(true);
+        mcp_->lastChange = -1e9;
+    }
+    toast("AI stopped. It cannot change anything until you press Let AI continue.", ToastKind::Info);
+}
+
+void App::mcpResumeAi() {
+    mcpPaused_.store(false);
+    toast("The AI can work in Kestral again.", ToastKind::Info);
 }
 
 // ---------------------------------------------------------------- preferences
@@ -931,6 +996,8 @@ void App::drawMcpPrefs() {
     flashItem("pref:Let other AI apps use Kestral's tools (MCP)");
     ImGui::TextDisabled("Claude Desktop, Claude Code, Cursor and any other MCP app can then build, check, slice and print here, live.");
     ImGui::TextDisabled("Only programs on this computer can connect, and only with Kestral's key.");
+    if (ImGui::Checkbox("Lock the design while an AI works (Stop takes over)", &settings_.lockWhileAi)) settings_.save(settingsPath_);
+    flashItem("pref:Lock the design while an AI works (Stop takes over)");
     McpStatus st = mcpStatus();
     std::string exe = platform::selfExe();
     std::string url = "http://127.0.0.1:" + std::to_string(st.port) + "/mcp";

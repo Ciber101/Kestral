@@ -16,6 +16,7 @@
 #include <array>
 #include <cmath>
 #include <filesystem>
+#include <iterator>
 #include <fstream>
 #include <future>
 #include <sstream>
@@ -154,6 +155,28 @@ bool App::saveImportAsDesign(std::vector<LibPiece>& pieces, const std::string& s
         refreshSignatures();
         doc_.name = pathToU8(u8path(out).stem());
         doc_.path = out;
+        {
+            // Bringing a design over again replaces its .kst: what was there (perhaps edited in
+            // Kestral since) is kept as a version first, so the Data panel can still open it.
+            std::error_code vec;
+            if (std::filesystem::exists(u8path(out), vec)) {
+                std::string vdir = versionsDir(out);
+                std::filesystem::create_directories(u8path(vdir), vec);
+                int v = latestVersion(out);
+                std::ifstream oldF(u8path(out), std::ios::binary);
+                std::string oldData((std::istreambuf_iterator<char>(oldF)), std::istreambuf_iterator<char>());
+                std::ifstream lastF(u8path(vdir + "/v" + std::to_string(v) + ".kst"), std::ios::binary);
+                std::string lastData((std::istreambuf_iterator<char>(lastF)), std::istreambuf_iterator<char>());
+                if (!oldData.empty() && oldData != lastData && !writeFileAtomic(vdir + "/v" + std::to_string(++v) + ".kst", oldData)) {
+                    err = "could not keep the old " + out + " as a version, so it was left as it was";
+                    std::swap(doc_, scratch);
+                    return false;
+                }
+                doc_.version = v + 1;
+                std::string data;
+                if (serializeDocument(doc_, data)) writeFileAtomic(vdir + "/v" + std::to_string(v + 1) + ".kst", data);
+            }
+        }
         ok = saveDocument(doc_, out);
         if (!ok) err = "could not write " + out;
         else thumbFromDoc(out);   // preview for the data panel (rendered on a worker)

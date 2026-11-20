@@ -125,9 +125,15 @@ ShapePtr shellBody(const ShapePtr& shape, const std::vector<uint32_t>& removeFac
 ShapePtr offsetFaces(const ShapePtr& shape, const std::vector<uint32_t>& faces, double offset);
 // Fusion's Delete Face: removes faces and heals the solid around them (fillets, holes, bosses).
 ShapePtr deleteFaces(const ShapePtr& shape, const std::vector<uint32_t>& faces);
+// Copies a feature made of faces (a hole, a pocket, a boss) within its own body: the faces are lifted
+// off (as Delete Face would), the material that changes is moved by each copy (body space) and cut
+// away or added. copies leaves out the original.
+ShapePtr patternFaces(const ShapePtr& shape, const std::vector<uint32_t>& faces, const std::vector<glm::dmat4>& copies);
 
 // Splits by an infinite plane. Returns one shape per resulting piece (may be empty on no cut).
 std::vector<ShapePtr> splitByPlane(const ShapePtr& shape, const glm::dvec3& p, const glm::dvec3& normal);
+// Split with a cylinder of radius r around the axis through p along dir, long enough to pass the whole body.
+std::vector<ShapePtr> splitByCylinder(const ShapePtr& shape, const glm::dvec3& p, const glm::dvec3& dir, double r);
 
 // Cuts the body on the outline seen along view. The outline has to lie in one plane.
 // Pieces are in world space.
@@ -150,6 +156,7 @@ bool faceInfo(const ShapePtr& shape, uint32_t face, glm::dvec3& center, glm::dve
 // Axis of a round face (cylinder, cone, torus), in shape coordinates. origin is on the axis at the
 // face's middle. False for flat and freeform faces.
 bool faceRoundAxis(const ShapePtr& shape, uint32_t face, glm::dvec3& origin, glm::dvec3& dir);
+bool faceCylinder(const ShapePtr& shape, uint32_t face, glm::dvec3& origin, glm::dvec3& dir, double& radius);   // a cylinder face: axis and radius
 // Extrudes a flat face of a body (with the body's transform applied) along its outward normal.
 // dist may be negative (into the body). Result is in world coordinates.
 ShapePtr extrudeFace(const ShapePtr& shape, const glm::mat4& xf, uint32_t face, double dist, bool symmetric);
@@ -170,6 +177,8 @@ struct EdgeGeom {
     std::vector<glm::dvec3> pts;     // polyline (all types)
 };
 bool edgeGeom(const ShapePtr& shape, const glm::mat4& xf, uint32_t edge, EdgeGeom& out);
+// Every edge of the placed shape, by edge index (an edge that failed has no pts). Stops after maxEdges.
+std::vector<EdgeGeom> allEdgeGeoms(const ShapePtr& shape, const glm::mat4& xf, size_t maxEdges);
 
 // Edges where the placed solid crosses the plane. Empty when the plane misses the body.
 std::vector<EdgeGeom> sectionEdges(const ShapePtr& shape, const glm::mat4& xf, const glm::dvec3& origin, const glm::dvec3& normal);
@@ -233,6 +242,8 @@ ShapePtr sweepRegion(const RegionLoops& loops, const std::vector<CurveSeg>& path
 // Loft through profile regions in order (smooth, not ruled). A point makes that end a pyramid tip
 // (ruled). pointAtStart puts the point before the first profile. A centerline moves each profile so
 // its middle follows that curve, without scaling it. Rails, a point, and a centerline are one at a time.
+// A flat face's outer boundary as a loop in world space (a loft section). Throws when not flat.
+RegionLoops faceOutline(const ShapePtr& shape, const glm::mat4& xform, uint32_t face);
 ShapePtr loftRegions(const std::vector<RegionLoops>& sections, const std::vector<std::vector<CurveSeg>>& rails = {},
                      bool hasPoint = false, const glm::dvec3& point = {}, bool pointAtStart = false,
                      const std::vector<CurveSeg>& centerline = {});
@@ -258,6 +269,55 @@ CurveMeasure measureArea(const ShapePtr& shape, const glm::mat4& xf, uint32_t fa
 CurveMeasure measureLoop(const ShapePtr& shape, const glm::mat4& xf, uint32_t face, uint32_t edge);
 // The smaller angle, 0 to 90 degrees, between two edges or two flat faces.
 CurveMeasure measureAngle(const ShapePtr& a, const glm::mat4& xa, uint32_t faceA, uint32_t edgeA,
+                          const ShapePtr& b, const glm::mat4& xb, uint32_t faceB, uint32_t edgeB);
+
+// The measure tool in the viewport (Fusion like). One pick: what it is and its own sizes. Two picks:
+// the closest points (drawn as a line, with dX dY dZ), the distance between centers or axes when both
+// picks are round (hole to hole is usually what is meant), and the full angle.
+struct PickInfo {
+    bool ok = false;
+    std::string what;              // "Line edge", "Circle edge", "Flat face", "Cylinder face"...
+    double length = -1;            // edge
+    double area = -1;              // face
+    double radius = -1;            // circle edge, cylinder, cone (at its base), sphere, torus minor
+    bool hasCenter = false, hasAxis = false;
+    glm::dvec3 center{0}, axis{0, 0, 1};   // world: circle / sphere center, or a point on the axis
+    bool hasDir = false;
+    glm::dvec3 dir{0};             // line edge direction, or a flat face's outward normal
+    bool isFace = false, isEdge = false;
+    glm::dvec3 v0{0}, v1{0};       // an edge's two ends
+};
+PickInfo measurePick(const ShapePtr& shape, const glm::mat4& xf, uint32_t face, uint32_t edge);
+// A sketch curve as a shape the measure functions take: one exact edge for a line, arc, circle or
+// ellipse (edge 0), or a chain of short edges for a spline (measure it whole). World space.
+ShapePtr curveShape(const std::vector<CurveSeg>& segs, const glm::dvec3& planeN);
+// A single point (a sketch point) as a shape the measure functions take. World space.
+ShapePtr pointShape(const glm::dvec3& p);
+struct PairMeasure {
+    bool ok = false;
+    double distance = 0;           // closest points
+    glm::dvec3 pa{0}, pb{0};
+    double centers = -1;           // center to center (or axis to axis, center to axis); -1 none
+    glm::dvec3 ca{0}, cb{0};       // the two points that distance runs between
+    double angle = -1;             // 0 to 180 degrees between the two directions, -1 none
+    bool angleSigned = false;      // true: edges meeting at a corner or face normals (a real 0 to 180)
+};
+PairMeasure measurePair(const ShapePtr& a, const glm::mat4& xa, uint32_t faceA, uint32_t edgeA,
+                        const ShapePtr& b, const glm::mat4& xb, uint32_t faceB, uint32_t edgeB);
+
+// Alignment of two picks (faces or edges): are they parallel, level (flat to flat) and centered?
+// A flat face's center is its round outline's center (a disc, a ring) or else its middle; a round
+// face or a circle edge gives its axis; a straight edge its line.
+struct AlignMeasure {
+    bool ok = false;
+    std::string whatA, whatB;
+    double tilt = -1;              // degrees between their directions (normals, axes, lines), 0 to 90; -1 none
+    bool hasHeight = false;        // both flat: how far apart their planes are, along the first one's normal
+    double height = 0;
+    double offCenter = -1;         // sideways distance between the centers or axes, -1 none
+    glm::dvec3 ca{0}, cb{0};       // the two centers (or axis points) used
+};
+AlignMeasure measureAlign(const ShapePtr& a, const glm::mat4& xa, uint32_t faceA, uint32_t edgeA,
                           const ShapePtr& b, const glm::mat4& xb, uint32_t faceB, uint32_t edgeB);
 
 // ---- M8: mesh to solid ----

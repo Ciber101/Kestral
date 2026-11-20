@@ -8,6 +8,19 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <chrono>
+#include <iterator>
+#include <thread>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace kst {
 namespace {
@@ -201,36 +214,101 @@ std::vector<TargetRef> parseRefs(const std::string& s) {
 
 } // namespace
 
-bool writeFileAtomic(const std::string& path, const std::string& data) {
-    // Write a temp file next to the target, then swap it in. A crash or power cut mid save leaves
-    // the old file untouched, never a half written one.
-    std::string tmp = path + ".saving";
-    try {
-        {
-            std::ofstream f(u8path(tmp), std::ios::binary | std::ios::trunc);
-            if (!f) return false;
-            f.write(data.data(), (std::streamsize)data.size());
-            f.flush();
-            if (!f) {
-                f.close();
-                std::error_code ec;
-                std::filesystem::remove(u8path(tmp), ec);
-                return false;
-            }
+namespace {
+// Write data to a new file and make sure it reached the disk (not just the OS cache), so a power cut
+// right after a save cannot leave an empty or half written file.
+bool writeDurable(const std::string& path, const std::string& data) {
+#ifdef _WIN32
+    std::filesystem::path p = u8path(path);
+    HANDLE h = CreateFileW(p.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    size_t off = 0;
+    bool ok = true;
+    while (ok && off < data.size()) {
+        DWORD chunk = (DWORD)std::min<size_t>(data.size() - off, 1u << 24), wrote = 0;
+        ok = WriteFile(h, data.data() + off, chunk, &wrote, nullptr) && wrote == chunk;
+        off += wrote;
+    }
+    ok = ok && FlushFileBuffers(h);
+    CloseHandle(h);
+    return ok;
+#else
+    int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return false;
+    size_t off = 0;
+    bool ok = true;
+    while (ok && off < data.size()) {
+        ssize_t n = ::write(fd, data.data() + off, data.size() - off);
+        if (n <= 0) ok = false;
+        else off += (size_t)n;
+    }
+    ok = ok && ::fsync(fd) == 0;
+    ::close(fd);
+    return ok;
+#endif
+}
+
+// Swap the finished temp file in for the target in one step. Sync tools and virus scanners hold
+// files for a moment, so it tries for a few seconds before giving up.
+bool swapIn(const std::string& tmp, const std::string& path) {
+    for (int attempt = 0; attempt < 30; ++attempt) {
+#ifdef _WIN32
+        if (MoveFileExW(u8path(tmp).c_str(), u8path(path).c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return true;
+#else
+        if (::rename(tmp.c_str(), path.c_str()) == 0) {
+            // The rename itself reaches the disk when the folder is synced.
+            std::string dir = pathToU8(u8path(path).parent_path());
+            int dfd = ::open(dir.empty() ? "." : dir.c_str(), O_RDONLY);
+            if (dfd >= 0) { ::fsync(dfd); ::close(dfd); }
+            return true;
         }
-        std::error_code ec;
-        std::filesystem::rename(u8path(tmp), u8path(path), ec);
-        if (ec) {
-            // Some sync tools hold the target open: fall back to a copy over it.
+#endif
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return false;
+}
+
+bool sameAsFile(const std::string& path, const std::string& data) {
+    std::ifstream f(u8path(path), std::ios::binary);
+    if (!f) return false;
+    std::string got((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    return got == data;
+}
+} // namespace
+
+bool writeFileAtomic(const std::string& path, const std::string& data) {
+    // Write a temp file next to the target, flush it to the disk, then swap it in. A crash or power
+    // cut mid save leaves the old file untouched, never a half written one. The result is read back:
+    // a save only counts when the bytes on disk are the bytes meant.
+    std::string tmp = path + ".saving";
+    std::error_code ec;
+    try {
+        if (!writeDurable(tmp, data) || !sameAsFile(tmp, data)) {
+            std::filesystem::remove(u8path(tmp), ec);
+            log::warn("Could not write " + tmp);
+            return false;
+        }
+        if (!swapIn(tmp, path)) {
+            // Still held after several seconds: keep the old file aside, then copy over it.
+            std::string keep = path + ".before-save";
+            std::filesystem::copy_file(u8path(path), u8path(keep), std::filesystem::copy_options::overwrite_existing, ec);
+            ec.clear();
             std::filesystem::copy_file(u8path(tmp), u8path(path), std::filesystem::copy_options::overwrite_existing, ec);
-            std::error_code ec2;
-            std::filesystem::remove(u8path(tmp), ec2);
-            return !ec;
+            bool ok = !ec && sameAsFile(path, data);
+            if (ok) {
+                std::filesystem::remove(u8path(tmp), ec);
+                std::filesystem::remove(u8path(keep), ec);
+            }
+            if (!ok) log::warn("Could not replace " + path + " (the new content is in " + tmp + ")");
+            return ok;
+        }
+        if (!sameAsFile(path, data)) {
+            log::warn("Read back of " + path + " did not match what was written");
+            return false;
         }
         return true;
     } catch (...) {
-        std::error_code ec;
-        std::filesystem::remove(u8path(tmp), ec);
+        log::warn("Could not write " + path);
         return false;
     }
 }
@@ -382,6 +460,8 @@ bool serializeDocument(const Document& doc, std::string& out) {
                   << "|" << q.pathSketch << "|" << q.pathEnt << "|" << q.distType << "|" << q.orient
                   << "|" << (q.flip ? 1 : 0) << "|" << q.pathBody.first << "|" << q.pathBody.second
                   << "|" << q.pathEdge << "\n";
+                if (!q.faceTargets.empty() && !q.faces.empty())
+                    f << "ppfc|" << ft.id << "|" << joinRefs(q.faceTargets) << "|" << joinRefs(q.faces) << "\n";
             }
             if (ft.type == FeatureType::Mirror && ft.mirror)
                 f << "mpar2|" << ft.id << "|" << ft.mirror->plane << "|" << joinRefs(ft.mirror->targets) << "|"
@@ -403,7 +483,7 @@ bool serializeDocument(const Document& doc, std::string& out) {
                 f << "spar|" << ft.id << "|" << ft.split->plane << "|" << joinRefs(ft.split->targets) << "|"
                   << num(ft.split->toolO.x) << "," << num(ft.split->toolO.y) << "," << num(ft.split->toolO.z) << "|"
                   << num(ft.split->toolN.x) << "," << num(ft.split->toolN.y) << "," << num(ft.split->toolN.z) << "|"
-                  << esc(ft.split->toolName) << "|" << ft.split->sketchId << "|" << ft.split->sketchEnt << "\n";
+                  << esc(ft.split->toolName) << "|" << ft.split->sketchId << "|" << ft.split->sketchEnt << "|" << num(ft.split->toolR) << "\n";
             if (ft.type == FeatureType::Align && ft.align) {
                 const AlignParams& a = *ft.align;
                 auto pk = [](const AlignParams::Pick& q) {
@@ -441,6 +521,9 @@ bool serializeDocument(const Document& doc, std::string& out) {
                   << "|" << esc(ft.multi->thinExpr) << "|" << ft.multi->thinSide
                   << "|" << ft.multi->pointEnd << "|" << esc(ft.multi->pointX) << "|" << esc(ft.multi->pointY)
                   << "|" << esc(ft.multi->pointZ) << "|" << ft.multi->centerId << "\n";
+                for (const LoftPick& lp : ft.multi->picks)
+                    f << "lpk|" << ft.id << "|" << lp.sketchId << "|" << num(lp.pt.x) << "|" << num(lp.pt.y) << "|" << lp.face.feature << "|"
+                      << lp.face.slot << "|" << lp.face.face << "|" << lp.face.faceTotal << "\n";
             }
             if (ft.type == FeatureType::Move && ft.move) {
                 const MoveParams& m = *ft.move;
@@ -555,7 +638,7 @@ bool serializeDocument(const Document& doc, std::string& out) {
             uint32_t fid = (uint32_t)(key >> 32), slot = (uint32_t)key;
             f << "override|" << fid << "|" << slot << "|" << esc(o.name) << "|" << (o.hasColor ? 1 : 0)
               << "|" << num(o.color.r) << " " << num(o.color.g) << " " << num(o.color.b)
-              << "|" << (o.visible ? 1 : 0) << "\n";
+              << "|" << (o.visible ? 1 : 0) << "|" << o.made << "|" << o.src.first << ":" << o.src.second << "\n";
             auto props = [&](const MatProps& m) {
                 return num(m.opacity) + " " + num(m.metal) + " " + num(m.rough) + " " + std::to_string((int)m.pattern) + " " +
                        num(m.color2.r) + " " + num(m.color2.g) + " " + num(m.color2.b) + " " + num(m.scale) + " " + num(m.glow) + " " +
@@ -965,6 +1048,15 @@ LoadResult loadDocument(const std::string& path) {
                 }
                 for (auto& ft : doc.timeline)
                     if (ft.id == fid) ft.pattern = q;
+            } else if (k == "ppfc") {
+                uint32_t fid = std::stoul(p.at(1));
+                for (auto& ft : doc.timeline)
+                    if (ft.id == fid && ft.pattern) {
+                        auto q = std::make_shared<PatternParams>(*ft.pattern);
+                        q->faceTargets = parseRefs(p.at(2));
+                        q->faces = parseRefs(p.at(3));
+                        ft.pattern = q;
+                    }
             } else if (k == "mpar2") {
                 uint32_t fid = std::stoul(p.at(1));
                 auto m = std::make_shared<MirrorParams>();
@@ -1009,6 +1101,7 @@ LoadResult loadDocument(const std::string& path) {
                     sp->toolName = unesc(p.at(6));
                     sp->sketchId = std::stoul(p.at(7));
                     if (p.size() > 8) sp->sketchEnt = std::stoul(p.at(8));
+                    if (p.size() > 9) sp->toolR = std::stod(p.at(9));
                 }
                 for (auto& ft : doc.timeline)
                     if (ft.id == fid) ft.split = sp;
@@ -1104,6 +1197,21 @@ LoadResult loadDocument(const std::string& path) {
                 if (p.size() > 13) m->centerId = (uint32_t)std::stoul(p[13]);
                 for (auto& ft : doc.timeline)
                     if (ft.id == fid) ft.multi = m;
+            } else if (k == "lpk") {   // a loft section picked in the viewport (after its msk line)
+                uint32_t fid = std::stoul(p.at(1));
+                LoftPick lp;
+                lp.sketchId = (uint32_t)std::stoul(p.at(2));
+                lp.pt = sk::Vec2(std::stod(p.at(3)), std::stod(p.at(4)));
+                lp.face.feature = (uint32_t)std::stoul(p.at(5));
+                lp.face.slot = (uint32_t)std::stoul(p.at(6));
+                lp.face.face = (uint32_t)std::stoul(p.at(7));
+                lp.face.faceTotal = (uint32_t)std::stoul(p.at(8));
+                for (auto& ft : doc.timeline)
+                    if (ft.id == fid && ft.multi) {
+                        auto m = std::make_shared<MultiSketchParams>(*ft.multi);
+                        m->picks.push_back(lp);
+                        ft.multi = m;
+                    }
             } else if (k == "mvp") {
                 uint32_t fid = std::stoul(p.at(1));
                 auto m = std::make_shared<MoveParams>();
@@ -1383,6 +1491,11 @@ LoadResult loadDocument(const std::string& path) {
                 std::vector<double> rgb = nums(p.at(5));
                 if (rgb.size() == 3) o.color = {(float)rgb[0], (float)rgb[1], (float)rgb[2]};
                 o.visible = p.at(6) == "1";
+                if (p.size() > 7 && !p[7].empty()) o.made = std::clamp(std::atoi(p[7].c_str()), -1, 1);
+                if (p.size() > 8) {
+                    auto refs = parseRefs(p[8]);
+                    if (!refs.empty()) o.src = refs[0];
+                }
                 doc.overrides[Document::overrideKey(fid, slot)] = o;
             } else if (k == "look" || k == "flook") {
                 // Appearance (newer files). Lines refer to an override written just before them.

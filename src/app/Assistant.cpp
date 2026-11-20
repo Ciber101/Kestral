@@ -114,7 +114,7 @@ const ToolDef kTools[] = {
      R"({"type":"object","properties":{"name":{"type":"string"},"version":{"type":"integer"}},"required":["name"]})"},
     {"list_designs", "List the saved designs (name, version, path). query filters by name.",
      R"({"type":"object","properties":{"query":{"type":"string"}}})"},
-    {"set_visibility", "Show or hide bodies (names, paths or folder names), sketches or construction planes by name, or \"all sketches\" / \"all planes\". Undo reverses it.",
+    {"set_visibility", "Show or hide bodies (names, paths or folder names), sketches (name or id) or construction planes by name, or \"all sketches\" / \"all planes\". Undo reverses it.",
      R"({"type":"object","properties":{"names":{"type":"array","items":{"type":"string"}},"visible":{"type":"boolean"}},"required":["names","visible"]})"},
     {"set_color", "Set the color of bodies. color is #RRGGBB.",
      R"({"type":"object","properties":{"names":{"type":"array","items":{"type":"string"}},"color":{"type":"string"}},"required":["names","color"]})"},
@@ -124,8 +124,10 @@ const ToolDef kTools[] = {
      R"({"type":"object","properties":{"plane":{"type":"string"},"offset":{"type":"number"},"flip":{"type":"boolean"},"on":{"type":"boolean"}}})"},
     {"move", "Move bodies by an offset in millimeters (adds a Move step to the timeline). copy=true moves copies instead. If a body is in a rigid group, the other bodies in that group move by the same amount.",
      R"({"type":"object","properties":{"names":{"type":"array","items":{"type":"string"}},"x":{"type":"number"},"y":{"type":"number"},"z":{"type":"number"},"copy":{"type":"boolean"}},"required":["names"]})"},
-    {"delete", "Delete bodies (adds a Remove step to the timeline, undoable).",
-     R"({"type":"object","properties":{"names":{"type":"array","items":{"type":"string"}}},"required":["names"]})"},
+    {"delete", "Delete bodies (adds a Remove step to the timeline, undoable). sketches: sketch names or ids to delete (the sketch step goes; steps built on it fail until edited).",
+     R"({"type":"object","properties":{"names":{"type":"array","items":{"type":"string"}},"sketches":{"type":"array","items":{}}}})"},
+    {"timeline", "Timeline steps by name (e.g. Extrude42). action info (default): for each step its kind, whether it failed or is suppressed, the bodies it chose, the bodies it used up and the bodies it made. delete: remove the steps (one undo). suppress / unsuppress. set_targets: the bodies an extrude or revolve cuts or joins (bodies: names as they were just before that step).",
+     R"({"type":"object","properties":{"action":{"type":"string"},"steps":{"type":"array","items":{"type":"string"}},"bodies":{"type":"array","items":{"type":"string"}}},"required":["steps"]})"},
     {"rename", "Rename a body or a folder.",
      R"({"type":"object","properties":{"name":{"type":"string"},"new_name":{"type":"string"}},"required":["name","new_name"]})"},
     {"set_parameter", "Create or change a user parameter. expression can be a number (mm or degrees) or math using other parameters.",
@@ -222,8 +224,8 @@ const ToolDef kTools[] = {
      R"({"type":"object","properties":{"action":{"type":"string","enum":["catalog","part_info","add","set","remove","stack","connect","disconnect","list","check","guide"]},"query":{"type":"string"},"part":{"type":"string"},"label":{"type":"string"},"new_label":{"type":"string"},"attach":{"type":"string"},"capacity_mAh":{"type":"number"},"hat":{"type":"string"},"pi":{"type":"string"},"from_part":{"type":"string"},"from_pin":{"type":"string"},"to_part":{"type":"string"},"to_pin":{"type":"string"},"color":{"type":"string"},"awg":{"type":"number"},"note":{"type":"string"},"wire":{"type":"number"}},"required":["action"]})"},
     {"interference", "Report which of the named bodies share volume. Touching faces do not count.",
      R"({"type":"object","properties":{"names":{"type":"array","items":{"type":"string"}}},"required":["names"]})"},
-    {"measure", "Measure. kind is distance (default), angle, radius, area, or loop. Distance: points is two [x,y,z], or names is two bodies (center to center). Angle: points is three [x,y,z] with the corner in the middle, or body with face and face2, or edge and edge2. The angle is the smaller one, 0 to 90 degrees. Radius: a cylinder, sphere, torus, or circular edge. Area: a face, in mm2. Loop: the outline of a face, or the wire an edge sits on, in mm. body names the solid. Leave face out to use the first round face or the first flat face.",
-     R"({"type":"object","properties":{"kind":{"type":"string","enum":["distance","angle","radius","area","loop"]},"points":{"type":"array"},"names":{"type":"array","items":{"type":"string"}},"body":{"type":"string"},"face":{"type":"number"},"face2":{"type":"number"},"edge":{"type":"number"},"edge2":{"type":"number"}}})"},
+    {"measure", "Measure. kind is distance (default), angle, radius, area, loop, or align. Distance: points is two [x,y,z], or names is two bodies (center to center). Angle: points is three [x,y,z] with the corner in the middle, or body with face and face2, or edge and edge2. The angle is the smaller one, 0 to 90 degrees. Radius: a cylinder, sphere, torus, or circular edge. Area: a face, in mm2. Loop: the outline of a face, or the wire an edge sits on, in mm. body names the solid. Leave face out to use the first round face or the first flat face. Align: body with face or edge, and body2 (default the same body) with face2 or edge2; reports tilt between them, height apart (two flat faces) and how far off center.",
+     R"({"type":"object","properties":{"kind":{"type":"string","enum":["distance","angle","radius","area","loop","align"]},"points":{"type":"array"},"names":{"type":"array","items":{"type":"string"}},"body":{"type":"string"},"body2":{"type":"string"},"face":{"type":"number"},"face2":{"type":"number"},"edge":{"type":"number"},"edge2":{"type":"number"}}})"},
     {"offset_plane", "Construction plane offset from XY, XZ or YZ. offset in mm along the plane normal.",
      R"({"type":"object","properties":{"plane":{"type":"string"},"offset":{"type":"number"}},"required":["offset"]})"},
     {"plane_at_angle", "Construction plane tilted from XY, XZ or YZ. angle is degrees. axis is x or y of that plane. The hinge stays on the origin.",
@@ -1342,7 +1344,7 @@ std::string App::aiRunTool(const std::string& name, const std::string& argsJson)
                 std::string l = low(n);
                 bool hit = false;
                 for (auto& [sid, sk] : doc_.sketches)
-                    if (l == "all sketches" || low(sk.name) == l) {
+                    if (l == "all sketches" || low(sk.name) == l || l == std::to_string(sid) || l == "sketch " + std::to_string(sid)) {
                         if (!pushed) { pushUndo(vis ? "Show" : "Hide"); pushed = true; }
                         sk.visible = vis; ++nsk; hit = true;
                     }
@@ -1464,13 +1466,145 @@ std::string App::aiRunTool(const std::string& name, const std::string& argsJson)
         return (err.empty() ? "" : err + " ") + "Moved " + std::to_string(ids.size()) + " bodies.";
     }
     if (name == "delete") {
+        std::string out;
+        if (a["sketches"].isArray() && a["sketches"].size()) {
+            // Sketches by name or id: their timeline step goes (one undo for all of them).
+            auto low = [](std::string x) { for (auto& ch : x) ch = (char)std::tolower((unsigned char)ch); return x; };
+            std::vector<uint32_t> fids;
+            std::string missing;
+            for (auto& v : a["sketches"].items()) {
+                std::string want = v.isNumber() ? std::to_string((uint32_t)v.asNumber()) : low(v.asString());
+                uint32_t hit = 0;
+                for (auto& [sid, sk] : doc_.sketches)
+                    if (std::to_string(sid) == want || low(sk.name) == want) hit = sk.featureId;
+                if (hit) fids.push_back(hit);
+                else missing += (missing.empty() ? "" : ", ") + (v.isNumber() ? want : v.asString());
+            }
+            if (!fids.empty()) {
+                pushUndo("Delete sketches");
+                for (uint32_t fid : fids)
+                    if (int fi = doc_.featureIndex(fid); fi >= 0) deleteFeature(fi, false);
+                out = "Deleted " + std::to_string(fids.size()) + " sketch" + (fids.size() > 1 ? "es." : ".");
+            }
+            if (!missing.empty()) out += (out.empty() ? "" : " ") + std::string("No sketch named or numbered: ") + missing + ".";
+            if (!a["names"].isArray() || !a["names"].size()) return out.empty() ? "Nothing to delete." : out;
+        }
         std::string err;
         auto ids = bodiesArg(err);
+        if (ids.empty() && !out.empty()) return out + (err.empty() ? "" : " " + err);
         if (ids.empty()) return err.empty() ? "Nothing to delete." : err;
         clearSelection();
         selectBodies(ids, false);
         deleteSelection();
-        return (err.empty() ? "" : err + " ") + "Deleted " + std::to_string(ids.size()) + " bodies.";
+        return (out.empty() ? "" : out + " ") + (err.empty() ? "" : err + " ") + "Deleted " + std::to_string(ids.size()) + " bodies.";
+    }
+    if (name == "timeline") {
+        std::string act = lower(a["action"].asString());
+        if (act.empty()) act = "info";
+        std::vector<int> idx;
+        std::string missing;
+        for (auto& v : a["steps"].items()) {
+            std::string want = lower(v.asString());
+            int hit = -1;
+            for (int i = 0; i < (int)doc_.timeline.size(); ++i)
+                if (lower(doc_.timeline[i].name) == want) hit = i;
+            if (hit >= 0) idx.push_back(hit);
+            else missing += (missing.empty() ? "" : ", ") + v.asString();
+        }
+        std::string miss = missing.empty() ? "" : " No step named: " + missing + ".";
+        if (idx.empty()) return "Nothing found." + miss;
+        // A body reference (step, slot) as words: the body's name and whether it is still there.
+        auto refName = [&](const TargetRef& r) {
+            std::vector<uint32_t> ids = doc_.featureBodies(r.first);
+            int fi = doc_.featureIndex(r.first);
+            std::string st = fi >= 0 ? doc_.timeline[fi].name : std::to_string(r.first);
+            std::string nm = r.second < ids.size() ? "'" + doc_.bodies.at(ids[r.second]).name + "'" : "(gone)";
+            return nm + " from " + st + " #" + std::to_string(r.second);
+        };
+        if (act == "info") {
+            std::string out;
+            for (int i : idx) {
+                const Feature& f = doc_.timeline[i];
+                out += f.name + " (step " + std::to_string(i + 1) + ")";
+                if (f.suppressed) out += " SUPPRESSED";
+                if (i >= doc_.markerPos) out += " after the marker";
+                if (f.failed) out += " FAILED: " + f.error;
+                std::vector<TargetRef> chosen;
+                if (f.extrude) { chosen = f.extrude->targets; out += f.extrude->op == 0 ? ", new body" : f.extrude->op == 1 ? ", join" : f.extrude->op == 2 ? ", cut" : ", intersect"; }
+                if (f.revolve) chosen = f.revolve->targets;
+                if (f.move) chosen = f.move->targets;
+                if (f.remove) chosen = f.remove->targets;
+                if (f.pattern) { chosen = f.pattern->targets; chosen.insert(chosen.end(), f.pattern->faceTargets.begin(), f.pattern->faceTargets.end()); }
+                if (f.combine) { chosen = f.combine->targets; chosen.insert(chosen.end(), f.combine->tools.begin(), f.combine->tools.end()); }
+                if (f.modify) chosen = f.modify->targets;
+                if ((f.extrude || f.revolve) && chosen.empty()) out += ", picks its bodies itself";
+                for (auto& r : chosen) out += "\n  chose " + refName(r);
+                for (auto& [bid, b] : doc_.bodies)
+                    if (b.consumedBy == f.id) {
+                        std::vector<uint32_t> ids = doc_.featureBodies(b.featureId);
+                        uint32_t slot = (uint32_t)(std::find(ids.begin(), ids.end(), bid) - ids.begin());
+                        out += "\n  used up " + refName({b.featureId, slot});
+                    }
+                std::vector<uint32_t> outs = doc_.featureBodies(f.id);
+                for (size_t k = 0; k < outs.size(); ++k) {
+                    const Body& b = doc_.bodies.at(outs[k]);
+                    out += "\n  made #" + std::to_string(k) + " '" + b.name + "'" + (b.consumedBy ? " (used up later)" : "") + (doc_.isBodyShown(b) ? "" : " (not shown)");
+                }
+                out += "\n";
+            }
+            return out + miss;
+        }
+        if (act == "delete") {
+            pushUndo(idx.size() == 1 ? "Delete " + doc_.timeline[idx[0]].name : "Delete steps");
+            std::sort(idx.begin(), idx.end());
+            idx.erase(std::unique(idx.begin(), idx.end()), idx.end());
+            std::string names;
+            for (int k = (int)idx.size() - 1; k >= 0; --k) {
+                names = doc_.timeline[idx[k]].name + (names.empty() ? "" : ", ") + names;
+                deleteFeature(idx[k], false);
+            }
+            return "Deleted " + names + "." + miss;
+        }
+        if (act == "suppress" || act == "unsuppress") {
+            bool on = act == "suppress";
+            pushUndo(on ? "Suppress" : "Unsuppress");
+            int first = (int)doc_.timeline.size();
+            for (int i : idx) { doc_.timeline[i].suppressed = on; first = std::min(first, i); }
+            doc_.touch();
+            scheduleRecompute(first);
+            return std::string(on ? "Suppressed " : "Unsuppressed ") + std::to_string(idx.size()) + " step(s)." + miss;
+        }
+        if (act == "set_targets") {
+            if (idx.size() != 1) return "set_targets takes one step.";
+            int si = idx[0];
+            Feature& f = doc_.timeline[si];
+            if (!f.extrude && !f.revolve) return f.name + " is not an extrude or revolve.";
+            // Bodies alive just before the step: made earlier, not used up before it.
+            std::vector<TargetRef> refs;
+            std::string notFound;
+            for (auto& v : a["bodies"].items()) {
+                std::string want = lower(v.asString());
+                TargetRef hit{0, 0};
+                for (auto& [bid, b] : doc_.bodies) {
+                    int bf = doc_.featureIndex(b.featureId);
+                    if (bf < 0 || bf >= si || lower(b.name) != want) continue;
+                    int cf = b.consumedBy ? doc_.featureIndex(b.consumedBy) : -1;
+                    if (cf >= 0 && cf < si) continue;
+                    std::vector<uint32_t> ids = doc_.featureBodies(b.featureId);
+                    hit = {b.featureId, (uint32_t)(std::find(ids.begin(), ids.end(), bid) - ids.begin())};
+                }
+                if (hit.first) refs.push_back(hit);
+                else notFound += (notFound.empty() ? "" : ", ") + v.asString();
+            }
+            if (!notFound.empty()) return "No body alive just before " + f.name + " named: " + notFound + ".";
+            pushUndo("Edit " + f.name);
+            if (f.extrude) { auto p = std::make_shared<ExtrudeParams>(*f.extrude); p->targets = refs; f.extrude = p; }
+            else { auto p = std::make_shared<RevolveParams>(*f.revolve); p->targets = refs; f.revolve = p; }
+            doc_.touch();
+            scheduleRecompute(si);
+            return f.name + " now works on " + std::to_string(refs.size()) + " bodies.";
+        }
+        return "action is info, delete, suppress, unsuppress or set_targets.";
     }
     if (name == "rename") {
         std::string from = lower(a["name"].asString()), to = a["new_name"].asString();
@@ -4109,5 +4243,213 @@ json::Value App::mcpToolList() const {
 }
 
 bool App::mcpKnownTool(const std::string& name) { return name != "find_tools" && toolExists(name); }
+
+// ---- forgiving calls: weaker models get names and arguments slightly wrong; most of it is clear
+// enough to fix here (and say so), and what is not gets an answer that shows the right call.
+namespace {
+std::string lowKey(const std::string& s) {
+    std::string o;
+    for (char c : s) if (c != '_' && c != '-' && c != ' ') o.push_back((char)std::tolower((unsigned char)c));
+    return o;
+}
+int editDistance(const std::string& a, const std::string& b) {
+    std::vector<int> prev(b.size() + 1), cur(b.size() + 1);
+    for (size_t j = 0; j <= b.size(); ++j) prev[j] = (int)j;
+    for (size_t i = 1; i <= a.size(); ++i) {
+        cur[0] = (int)i;
+        for (size_t j = 1; j <= b.size(); ++j)
+            cur[j] = std::min({prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1)});
+        std::swap(prev, cur);
+    }
+    return prev[b.size()];
+}
+std::string numText(double d) {
+    char b[32];
+    std::snprintf(b, sizeof b, "%.10g", d);
+    return b;
+}
+std::string typeOf(const Value& sch) {
+    if (sch.isObject() && sch["type"].isString()) return sch["type"].asString();
+    return "";
+}
+} // namespace
+
+std::string App::mcpFixCall(std::string& name, Value& args, bool& fatal) const {
+    fatal = false;
+    std::string note;
+    // Tool names some apps prefix ("mcp__kestral__extrude", "kestral.extrude").
+    if (auto p = name.rfind("__"); p != std::string::npos) name = name.substr(p + 2);
+    for (const char* pre : {"kestral.", "kestral_", "Kestral."})
+        if (name.rfind(pre, 0) == 0) name = name.substr(std::strlen(pre));
+    // Every tool with its schema (modeling tools and the whole-program ones).
+    std::vector<std::pair<std::string, Value>> all;
+    for (auto& t : kTools)
+        if (std::string(t.name) != "find_tools") all.push_back({t.name, Value::parse(t.schema)});
+    Value uiList = mcpUiToolList();   // kept alive: its items are read below
+    for (auto& v : uiList.items()) all.push_back({v["name"].asString(), v["inputSchema"]});
+    auto find = [&](const std::string& n) -> const Value* {
+        for (auto& [k, sch] : all) if (k == n) return &sch;
+        return nullptr;
+    };
+    if (!find(name)) {
+        // Common names for tools that exist under another name.
+        static const std::pair<const char*, const char*> alias[] = {
+            {"remove", "delete"}, {"erase", "delete"}, {"deletebody", "delete"}, {"deletebodies", "delete"},
+            {"deletesketch", "delete"}, {"deletesketches", "delete"}, {"removebody", "delete"}, {"removesketch", "delete"},
+            {"hide", "set_visibility"}, {"show", "set_visibility"}, {"visibility", "set_visibility"},
+            {"sketch", "create_sketch"}, {"newsketch", "create_sketch"}, {"startsketch", "create_sketch"},
+            {"draw", "sketch_add"}, {"addtosketch", "sketch_add"}, {"sketchentities", "sketch_add"}, {"addentities", "sketch_add"},
+            {"box", "create_box"}, {"cube", "create_box"}, {"cylinder", "create_cylinder"}, {"sphere", "create_sphere"},
+            {"getdesign", "get_design"}, {"listbodies", "get_design"}, {"design", "get_design"}, {"bodies", "get_design"},
+            {"open", "open_design"}, {"save", "save_design"}, {"cut", "extrude"}, {"pull", "press_pull"},
+            {"translate", "move"}, {"moveBody", "move"}, {"look", "look_at_design"}, {"view_design", "look_at_design"},
+        };
+        std::string k = lowKey(name);
+        for (auto& [from, to] : alias)
+            if (lowKey(from) == k && find(to)) {
+                note += "(" + name + " is called " + to + " in Kestral.) ";
+                if (k == "hide" || k == "show") args.set("visible", k == "show");
+                if ((k == "deletesketch" || k == "deletesketches" || k == "removesketch") && !args.has("sketches")) {
+                    Value arr = Value::array();
+                    for (const char* key : {"sketches", "sketch", "sketch_id", "sketch_ids", "names", "name", "id", "ids"})
+                        if (args.has(key)) {
+                            const Value& v = args[key];
+                            if (v.isArray()) for (auto& x : v.items()) arr.push(x); else arr.push(v);
+                        }
+                    Value na = Value::object();
+                    na.set("sketches", arr);
+                    args = na;
+                }
+                name = to;
+                break;
+            }
+        if (!find(name)) {
+            for (auto& [n, sch] : all)
+                if (lowKey(n) == k) { name = n; break; }
+        }
+        if (!find(name)) {
+            std::vector<std::pair<int, std::string>> near;
+            for (auto& [n, sch] : all) {
+                int d = editDistance(lowKey(n), k);
+                if (lowKey(n).find(k) != std::string::npos || k.find(lowKey(n)) != std::string::npos) d = std::min(d, 2);
+                near.push_back({d, n});
+            }
+            std::sort(near.begin(), near.end());
+            std::string sug;
+            for (size_t i = 0; i < near.size() && i < 4; ++i) sug += (i ? ", " : "") + near[i].second;
+            fatal = true;
+            return "Unknown tool: " + name + ". Closest Kestral tools: " + sug + ". Deleting bodies or sketches is the delete tool "
+                   "(names for bodies, sketches for sketches); list_commands and run_command reach every menu command.";
+        }
+    }
+    const Value* sch = find(name);
+    if (!sch || !args.isObject()) return note;
+    const Value& props = (*sch)["properties"];
+    if (!props.isObject()) return note;
+    auto propType = [&](const std::string& k) { return typeOf(props[k]); };
+    auto known = [&](const std::string& k) { return props.has(k); };
+    // Argument names: exact, then case and underscores ignored, then singular / plural, then a few
+    // words models use for the same thing.
+    static const std::pair<const char*, const char*> syn[] = {
+        {"body", "names"}, {"bodies", "names"}, {"bodynames", "names"}, {"targets", "names"}, {"target", "names"},
+        {"sketch", "sketch_id"}, {"sketchid", "sketch_id"}, {"id", "sketch_id"},
+        {"depth", "distance"}, {"length", "distance"}, {"amount", "distance"},
+        {"op", "operation"}, {"mode", "operation"}, {"name", "text"}, {"label", "text"}, {"target", "text"},
+    };
+    // ui_input actions written with "type" in place of "action".
+    if (name == "ui_input" && args["actions"].isArray()) {
+        Value acts = Value::array();
+        bool changed = false;
+        for (auto& it : args["actions"].items()) {
+            if (it.isObject() && !it.has("action") && it["type"].isString()) {
+                Value o = Value::object();
+                for (auto& [k, v] : it.members()) o.set(k == "type" ? "action" : k, v);
+                acts.push(o);
+                changed = true;
+            } else {
+                acts.push(it);
+            }
+        }
+        if (changed) {
+            Value na = Value::object();
+            for (auto& [k, v] : args.members()) na.set(k, k == "actions" ? acts : v);
+            args = na;
+            note += "(Each action is named by \"action\", not \"type\".) ";
+        }
+    }
+    Value fixed = Value::object();
+    std::string renamed, dropped;
+    for (auto& [k0, v0] : args.members()) {
+        std::string k = k0;
+        Value v = v0;
+        if (!known(k)) {
+            std::string lk = lowKey(k), to;
+            for (auto& [pk, pv] : props.members()) if (lowKey(pk) == lk) to = pk;
+            if (to.empty() && known(k + "s")) to = k + "s";
+            if (to.empty() && k.size() > 1 && k.back() == 's' && known(k.substr(0, k.size() - 1))) to = k.substr(0, k.size() - 1);
+            if (to.empty())
+                for (auto& [from, too] : syn)
+                    if (lowKey(from) == lk && known(too) && !args.has(too)) { to = too; break; }
+            if (to.empty()) { dropped += (dropped.empty() ? "" : ", ") + k; continue; }
+            renamed += (renamed.empty() ? "" : ", ") + k + " -> " + to;
+            k = to;
+        }
+        std::string t = propType(k);
+        if (t == "array" && !v.isArray()) {
+            Value arr = Value::array();
+            if (v.isString() && v.asString().find(',') != std::string::npos && k != "entities") {
+                std::string s = v.asString(), part;
+                for (char c : s + ",") {
+                    if (c == ',') { while (!part.empty() && part.back() == ' ') part.pop_back(); size_t b = part.find_first_not_of(' ');
+                                    if (b != std::string::npos) arr.push(part.substr(b)); part.clear(); }
+                    else part.push_back(c);
+                }
+            } else {
+                arr.push(v);
+            }
+            v = arr;
+        } else if (t == "number" && v.isString()) {
+            char* end = nullptr;
+            double d = std::strtod(v.asString().c_str(), &end);
+            if (end && *end == 0 && !v.asString().empty()) v = Value(d);
+        } else if (t == "boolean" && v.isString()) {
+            std::string l = lowKey(v.asString());
+            if (l == "true" || l == "yes" || l == "1") v = Value(true);
+            else if (l == "false" || l == "no" || l == "0") v = Value(false);
+        } else if (t == "string" && v.isNumber()) {
+            v = Value(numText(v.asNumber()));
+        } else if (t == "array" && v.isArray() && k == "names") {
+            // names given as numbers (body ids): keep them as text, the tools match ids written out
+            Value arr = Value::array();
+            for (auto& x : v.items()) arr.push(x.isNumber() ? Value(numText(x.asNumber())) : x);
+            v = arr;
+        } else if (t == "number" && v.isArray() && v.size() == 1 && v.items()[0].isNumber()) {
+            { Value one = v.items()[0]; v = one; }
+        }
+        if (!fixed.has(k)) fixed.set(k, v);
+    }
+    args = fixed;
+    if (!renamed.empty()) note += "(Read " + renamed + ".) ";
+    auto listProps = [&] {
+        std::string o;
+        for (auto& [pk, pv] : props.members()) {
+            std::string t = typeOf(pv);
+            o += (o.empty() ? "" : ", ") + pk + (t.empty() ? "" : " (" + t + ")");
+        }
+        return o;
+    };
+    if (!dropped.empty()) note += "(Ignored " + dropped + ": " + name + " takes " + listProps() + ".) ";
+    const Value& req = (*sch)["required"];
+    if (req.isArray()) {
+        std::string miss;
+        for (auto& r : req.items())
+            if (r.isString() && !args.has(r.asString())) miss += (miss.empty() ? "" : ", ") + r.asString();
+        if (!miss.empty()) {
+            fatal = true;
+            return "Error: " + name + " needs " + miss + ". It takes " + listProps() + ". " + note;
+        }
+    }
+    return note;
+}
 
 } // namespace kst

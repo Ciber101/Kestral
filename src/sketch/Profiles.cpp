@@ -363,6 +363,55 @@ bool makeCurve(const Sketch& sk, const Entity& e, Curve& c) {
 }
 } // namespace
 
+void profileTrisFor(const Sketch& sk, const Profile& p, const std::function<double(Vec2)>& tolAt, std::vector<Vec2>& tris) {
+    tris.clear();
+    try {
+        auto sampleLoop = [&](const Loop& loop, std::vector<Vec2>& out) {
+            for (const ProfEdge& pe : loop.edges) {
+                if (pe.chord) { out.push_back(pe.ca); continue; }
+                const Entity* e = sk.find(pe.ent);
+                Curve c;
+                if (!e || !makeCurve(sk, *e, c)) continue;
+                if (c.type == EntType::Line) { out.push_back(c.at(pe.ta)); continue; }
+                // Start from 3 degree pieces, then split a piece in half while its middle is farther
+                // from the chord than the view allows there.
+                double span = std::abs(pe.tb - pe.ta) * c.g.sweep;
+                int base = std::max(2, (int)std::ceil(span / (kPi / 60.0)));
+                std::function<void(double, double, Vec2, Vec2, int)> refine = [&](double t0, double t1, Vec2 p0, Vec2 p1, int depth) {
+                    double tm = 0.5 * (t0 + t1);
+                    Vec2 pm = c.at(tm);
+                    Vec2 ch = p1 - p0;
+                    double L = glm::length(ch);
+                    double sag = L > 1e-15 ? std::abs((pm.x - p0.x) * ch.y - (pm.y - p0.y) * ch.x) / L : glm::length(pm - p0);
+                    if (depth < 22 && sag > tolAt(pm)) {
+                        refine(t0, tm, p0, pm, depth + 1);
+                        refine(tm, t1, pm, p1, depth + 1);
+                        return;
+                    }
+                    out.push_back(p0);
+                };
+                for (int k = 0; k < base; ++k) {
+                    double t0 = pe.ta + (pe.tb - pe.ta) * k / base, t1 = pe.ta + (pe.tb - pe.ta) * (k + 1) / base;
+                    refine(t0, t1, c.at(t0), c.at(t1), 0);
+                }
+            }
+        };
+        std::vector<Vec2> outer;
+        sampleLoop(p.outer, outer);
+        std::vector<std::vector<Vec2>> holes(p.holes.size());
+        std::vector<const std::vector<Vec2>*> hp;
+        for (size_t i = 0; i < p.holes.size(); ++i) {
+            sampleLoop(p.holes[i], holes[i]);
+            hp.push_back(&holes[i]);
+        }
+        if (outer.size() < 3) { tris = p.tris; return; }
+        triangulate(outer, hp, tris);
+        if (tris.empty()) tris = p.tris;
+    } catch (...) {
+        tris = p.tris;
+    }
+}
+
 std::vector<double> curveSplitParams(const Sketch& sk, uint32_t ent) {
     std::vector<double> out;
     try {
@@ -662,7 +711,9 @@ std::vector<Profile> findProfiles(const Sketch& sk) {
             const Curve& c = curves[e.curve];
             double t0 = fwd ? e.ta : e.tb, t1 = fwd ? e.tb : e.ta;
             int n = 1;
-            if (c.type != EntType::Line) n = std::max(2, (int)std::ceil(std::abs(t1 - t0) * c.g.sweep / (kPi / 60.0)));
+            // 0.75 degree pieces (480 per circle): the shaded region stays on its smooth outline when
+            // zoomed in far (it was 3 degrees, visibly faceted up close).
+            if (c.type != EntType::Line) n = std::max(2, (int)std::ceil(std::abs(t1 - t0) * c.g.sweep / (kPi / 240.0)));
             for (int k = 0; k < n; ++k) poly.push_back(c.at(t0 + (t1 - t0) * k / n));
         };
         for (int h0 = 0; h0 < H; ++h0) {

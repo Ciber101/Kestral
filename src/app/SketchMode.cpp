@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 
@@ -108,21 +109,138 @@ struct PlaneView {
 std::string snapText(const Sketch& s, const SnapInfo& si) {
     switch (si.kind) {
     case SnapKind::Point: {
+        if (si.refPt == 1) return "Body corner";
+        if (si.refPt == 2) return "Body center";
         if (si.point == 0 && si.curve == 0xFFFFFFFFu) return "Face center";
         if (si.point == Sketch::kOrigin) return "Origin";
         for (auto& [id, e] : s.ents)
             if ((e.type == EntType::Circle || e.type == EntType::Arc) && e.c == si.point) return "Center";
         return "Endpoint";
     }
-    case SnapKind::OnCurve: return si.curve == Sketch::kXAxis ? "On X axis" : si.curve == Sketch::kYAxis ? "On Y axis" : "On curve";
+    case SnapKind::OnCurve:
+        if (si.guide >= 0) {
+            std::string g = si.guide % 180 == 0 ? "Horizontal" : si.guide % 180 == 90 ? "Vertical" : std::to_string(si.guide) + "\xC2\xB0";
+            return ((si.curve & kRefBit) ? "On body edge, " : "On curve, ") + g;
+        }
+        if (si.curve & kRefBit) return "On body edge";
+        return si.curve == Sketch::kXAxis ? "On X axis" : si.curve == Sketch::kYAxis ? "On Y axis" : "On curve";
     case SnapKind::Midpoint: return "Midpoint";
+    case SnapKind::Intersection: return "Intersection";
+    case SnapKind::Angle: return std::to_string(si.curve2) + "\xC2\xB0";
     case SnapKind::Horizontal: return "Horizontal";
     case SnapKind::Vertical: return "Vertical";
     default: return {};
     }
 }
 
-SnapInfo computeSnap(const Sketch& s, const Vec2& raw, double tol, bool useGrid, double grid, bool infer, bool hasAnchor, Vec2 anchor) {
+// Where two curves cross near the cursor (the X and Y axes count, as infinite lines). Every curve
+// kind works the same way: their drawn polylines find the crossing roughly, then stepping between
+// the exact closest points on the two curves pins it down (a circle on an axis to 1e-12 mm).
+bool nearestIntersection(const Sketch& s, const Vec2& raw, double tol, Vec2& out, uint32_t& c1, uint32_t& c2, const SketchRefs* refs) {
+    struct Cand { uint32_t id; std::vector<Vec2> poly; };
+    std::vector<Cand> cands;
+    const double reach = tol * 3;
+    auto project = [&](uint32_t id, const Vec2& p, Vec2& q) {
+        if (id & kRefBit) return refClosest(refs->curves[id & ~kRefBit], p, q);
+        if (id == Sketch::kXAxis) { q = Vec2(p.x, 0); return std::abs(p.y); }
+        if (id == Sketch::kYAxis) { q = Vec2(0, p.y); return std::abs(p.x); }
+        const Entity* e = s.find(id);
+        return e ? s.distanceTo(*e, p, &q) : 1e30;
+    };
+    if (std::abs(raw.y) < reach) cands.push_back({Sketch::kXAxis, {Vec2(raw.x - reach * 4, 0), Vec2(raw.x + reach * 4, 0)}});
+    if (std::abs(raw.x) < reach) cands.push_back({Sketch::kYAxis, {Vec2(0, raw.y - reach * 4), Vec2(0, raw.y + reach * 4)}});
+    for (auto& [id, e] : s.ents) {
+        if (e.type == EntType::Point || e.locked || cands.size() >= 16) continue;
+        Vec2 q;
+        if (s.distanceTo(e, raw, &q) > reach) continue;
+        Cand c{id, {}};
+        switch (e.type) {
+        case EntType::Line: c.poly = {s.pt(e.a), s.pt(e.b)}; break;
+        case EntType::Circle: {
+            Vec2 ce = s.pt(e.c);
+            for (int i = 0; i <= 128; ++i) { double t = 6.283185307179586 * i / 128; c.poly.push_back(ce + Vec2(std::cos(t), std::sin(t)) * e.r); }
+            break;
+        }
+        case EntType::Arc: {
+            Vec2 ce = s.pt(e.c), a = s.pt(e.a), b = s.pt(e.b);
+            double r = glm::length(a - ce), t0 = std::atan2(a.y - ce.y, a.x - ce.x), t1 = std::atan2(b.y - ce.y, b.x - ce.x), sw = t1 - t0;
+            while (sw <= 0) sw += 6.283185307179586;
+            for (int i = 0; i <= 96; ++i) { double t = t0 + sw * i / 96; c.poly.push_back(ce + Vec2(std::cos(t), std::sin(t)) * r); }
+            break;
+        }
+        case EntType::Ellipse:
+        case EntType::EllipArc: {
+            Sketch::EllipseGeom g;
+            if (!s.ellipseGeom(e, g)) continue;
+            for (int i = 0; i <= 128; ++i) c.poly.push_back(s.ellipsePoint(g, (double)i / 128));
+            break;
+        }
+        case EntType::Spline: c.poly = s.splinePoly(e, 16); break;
+        case EntType::CtrlSpline: c.poly = s.ctrlSplinePoly(e, 16); break;
+        default: break;
+        }
+        if (c.poly.size() >= 2) cands.push_back(std::move(c));
+    }
+    if (refs) {
+        int took = 0;
+        for (size_t i = 0; i < refs->curves.size() && took < 12; ++i) {
+            const RefCurve& rc = refs->curves[i];
+            if (raw.x < rc.lo.x - reach || raw.x > rc.hi.x + reach || raw.y < rc.lo.y - reach || raw.y > rc.hi.y + reach) continue;
+            Vec2 q;
+            if (refClosest(rc, raw, q) > reach || rc.poly.size() < 2) continue;
+            cands.push_back({kRefBit | (uint32_t)i, rc.poly});
+            ++took;
+        }
+    }
+    // Only the pieces near the cursor take part (keeps this instant with many curves around).
+    auto segNear = [&](Vec2 a, Vec2 b) {
+        Vec2 d = b - a;
+        double l2 = glm::dot(d, d), t = l2 > 1e-24 ? std::clamp(glm::dot(raw - a, d) / l2, 0.0, 1.0) : 0.0;
+        return glm::length(a + d * t - raw) < reach * 2;
+    };
+    for (auto& c : cands) {
+        std::vector<Vec2> keep;   // pairs: start, end
+        for (size_t k = 1; k < c.poly.size(); ++k)
+            if (segNear(c.poly[k - 1], c.poly[k])) { keep.push_back(c.poly[k - 1]); keep.push_back(c.poly[k]); }
+        c.poly = std::move(keep);
+    }
+    double best = tol * 1.2;
+    bool found = false;
+    auto cross2 = [](Vec2 a, Vec2 b) { return a.x * b.y - a.y * b.x; };
+    for (size_t i = 0; i < cands.size(); ++i)
+        for (size_t j = i + 1; j < cands.size(); ++j) {
+            // Two body edges crossing only in this view do not meet: their corners snap instead.
+            if ((cands[i].id & kRefBit) && (cands[j].id & kRefBit)) continue;
+            const auto& A = cands[i].poly;
+            const auto& B = cands[j].poly;
+            for (size_t a = 1; a < A.size(); a += 2)
+                for (size_t b = 1; b < B.size(); b += 2) {
+                    Vec2 p = A[a - 1], r = A[a] - A[a - 1], q = B[b - 1], d = B[b] - B[b - 1];
+                    double den = cross2(r, d);
+                    if (std::abs(den) < 1e-15) continue;
+                    double t = cross2(q - p, d) / den, u = cross2(q - p, r) / den;
+                    if (t < -1e-6 || t > 1 + 1e-6 || u < -1e-6 || u > 1 + 1e-6) continue;
+                    Vec2 x = p + r * t;
+                    if (glm::length(x - raw) > reach) continue;
+                    // Refine on the exact curves.
+                    for (int it = 0; it < 60; ++it) {
+                        Vec2 qa, qb;
+                        project(cands[i].id, x, qa);
+                        project(cands[j].id, qa, qb);
+                        Vec2 nx = (qa + qb) * 0.5;
+                        if (glm::length(nx - x) < 1e-13) { x = nx; break; }
+                        x = nx;
+                    }
+                    Vec2 tmp;
+                    if (project(cands[i].id, x, tmp) > 1e-6 || project(cands[j].id, x, tmp) > 1e-6) continue;   // not a real crossing
+                    double dd = glm::length(x - raw);
+                    if (dd < best) { best = dd; out = x; c1 = cands[i].id; c2 = cands[j].id; found = true; }
+                }
+        }
+    return found;
+}
+
+static SnapInfo computeSnapImpl(const Sketch& s, const Vec2& raw, double tol, bool useGrid, double grid, bool infer, bool hasAnchor, Vec2 anchor, const SketchRefs* refs) {
     SnapInfo r;
     r.pos = raw;
     // Closest point, closest edge middle, and the face center compete. The nearest one wins, so a
@@ -137,6 +255,13 @@ SnapInfo computeSnap(const Sketch& s, const Vec2& raw, double tol, bool useGrid,
         double d = glm::length(Vec2(e.x, e.y) - raw);
         if (d < bestPt) { bestPt = d; bp = id; }
     }
+    int refP = -1;
+    if (refs)
+        for (size_t i = 0; i < refs->pts.size(); ++i) {
+            double d = glm::length(refs->pts[i].first - raw) + 1e-9;
+            if (d < bestPt) { bestPt = d; refP = (int)i; }
+        }
+    if (refP >= 0) bp = 0;
     for (auto& [id, e] : s.ents) {
         if (e.type != EntType::Line) continue;
         if (id == Sketch::kXAxis || id == Sketch::kYAxis) continue;
@@ -144,6 +269,14 @@ SnapInfo computeSnap(const Sketch& s, const Vec2& raw, double tol, bool useGrid,
         double d = glm::length(m - raw);
         if (d < bestMid) { bestMid = d; haveMid = true; mp = m; mc = id; }
     }
+    if (refs)
+        for (size_t i = 0; i < refs->curves.size(); ++i) {
+            const RefCurve& rc = refs->curves[i];
+            if (rc.type != 0) continue;
+            Vec2 m = (rc.a + rc.b) * 0.5;
+            double d = glm::length(m - raw) + 1e-9;
+            if (d < bestMid) { bestMid = d; haveMid = true; mp = m; mc = kRefBit | (uint32_t)i; }
+        }
     {
         Vec2 sum(0);
         int nf = 0;
@@ -160,8 +293,23 @@ SnapInfo computeSnap(const Sketch& s, const Vec2& raw, double tol, bool useGrid,
             haveFace = bestFace < tol * 1.8;
         }
     }
-    if (bp && (!haveMid || bestPt <= bestMid) && (!haveFace || bestPt <= bestFace)) {
-        r.kind = SnapKind::Point; r.point = bp; r.pos = s.pt(bp); return r;
+    if ((bp || refP >= 0) && (!haveMid || bestPt <= bestMid) && (!haveFace || bestPt <= bestFace)) {
+        r.kind = SnapKind::Point;
+        if (refP >= 0) { r.pos = refs->pts[refP].first; r.refPt = refs->pts[refP].second; return r; }
+        r.point = bp; r.pos = s.pt(bp); return r;
+    }
+    // Where two curves cross (a circle on an axis, two lines): ahead of middles and plain "on curve".
+    {
+        Vec2 ix;
+        uint32_t c1 = 0, c2 = 0;
+        if (nearestIntersection(s, raw, tol, ix, c1, c2, refs) && (!haveMid || glm::length(ix - raw) <= bestMid) &&
+            (!haveFace || glm::length(ix - raw) <= bestFace)) {
+            r.kind = SnapKind::Intersection;
+            r.pos = ix;
+            r.curve = c1;
+            r.curve2 = c2;
+            return r;
+        }
     }
     if (haveFace && (!haveMid || bestFace <= bestMid)) {
         r.kind = SnapKind::Point;
@@ -187,13 +335,81 @@ SnapInfo computeSnap(const Sketch& s, const Vec2& raw, double tol, bool useGrid,
         double d = s.distanceTo(e, raw, &q);
         if (d < best) { best = d; bc = id; bq = q; }
     }
+    if (refs)
+        for (size_t i = 0; i < refs->curves.size(); ++i) {
+            const RefCurve& rc = refs->curves[i];
+            if (raw.x < rc.lo.x - best || raw.x > rc.hi.x + best || raw.y < rc.lo.y - best || raw.y > rc.hi.y + best) continue;
+            Vec2 q;
+            double d = refClosest(rc, raw, q) + 1e-9;
+            if (d < best) { best = d; bc = kRefBit | (uint32_t)i; bq = q; }
+        }
     if (bc) {
-        const Entity* e = s.find(bc);
+        if (bc & kRefBit) {
+            const RefCurve& rc = refs->curves[bc & ~kRefBit];
+            if (rc.type == 0 && glm::length((rc.a + rc.b) * 0.5 - raw) < tol * 1.3) { r.kind = SnapKind::Midpoint; r.pos = (rc.a + rc.b) * 0.5; r.curve = bc; return r; }
+        }
+        const Entity* e = (bc & kRefBit) ? nullptr : s.find(bc);
         if (e && e->type == EntType::Line && !e->locked) {
             Vec2 mid = s.center(*e);
             if (glm::length(mid - raw) < tol * 1.3) { r.kind = SnapKind::Midpoint; r.pos = mid; r.curve = bc; return r; }
         }
         r.kind = SnapKind::OnCurve; r.pos = bq; r.curve = bc;
+        // Drawing a line: where the horizontal, vertical or 45 degree guide from the start crosses
+        // this curve, so the line lands on the curve and stays square at the same time.
+        if (infer && hasAnchor) {
+            Vec2 v = raw - anchor;
+            double len = glm::length(v);
+            if (len > tol) {
+                const double kPi4 = 0.7853981633974483;
+                int k = (int)std::lround(std::atan2(v.y, v.x) / kPi4);
+                k = ((k % 8) + 8) % 8;
+                Vec2 dir(std::cos(k * kPi4), std::sin(k * kPi4));
+                double off = std::abs(v.x * dir.y - v.y * dir.x);
+                if (off < tol && glm::dot(v, dir) > tol) {
+                    auto onCurve = [&](const Vec2& p, Vec2& q) {
+                        if (bc & kRefBit) return refClosest(refs->curves[bc & ~kRefBit], p, q);
+                        if (bc == Sketch::kXAxis) { q = Vec2(p.x, 0); return std::abs(p.y); }
+                        if (bc == Sketch::kYAxis) { q = Vec2(0, p.y); return std::abs(p.x); }
+                        const Entity* e = s.find(bc);
+                        return e ? s.distanceTo(*e, p, &q) : 1e30;
+                    };
+                    // A straight curve: solve the crossing outright. Anything else: step between the two.
+                    bool straight = false;
+                    Vec2 la, lb;
+                    if (bc == Sketch::kXAxis) { straight = true; la = Vec2(0, 0); lb = Vec2(1, 0); }
+                    else if (bc == Sketch::kYAxis) { straight = true; la = Vec2(0, 0); lb = Vec2(0, 1); }
+                    else if (bc & kRefBit) {
+                        const RefCurve& rc = refs->curves[bc & ~kRefBit];
+                        if (rc.type == 0) { straight = true; la = rc.a; lb = rc.b; }
+                    } else if (const Entity* e = s.find(bc); e && e->type == EntType::Line) { straight = true; la = s.pt(e->a); lb = s.pt(e->b); }
+                    Vec2 x = anchor + dir * glm::dot(raw - anchor, dir);
+                    bool ok = false;
+                    if (straight) {
+                        Vec2 d = lb - la;
+                        double den = dir.x * d.y - dir.y * d.x;
+                        if (std::abs(den) > 1e-9 * glm::length(d)) {
+                            double t = ((la.x - anchor.x) * d.y - (la.y - anchor.y) * d.x) / den;
+                            x = anchor + dir * t;
+                            ok = true;
+                        }
+                    } else {
+                        for (int it = 0; it < 200; ++it) {
+                            Vec2 q;
+                            onCurve(x, q);
+                            Vec2 nx = anchor + dir * glm::dot(q - anchor, dir);
+                            if (glm::length(nx - x) < 1e-13) { x = nx; break; }
+                            x = nx;
+                        }
+                        ok = true;
+                    }
+                    Vec2 q;
+                    if (ok && onCurve(x, q) < 1e-7 && glm::length(x - raw) < tol * 1.5 && glm::dot(x - anchor, dir) > 1e-9) {
+                        r.pos = x;
+                        r.guide = k * 45;
+                    }
+                }
+            }
+        }
         return r;
     }
     // 3. horizontal / vertical inference from the anchor
@@ -211,11 +427,43 @@ SnapInfo computeSnap(const Sketch& s, const Vec2& raw, double tol, bool useGrid,
             if (useGrid && grid > 0) r.pos.y = std::round(raw.y / grid) * grid;
             return r;
         }
+        // The diagonals: 45, 135, 225 and 315 degrees from the line's start, the same pull as
+        // horizontal and vertical (a few pixels to either side of the guide).
+        Vec2 v = raw - anchor;
+        const double h = 0.7071067811865476;
+        const Vec2 dirs[4] = {Vec2(h, h), Vec2(-h, h), Vec2(-h, -h), Vec2(h, -h)};
+        const int degs[4] = {45, 135, 225, 315};
+        for (int k = 0; k < 4; ++k) {
+            double along = glm::dot(v, dirs[k]);
+            double off = std::abs(v.x * dirs[k].y - v.y * dirs[k].x);
+            if (along > tol && off < tol * 0.6) {
+                r.kind = SnapKind::Angle;
+                r.curve2 = (uint32_t)degs[k];
+                if (useGrid && grid > 0) along = std::round(along / grid) * grid;   // grid steps along the diagonal
+                r.pos = anchor + dirs[k] * along;
+                return r;
+            }
+        }
     }
     // 4. grid
     if (useGrid && grid > 0) {
         r.kind = SnapKind::Grid;
         r.pos = Vec2(std::round(raw.x / grid) * grid, std::round(raw.y / grid) * grid);
+    }
+    return r;
+}
+
+SnapInfo computeSnap(const Sketch& s, const Vec2& raw, double tol, bool useGrid, double grid, bool infer, bool hasAnchor, Vec2 anchor, const SketchRefs* refs) {
+    SnapInfo r = computeSnapImpl(s, raw, tol, useGrid, grid, infer, hasAnchor, anchor, refs);
+    if (refs && (r.kind == SnapKind::OnCurve || r.kind == SnapKind::Midpoint || r.kind == SnapKind::Intersection)) {
+        auto name = [&](uint32_t id, SnapInfo::Ref& out) {
+            if (!(id & kRefBit)) return;
+            const RefCurve& rc = refs->curves[id & ~kRefBit];
+            out.body = rc.body;
+            out.edge = rc.edge;
+        };
+        name(r.curve, r.ref1);
+        if (r.kind == SnapKind::Intersection) name(r.curve2, r.ref2);
     }
     return r;
 }
@@ -406,8 +654,42 @@ void App::editSketch(uint32_t id) {
     sk::computeDof(it->second);
     if (!already && settings_.sketchLookAt) sketchLookAt();   // Look At stays one click away
     markSceneDirty();
-    doc_.touch();
+    {
+        // Opening a sketch to look at it is not a change; drawing in it is (that marks it).
+        bool wasClean = !dirty_ && doc_.revision == cleanRev_;
+        doc_.touch();
+        if (wasClean) cleanRev_ = doc_.revision;
+    }
     activity();
+}
+
+// After undo or redo: be where that state was made. In its sketch (entered again without finishing
+// anything, no camera move), or out of sketch mode.
+void App::goToUndoCtx(const UndoCtx& c) {
+    bool want = c.sketch != 0 && doc_.sketches.count(c.sketch);
+    if (!want) {
+        if (sk_.active) {
+            leaveSketchMode();
+            savedMarker_ = -1;
+        }
+        return;
+    }
+    if (sk_.active && sk_.sketchId == c.sketch) {
+        savedMarker_ = c.savedMarker;
+        return;
+    }
+    if (sk_.active) leaveSketchMode();
+    // (An open command is not closed here: cancelling one runs undo itself, which lands here.)
+    resetTransient(sk_);
+    sk_.active = true;
+    sk_.choosingPlane = false;
+    sk_.sketchId = c.sketch;
+    savedMarker_ = c.savedMarker;
+    isolated_.clear();
+    auto& s = doc_.sketches[c.sketch];
+    s.visible = true;
+    sk::computeDof(s);
+    toast("Back in " + s.name);
 }
 
 void App::leaveSketchMode() {
@@ -421,6 +703,8 @@ void App::leaveSketchMode() {
 
 void App::finishSketch() {
     if (!sk_.active) return;
+    // A step in the undo history (not a change to save: the sketch's edits already are).
+    undo_.push(doc_, "Finish Sketch", undoCtxNow());
     Sketch* s = curSketch();
     uint32_t sid = s ? s->id : 0;
     if (s && s->geometryCount() == 0) {
@@ -462,6 +746,7 @@ void App::sketchToolCommand(const std::string& id) {
 void App::setSketchTool(const std::string& id) {
     Sketch* s = curSketch();
     if (!s) return;
+    if (measureMode_) runMeasure();   // back to drawing
     sk_.tool = id == "select" ? std::string() : id;
     sk_.step = 0;
     sk_.clicks.clear();
@@ -556,10 +841,26 @@ void App::sketchFinishOp() {
     activity();
 }
 
-uint32_t App::sketchMakePoint(Sketch& s, const SnapInfo& si) {
+uint32_t App::sketchMakePoint(Sketch& s, const SnapInfo& si0) {
+    SnapInfo si = si0;
+    if (si.kind == SnapKind::Point && si.refPt) return sketchRefPointInto(s, si.pos);   // a body corner or center
+    if (si.kind == SnapKind::OnCurve || si.kind == SnapKind::Midpoint || si.kind == SnapKind::Intersection) {
+        // A body edge: project it in (like Fusion), then tie the point to it.
+        if (si.curve & kRefBit) si.curve = sketchRefCurveInto(s, si.ref1, si.pos);
+        if (si.kind == SnapKind::Intersection && (si.curve2 & kRefBit)) si.curve2 = sketchRefCurveInto(s, si.ref2, si.pos);
+        if (si.kind == SnapKind::Intersection && (!si.curve || !si.curve2)) {
+            si.kind = SnapKind::OnCurve;
+            if (!si.curve) si.curve = si.curve2;
+        }
+    }
     if (si.kind == SnapKind::Point && si.point && s.find(si.point)) return si.point;
     uint32_t p = s.addPoint(si.pos);
     if (si.kind == SnapKind::OnCurve && si.curve) s.addConstraint(CType::PointOnObject, p, si.curve);
+    else if (si.kind == SnapKind::Intersection && si.curve && si.curve2) {
+        // On both curves: it stays at their crossing when either one moves.
+        s.addConstraint(CType::PointOnObject, p, si.curve);
+        s.addConstraint(CType::PointOnObject, p, si.curve2);
+    }
     else if (si.kind == SnapKind::Midpoint && si.curve) s.addConstraint(CType::Midpoint, p, si.curve);
     return p;
 }
@@ -675,7 +976,15 @@ void App::sketchUpdate() {
         bool infer = sk_.tool == "line" && !sk_.clicks.empty();
         Vec2 anchor = infer ? sk_.clicks[0].pos : Vec2(0, 0);
         double tol = 9.0 / std::max(sk_.ppu, 1e-9);
-        sk_.snap = computeSnap(*s, sk_.raw, tol, sk_.optSnap, sk_.gridStep, infer, infer, anchor);
+        sketchRefsUpdate(*s);
+        sk_.snap = computeSnap(*s, sk_.raw, tol, sk_.optSnap, sk_.gridStep, infer, infer, anchor, &sk_.refs);
+        sk_.snapRefPoly.clear();
+        for (uint32_t id : {sk_.snap.curve, sk_.snap.curve2})
+            if ((id & kRefBit) && id != 0xFFFFFFFFu && sk_.snap.kind != SnapKind::Point && sk_.snap.kind != SnapKind::Angle && (id & ~kRefBit) < sk_.refs.curves.size()) {
+                const auto& pl = sk_.refs.curves[id & ~kRefBit].poly;
+                sk_.snapRefPoly.insert(sk_.snapRefPoly.end(), pl.begin(), pl.end());
+                sk_.snapRefPoly.push_back(Vec2(std::nan(""), 0));   // break between curves
+            }
         sk_.snapLabel = snapText(*s, sk_.snap);
     }
     sketchHud();
@@ -1340,8 +1649,8 @@ void App::sketchClickImpl() {
             uint32_t pb = sketchMakePoint(*s, si);
             if (pa == pb) return;
             uint32_t ln = s->addLine(pa, pb, cons);
-            if (si.kind == SnapKind::Horizontal) s->addConstraint(CType::Horizontal, ln);
-            else if (si.kind == SnapKind::Vertical) s->addConstraint(CType::Vertical, ln);
+            if (si.kind == SnapKind::Horizontal || si.guide == 0 || si.guide == 180) s->addConstraint(CType::Horizontal, ln);
+            else if (si.kind == SnapKind::Vertical || si.guide == 90 || si.guide == 270) s->addConstraint(CType::Vertical, ln);
             if (!sk_.chainStart) sk_.chainStart = pa;
             closing = pb == sk_.chainStart;
             SnapInfo n;
@@ -2420,7 +2729,8 @@ namespace {
 #define kDark (ui::th(IM_COL32(28, 32, 40, 255)))
 #define kHover (ui::th(IM_COL32(255, 160, 100, 255)))
 #define kSelect (ui::th(IM_COL32(255, 96, 30, 255)))
-#define kDim (ui::th(IM_COL32(18, 110, 70, 255)))
+// Dimensions: neon green on the dark theme so they stand out on any part, a strong green on light.
+#define kDim (ui::darkness() > 0.f ? IM_COL32(57, 255, 20, 255) : IM_COL32(0, 150, 40, 255))
 #define kBad (ui::th(IM_COL32(220, 50, 50, 255)))
 #define kFaint (ui::th(IM_COL32(120, 130, 145, 210)))
 
@@ -2432,7 +2742,32 @@ bool toScr(const SketchState& st, const sk::Plane& pl, Vec2 p, ImVec2& o) {
     return std::isfinite(o.x) && std::isfinite(o.y) && std::abs(o.x) < 1e7f && std::abs(o.y) < 1e7f;
 }
 
+void strokePathRun(ImDrawList* dl, const std::vector<ImVec2>& p, ImU32 col, float th, bool dashed, float dash, float gap);
+
+// Draws a path; a NaN point splits it (a part that cannot be shown). Long runs go in pieces of 1500
+// points: one thick anti aliased polyline of tens of thousands of points overflows ImGui's 16 bit
+// vertex indices and comes out faint or broken.
 void strokePath(ImDrawList* dl, const std::vector<ImVec2>& p, ImU32 col, float th, bool dashed, float dash = 7.f, float gap = 4.f) {
+    std::vector<ImVec2> run;
+    auto flush = [&] {
+        if (run.size() >= 2) {
+            if (dashed) strokePathRun(dl, run, col, th, true, dash, gap);
+            else
+                for (size_t i = 0; i + 1 < run.size(); i += 1499) {
+                    size_t n = std::min<size_t>(1500, run.size() - i);
+                    dl->AddPolyline(run.data() + i, (int)n, col, 0, th);
+                }
+        }
+        run.clear();
+    };
+    for (auto& v : p) {
+        if (std::isnan(v.x)) { flush(); continue; }
+        run.push_back(v);
+    }
+    flush();
+}
+
+void strokePathRun(ImDrawList* dl, const std::vector<ImVec2>& p, ImU32 col, float th, bool dashed, float dash, float gap) {
     if (p.size() < 2) return;
     if (!dashed) { dl->AddPolyline(p.data(), (int)p.size(), col, 0, th); return; }
     float acc = 0;
@@ -2456,46 +2791,109 @@ void strokePath(ImDrawList* dl, const std::vector<ImVec2>& p, ImU32 col, float t
     }
 }
 
+// A sketch curve on screen, smooth at any zoom: curves are sampled by their size on screen right
+// now (chord error about a third of a pixel), never by a fixed count or a stale zoom level. Used in and
+// out of sketch mode (a design just opened has never set the sketch zoom, which made circles octagons).
 bool curvePath(const SketchState& st, const Sketch& s, const Entity& e, std::vector<ImVec2>& out) {
     out.clear();
     const sk::Plane& pl = s.plane;
     ImVec2 q;
+    // A point that cannot be drawn (behind the eye when zoomed in close, or absurdly far off screen)
+    // leaves a gap instead of hiding the whole curve; strokePath draws the pieces on each side.
+    const ImVec2 gap(std::numeric_limits<float>::quiet_NaN(), 0.f);
+    auto put = [&](std::vector<ImVec2>& o, const Vec2& p) {
+        ImVec2 v;
+        if (toScr(st, pl, p, v)) o.push_back(v);
+        else if (!o.empty() && !std::isnan(o.back().x)) o.push_back(gap);
+    };
+    auto real = [](const std::vector<ImVec2>& o) {
+        int n = 0;
+        for (auto& v : o) if (!std::isnan(v.x)) ++n;
+        return n;
+    };
+    auto screenLen = [](const std::vector<ImVec2>& p) {
+        double L = 0;
+        for (size_t i = 1; i < p.size(); ++i)
+            if (!std::isnan(p[i].x) && !std::isnan(p[i - 1].x)) L += std::hypot(p[i].x - p[i - 1].x, p[i].y - p[i - 1].y);
+        return L;
+    };
     if (e.type == EntType::Spline || e.type == EntType::CtrlSpline) {
-        auto poly = e.type == EntType::CtrlSpline ? s.ctrlSplinePoly(e, 8) : s.splinePoly(e, 8);
-        for (auto& p : poly) {
-            if (!toScr(st, pl, p, q)) return false;
-            out.push_back(q);
-        }
-        return out.size() >= 2;
+        // A coarse pass measures it on screen, then enough samples per span for a smooth curve.
+        auto coarse = e.type == EntType::CtrlSpline ? s.ctrlSplinePoly(e, 8) : s.splinePoly(e, 8);
+        std::vector<ImVec2> cs;
+        for (auto& p : coarse) put(cs, p);
+        int spans = std::max(1, (int)(coarse.size() - 1) / 8);
+        int steps = std::clamp((int)std::ceil(screenLen(cs) / spans / 3.0), 8, 512);
+        if (steps == 8) { out = std::move(cs); return real(out) >= 2; }
+        auto poly = e.type == EntType::CtrlSpline ? s.ctrlSplinePoly(e, steps) : s.splinePoly(e, steps);
+        for (auto& p : poly) put(out, p);
+        return real(out) >= 2;
     }
     if (e.type == EntType::Ellipse || e.type == EntType::EllipArc) {
         Sketch::EllipseGeom g;
         if (!s.ellipseGeom(e, g)) return false;
-        int n = 64;
-        for (int i = 0; i <= n; ++i) {
-            if (!toScr(st, pl, s.ellipsePoint(g, (double)i / n), q)) return false;
-            out.push_back(q);
-        }
-        return out.size() >= 2;
+        std::vector<ImVec2> cs;
+        for (int i = 0; i <= 64; ++i) put(cs, s.ellipsePoint(g, (double)i / 64));
+        int n = std::clamp((int)std::ceil(screenLen(cs) / 3.0), 64, 8192);
+        if (n == 64) { out = std::move(cs); return real(out) >= 2; }
+        for (int i = 0; i <= n; ++i) put(out, s.ellipsePoint(g, (double)i / n));
+        return real(out) >= 2;
     }
     if (e.type == EntType::Line) {
-        if (!toScr(st, pl, s.pt(e.a), q)) return false;
-        out.push_back(q);
-        if (!toScr(st, pl, s.pt(e.b), q)) return false;
-        out.push_back(q);
+        // A line with an end behind the eye (zoomed in close in perspective) is cut where it leaves
+        // the view instead of disappearing.
+        glm::dvec3 A = pl.toWorld(s.pt(e.a)), B = pl.toWorld(s.pt(e.b));
+        glm::dvec4 ca = st.vp * glm::dvec4(A, 1.0), cb = st.vp * glm::dvec4(B, 1.0);
+        const double eps = 1e-6;
+        if (ca.w <= eps && cb.w <= eps) return false;
+        if (ca.w <= eps || cb.w <= eps) {
+            double t = (eps * 4 - ca.w) / (cb.w - ca.w);
+            glm::dvec3 C = A + (B - A) * t;
+            if (ca.w <= eps) A = C; else B = C;
+        }
+        for (const glm::dvec3& w : {A, B}) {
+            glm::dvec4 c = st.vp * glm::dvec4(w, 1.0);
+            if (c.w <= 1e-9) return false;
+            ImVec2 v((float)((c.x / c.w * 0.5 + 0.5) * st.W), (float)((c.y / c.w * 0.5 + 0.5) * st.H));
+            if (!std::isfinite(v.x) || !std::isfinite(v.y)) return false;
+            // Far beyond the screen: pull it in along the line (float precision stays fine).
+            out.push_back(v);
+        }
+        ImVec2& a = out[0];
+        ImVec2& b = out[1];
+        const float lim = 2e6f;
+        auto pull = [&](ImVec2& far, const ImVec2& near) {
+            float m = std::max(std::abs(far.x), std::abs(far.y));
+            if (m <= lim) return;
+            float t = 0, lo = 0, hi = 1;
+            for (int it = 0; it < 40; ++it) {
+                t = (lo + hi) * 0.5f;
+                ImVec2 v(near.x + (far.x - near.x) * t, near.y + (far.y - near.y) * t);
+                if (std::max(std::abs(v.x), std::abs(v.y)) > lim) hi = t; else lo = t;
+            }
+            far = ImVec2(near.x + (far.x - near.x) * lo, near.y + (far.y - near.y) * lo);
+        };
+        pull(a, b);
+        pull(b, a);
         return true;
     }
     Sketch::ArcGeom g;
     if (!s.arcGeom(e, g)) return false;
-    double rpx = g.r * std::max(st.ppu, 1e-6);
-    double step = 2.0 * std::acos(std::clamp(1.0 - 0.35 / std::max(rpx, 0.5), -1.0, 1.0));
-    step = std::clamp(step, kTwoPi / 720.0, kPi / 4);
-    int n = std::max(2, (int)std::ceil(g.sweep / step));
-    for (int i = 0; i <= n; ++i) {
-        if (!toScr(st, pl, s.arcPoint(g, (double)i / n), q)) return false;
-        out.push_back(q);
+    // Its radius in pixels, from the view as it is now (two directions: the plane may be tilted).
+    double rpx = 0;
+    {
+        ImVec2 c0, c1, c2;
+        if (toScr(st, pl, g.c, c0)) {
+            if (toScr(st, pl, g.c + Vec2(g.r, 0), c1)) rpx = std::max(rpx, (double)std::hypot(c1.x - c0.x, c1.y - c0.y));
+            if (toScr(st, pl, g.c + Vec2(0, g.r), c2)) rpx = std::max(rpx, (double)std::hypot(c2.x - c0.x, c2.y - c0.y));
+        }
+        if (rpx <= 0) rpx = g.r * std::max(st.ppu, 1e-6);
     }
-    return true;
+    double step = 2.0 * std::acos(std::clamp(1.0 - 0.3 / std::max(rpx, 0.5), -1.0, 1.0));
+    step = std::clamp(step, kTwoPi / 16384.0, kPi / 4);
+    int n = std::max(2, (int)std::ceil(g.sweep / step));
+    for (int i = 0; i <= n; ++i) put(out, s.arcPoint(g, (double)i / n));
+    return real(out) >= 2;
 }
 
 void arrowHead(ImDrawList* dl, ImVec2 tip, ImVec2 dirToward, float size, ImU32 col) {
@@ -2798,10 +3196,11 @@ void App::drawSketchOverlay() {
         }
         ImDrawListFlags oldFlags = dl->Flags;
         dl->Flags &= ~ImDrawListFlags_AntiAliasedFill;   // shared triangle edges must not show seams
-        for (auto& pr : sk_.profiles) {
-            for (size_t i = 0; i + 2 < pr.tris.size(); i += 3) {
+        for (size_t pi = 0; pi < sk_.profiles.size(); ++pi) {
+            const auto& tr = profileTrisView(s, pi, sk_.profiles[pi]);   // on the exact curves at any zoom
+            for (size_t i = 0; i + 2 < tr.size(); i += 3) {
                 ImVec2 a, b, c;
-                if (toScr(sk_, pl, pr.tris[i], a) && toScr(sk_, pl, pr.tris[i + 1], b) && toScr(sk_, pl, pr.tris[i + 2], c))
+                if (toScr(sk_, pl, tr[i], a) && toScr(sk_, pl, tr[i + 1], b) && toScr(sk_, pl, tr[i + 2], c))
                     dl->AddTriangleFilled(a, b, c, ui::th(IM_COL32(70, 140, 235, 55)));
             }
         }
@@ -2810,9 +3209,14 @@ void App::drawSketchOverlay() {
 
     // ---- curves
     auto isPick = [&](uint32_t id) { return std::find(sk_.picks.begin(), sk_.picks.end(), id) != sk_.picks.end(); };
+    // Two passes: plain curves first, then the hovered and selected ones, so a lit curve is never
+    // painted over by another curve lying on it (a circle drawn on a projected edge, a duplicate).
+    for (int pass = 0; pass < 2; ++pass)
     for (auto& [id, e] : s.ents) {
         if (e.type == EntType::Point || (e.locked && sk_.tool.empty())) continue;
         if (e.locked) continue;
+        bool lit = sk_.selEnt.count(id) > 0 || sk_.hoverEnt == id || isPick(id);
+        if (lit != (pass == 1)) continue;
         if (!curvePath(sk_, s, e, path)) continue;
         bool sel = sk_.selEnt.count(id) > 0, hov = sk_.hoverEnt == id || isPick(id);
         bool defined = s.defined.count(id) > 0;
@@ -2872,7 +3276,7 @@ void App::drawSketchOverlay() {
             ImVec4 r = drawDimension(dl, sk_, s, cc, col, S, unitPerPx);
             if (r.z > r.x) sk_.dimRects[id] = r;
         }
-        if (sk_.dimPlacing && sk_.cursorValid) drawDimension(dl, sk_, s, sk_.dim, ui::th(IM_COL32(18, 110, 70, 170)), S, unitPerPx);
+        if (sk_.dimPlacing && sk_.cursorValid) drawDimension(dl, sk_, s, sk_.dim, (kDim & 0x00FFFFFF) | 0xAA000000u, S, unitPerPx);
     }
 
     // ---- constraint glyphs
@@ -3162,15 +3566,30 @@ void App::drawSketchOverlay() {
             }
         }
         if (drawing && S2(sp2, cur)) {
+            // The body edge being snapped to, lit up so it is clear what the point will stick to.
+            if (!sk_.snapRefPoly.empty()) {
+                std::vector<ImVec2> run;
+                auto flush = [&]() { if (run.size() >= 2) strokePath(dl, run, kHover, 1.6f * S, false); run.clear(); };
+                for (const Vec2& q : sk_.snapRefPoly) {
+                    ImVec2 sp;
+                    if (std::isnan(q.x) || !S2(q, sp)) { flush(); continue; }
+                    run.push_back(sp);
+                }
+                flush();
+            }
             // Snap marker
             const SnapInfo& sn = sk_.snap;
-            if (sn.kind == SnapKind::Horizontal || sn.kind == SnapKind::Vertical) {
+            if (sn.kind == SnapKind::Horizontal || sn.kind == SnapKind::Vertical || sn.kind == SnapKind::Angle || sn.guide >= 0) {
                 ImVec2 a;
                 if (!sk_.clicks.empty() && S2(sk_.clicks[0].pos, a)) strokePath(dl, {a, cur}, ui::th(IM_COL32(255, 140, 30, 200)), 1.2f * S, true);
             }
             if (sn.kind == SnapKind::Point) dl->AddRect(ImVec2(cur.x - 6 * S, cur.y - 6 * S), ImVec2(cur.x + 6 * S, cur.y + 6 * S), kHover, 0, 0, 2.f * S);
             else if (sn.kind == SnapKind::Midpoint) dl->AddTriangle(ImVec2(cur.x, cur.y - 7 * S), ImVec2(cur.x - 6 * S, cur.y + 5 * S), ImVec2(cur.x + 6 * S, cur.y + 5 * S), kHover, 2.f * S);
             else if (sn.kind == SnapKind::OnCurve) dl->AddCircle(cur, 5.5f * S, kHover, 14, 2.f * S);
+            else if (sn.kind == SnapKind::Intersection) {
+                dl->AddLine(ImVec2(cur.x - 6 * S, cur.y - 6 * S), ImVec2(cur.x + 6 * S, cur.y + 6 * S), kHover, 2.f * S);
+                dl->AddLine(ImVec2(cur.x - 6 * S, cur.y + 6 * S), ImVec2(cur.x + 6 * S, cur.y - 6 * S), kHover, 2.f * S);
+            }
             else dl->AddCircleFilled(cur, 3.f * S, ui::th(IM_COL32(24, 104, 220, 220)));
             if (drawHud(cur)) {
             } else {

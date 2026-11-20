@@ -2789,7 +2789,7 @@ void App::modelTestStep() {
         }});
         steps.push_back({"reopen 2", 60, [&] {
             if (!saveDocument(doc_, kst)) { last = "save failed"; return; }
-            dirty_ = false;
+            markClean();
             openDocumentPath(kst);
         }, [&] {
             if (last == "save failed") return last;
@@ -2805,7 +2805,7 @@ void App::modelTestStep() {
         std::ofstream f(outPath, std::ios::binary);
         f << log;
         log::info(std::string(modelTestFail_ ? "model test FAILED" : "model test passed") + " (" + outPath.string() + ")");
-        dirty_ = false;
+        markClean();
         glfwSetWindowShouldClose(window_, GLFW_TRUE);
     };
     if (step == 0 && phase == 0) {
@@ -2869,7 +2869,7 @@ void App::uiTestStep() {
         log::info("ui test " + std::string(fails ? "FAILED" : "passed") + ": " + std::to_string(ran) + " commands, " +
                   std::to_string(fails) + " failed (" + outPath.string() + ")");
         if (fails) modelTestFail_ = true;
-        dirty_ = false;
+        markClean();
         glfwSetWindowShouldClose(window_, GLFW_TRUE);
     };
     auto closeAll = [&] {

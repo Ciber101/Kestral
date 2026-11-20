@@ -1,6 +1,8 @@
 #pragma once
 #include "sketch/Sketch.h"
 
+#include <functional>
+
 namespace kst::sk {
 
 // One piece of a boundary: a stretch of a sketch curve. Parameters run 0..1 along the curve's natural
@@ -33,6 +35,11 @@ struct Profile {
 std::vector<Profile> findProfiles(const Sketch& sk);
 
 bool pointInProfile(const Profile& p, Vec2 q);
+
+// The profile's display triangles with its curves sampled to a view: tolAt(q) is the largest chord
+// error allowed near q, in sketch units (small where q is on screen, huge off screen). Curved
+// pieces split until each chord is within it, so the shading sits on the exact curve at any zoom.
+void profileTrisFor(const Sketch& sk, const Profile& p, const std::function<double(Vec2)>& tolAt, std::vector<Vec2>& tris);
 
 // Parameters (0..1 along the curve's natural direction) where `ent` is cut by other curves, plus its
 // endpoints when it is open. Sorted and unique. Used by Trim.

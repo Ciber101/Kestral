@@ -1,5 +1,6 @@
 #include "kernel/Kernel.h"
 #include "kernel/ShapeHandle.h"
+#include "kernel/Trsf.h"
 #include "core/Log.h"
 #include "platform/Platform.h"
 
@@ -15,6 +16,7 @@
 #include <BRepBuilderAPI_Copy.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
 #include <Message_ProgressIndicator.hxx>
+#include <ShapeUpgrade_ShapeDivideAngle.hxx>
 #include <ShapeUpgrade_UnifySameDomain.hxx>
 #include <BRepTools_History.hxx>
 #include <TopTools_ListOfShape.hxx>
@@ -701,6 +703,44 @@ void importObj(const std::string& path, ImportResult& r) {
     r.bodies.push_back(b);
 }
 
+// Meshes a copied shape for export. OpenCASCADE's mesher sometimes gives up on a whole face (seen
+// on a bore that is one full-turn cylinder face with many holes cut in it); that face would be
+// missing from the file and the slicer would close the gap over it, printing the part solid. When a
+// face comes out empty, the faces are split into pieces of at most a quarter turn and meshed again,
+// which every face so far has accepted. The split shape replaces s.
+void meshShapeForExport(TopoDS_Shape& s, double lin) {
+    auto missing = [](const TopoDS_Shape& sh) {
+        int n = 0;
+        for (TopExp_Explorer ex(sh, TopAbs_FACE); ex.More(); ex.Next()) {
+            TopLoc_Location loc;
+            Handle(Poly_Triangulation) tri = BRep_Tool::Triangulation(TopoDS::Face(ex.Current()), loc);
+            if (tri.IsNull() || tri->NbTriangles() == 0) ++n;
+        }
+        return n;
+    };
+    BRepMesh_IncrementalMesh mesher(s, lin, Standard_False, 0.1, Standard_True);
+    int bad = missing(s);
+    if (!bad) return;
+    for (double ang : {1.5707963267948966, 0.7853981633974483}) {
+        try {
+            ShapeUpgrade_ShapeDivideAngle div(ang, s);
+            if (!div.Perform()) continue;
+            TopoDS_Shape r = div.Result();
+            if (r.IsNull()) continue;
+            BRepTools::Clean(r);
+            BRepMesh_IncrementalMesh again(r, lin, Standard_False, 0.1, Standard_True);
+            int nb = missing(r);
+            if (nb < bad) {
+                s = r;
+                bad = nb;
+            }
+            if (!bad) return;
+        } catch (const Standard_Failure&) {
+        }
+    }
+    log::warn("Export: " + std::to_string(bad) + " face(s) could not be meshed; the file may have holes");
+}
+
 void appendShapeTriangles(const TopoDS_Shape& s, const glm::mat4& xf, std::vector<float>& out) {
     for (TopExp_Explorer ex(s, TopAbs_FACE); ex.More(); ex.Next()) {
         const TopoDS_Face& face = TopoDS::Face(ex.Current());
@@ -781,16 +821,17 @@ void fallbackFaceMesh(const TopoDS_Face& face, uint32_t faceIndex, double lin, M
 }
 } // namespace
 
-MeshPtr tessellate(const ShapeHandle& h, double rel, double ang) {
+MeshPtr tessellate(const ShapeHandle& h, double rel, double ang, double absLin) {
     try {
         const TopoDS_Shape& shape = h.shape;
         Bnd_Box box;
         BRepBndLib::Add(shape, box);
         double diag = box.IsVoid() ? 1.0 : std::sqrt(box.SquareExtent());
-        double lin = std::clamp(diag * rel, 0.001, 2.0);
+        double lin = absLin > 0 ? absLin : std::clamp(diag * rel, 0.001, 2.0);
         BRepMesh_IncrementalMesh mesher(shape, lin, Standard_False, ang, Standard_False);
 
         auto m = std::make_shared<MeshData>();
+        m->lin = lin;
         TopTools_IndexedMapOfShape faces;
         TopExp::MapShapes(shape, TopAbs_FACE, faces);
         TopTools_MapOfShape seams;
@@ -906,6 +947,21 @@ MeshPtr tessellate(const ShapeHandle& h, double rel, double ang) {
         return m;
     } catch (const Standard_Failure& e) {
         rethrowOcct(e, "tessellation");
+    }
+}
+
+MeshPtr tessellateForView(const ShapePtr& shape, double linMm, size_t maxTris) {
+    if (!shape) return nullptr;
+    try {
+        ShapeHandle copy;
+        copy.shape = BRepBuilderAPI_Copy(shape->shape, Standard_True, Standard_False).Shape();
+        // The angle limit is loose: the chord error is what a close view needs, and a tight angle
+        // would fill big flat-ish curves with needless triangles.
+        MeshPtr m = tessellate(copy, 0, 0.35, linMm);
+        if (!m || m->triCount() > maxTris) return nullptr;
+        return m;
+    } catch (...) {
+        return nullptr;
     }
 }
 
@@ -1442,7 +1498,7 @@ void exportStl(const std::vector<ExportItem>& items, const std::string& path, co
                 BRepBndLib::Add(s, box);
                 double diag = box.IsVoid() ? 1.0 : std::sqrt(box.SquareExtent());
                 double lin = std::clamp(diag * 0.0002, 0.002, 0.01);
-                BRepMesh_IncrementalMesh mesher(s, lin, Standard_False, 0.1, Standard_True);
+                meshShapeForExport(s, lin);
                 appendShapeTriangles(s, it.xform, tris);
             } else if (it.mesh) {
                 auto& m = *it.mesh;
@@ -1496,9 +1552,7 @@ void exportStep(const std::vector<ExportItem>& items, const std::string& path, c
         auto placed = [&](const ExportItem& it) {
             gp_Trsf tr;
             const glm::mat4& m = it.xform;
-            tr.SetValues(m[0][0], m[1][0], m[2][0], m[3][0],
-                         m[0][1], m[1][1], m[2][1], m[3][1],
-                         m[0][2], m[1][2], m[2][2], m[3][2]);
+            tr = trsfOfMat(m);
             return it.shape->shape.Moved(TopLoc_Location(tr));
         };
         auto nameOf = [](const ExportItem& it, int n) {
@@ -1682,7 +1736,7 @@ void export3mf(const std::vector<ExportItem>& items, const std::string& path, co
             BRepBndLib::Add(sh, box);
             double diag = box.IsVoid() ? 1.0 : std::sqrt(box.SquareExtent());
             double lin = std::clamp(diag * 0.0004, 0.004, 0.02);
-            BRepMesh_IncrementalMesh mesher(sh, lin, Standard_False, 0.1, Standard_True);
+            meshShapeForExport(sh, lin);
             appendShapeTriangles(sh, it.xform, tris);
         } else if (it.mesh) {
             auto& m = *it.mesh;

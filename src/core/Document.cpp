@@ -163,31 +163,45 @@ void Document::gcParts() {
         it = used.count(it->first) ? std::next(it) : parts.erase(it);
 }
 
-void UndoStack::push(const Document& before, std::string label) {
-    undo_.push_back({before, std::move(label)});
+void UndoStack::push(const Document& before, std::string label, UndoCtx ctx) {
+    undo_.push_back({before, std::move(label), ctx});
     if (undo_.size() > kMax) undo_.erase(undo_.begin());
     redo_.clear();
 }
 
-bool UndoStack::undo(Document& doc) {
+// Undo brings back the model, never the file it lives in: a step from before the first save must
+// not turn a saved design back into "Untitled" with no file (Ctrl+S would then ask for a name again).
+void UndoStack::restoreKeepingFile(Document& doc, Document&& from) {
+    std::string path = doc.path, name = doc.name;
+    int version = doc.version;
+    auto root = doc.components.find(doc.rootId);
+    std::string rootName = root != doc.components.end() ? root->second.name : name;
+    doc = std::move(from);
+    doc.path = path;
+    doc.name = name;
+    doc.version = version;
+    auto r2 = doc.components.find(doc.rootId);
+    if (r2 != doc.components.end()) r2->second.name = rootName;
+    doc.revision = Document::nextRevision();   // a new state: never equal to the saved one
+}
+
+bool UndoStack::undo(Document& doc, UndoCtx* ctx) {
     if (undo_.empty()) return false;
     Entry e = std::move(undo_.back());
     undo_.pop_back();
-    redo_.push_back({doc, e.label});
-    uint64_t rev = doc.revision;
-    doc = std::move(e.doc);
-    doc.revision = rev + 1;
+    redo_.push_back({doc, e.label, ctx ? *ctx : UndoCtx{}});
+    restoreKeepingFile(doc, std::move(e.doc));
+    if (ctx) *ctx = e.ctx;
     return true;
 }
 
-bool UndoStack::redo(Document& doc) {
+bool UndoStack::redo(Document& doc, UndoCtx* ctx) {
     if (redo_.empty()) return false;
     Entry e = std::move(redo_.back());
     redo_.pop_back();
-    undo_.push_back({doc, e.label});
-    uint64_t rev = doc.revision;
-    doc = std::move(e.doc);
-    doc.revision = rev + 1;
+    undo_.push_back({doc, e.label, ctx ? *ctx : UndoCtx{}});
+    restoreKeepingFile(doc, std::move(e.doc));
+    if (ctx) *ctx = e.ctx;
     return true;
 }
 

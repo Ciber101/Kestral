@@ -20,6 +20,11 @@ void App::designSwap(DesignTab& t) {
     std::swap(t.isolated, isolated_);
     std::swap(t.collapsed, collapsed_);
     std::swap(t.savedMarker, savedMarker_);
+    std::swap(t.asKey, asKey_);
+    std::swap(t.cleanRev, cleanRev_);
+    std::swap(t.recRev, recRev_);
+    std::swap(t.ownRev, ownRev_);
+    std::swap(t.ownAutosaved, ownAutosaved_);
 }
 
 bool App::docInUse() const {
@@ -34,6 +39,9 @@ void App::switchDesignTab(int i) {
     if (dlg_.open) closeFeatureDialog(true);
     if (tdlg_.open) closeToolDialog(true);
     if (sliceWs_) leaveSliceWorkspace();
+    // The design going to the back has its recovery copy up to date (it cannot change back there).
+    syncDirty();
+    if (dirty_ && recRev_ != doc_.revision) writeRecoverySync(doc_, asKey_, recRev_);
     designSwap(designTabs_[(size_t)designActive_]);
     designSwap(designTabs_[(size_t)i]);
     designActive_ = i;
@@ -60,17 +68,33 @@ int App::newDesignTab() {
 
 void App::closeDesignTab(int i) {
     if (i < 0 || i >= (int)designTabs_.size()) return;
+    // Unsaved work that reaches here (Save and Don't Save are handled before) keeps its recovery copy,
+    // offered on the next start. Saved or discarded work has none left.
+    if (i == designActive_) {
+        syncDirty();
+        if (dirty_) writeRecoverySync(doc_, asKey_, recRev_);
+    } else {
+        DesignTab& t = designTabs_[(size_t)i];
+        if (t.doc.revision != t.cleanRev) t.dirty = true;
+        if (t.dirty && t.recRev != t.doc.revision) writeRecoverySync(t.doc, t.asKey, t.recRev);
+    }
     if (designTabs_.size() <= 1) {   // the last one: an empty design in its place
-        newDocument();
+        leaveSketchMode();
+        sk_.active = false;
+        doc_ = Document();
+        undo_.clear();
+        selection_.clear();
+        isolated_.clear();
+        browserHover_.clear();
+        asKey_.clear();
+        recRev_ = ownRev_ = 0;
+        ownAutosaved_ = false;
+        markClean();
+        markSceneDirty();
+        activity();
         return;
     }
     if (i == designActive_) {
-        // Keep unsaved work: it goes to the autosave like closing Kestral does.
-        if (dirty_ && !doc_.timeline.empty()) {
-            std::error_code ec;
-            std::filesystem::create_directories(u8path(autosavePath()).parent_path(), ec);
-            saveDocument(doc_, autosavePath());
-        }
         int next = i + 1 < (int)designTabs_.size() ? i + 1 : i - 1;
         switchDesignTab(next);
         designTabs_.erase(designTabs_.begin() + i);

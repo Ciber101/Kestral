@@ -6,6 +6,7 @@
 #include "print/Orca.h"
 #include "platform/Platform.h"
 
+#include <algorithm>
 #include <string>
 #include <vector>
 #ifdef _WIN32
@@ -65,6 +66,27 @@ int main(int argc, char** argv) {
     }
     if (argc >= 3 && std::string(argv[1]) == "--slice-test")
         return kst::print::sliceSelfTest(argv[2], argc >= 4 ? argv[3] : "");
+#ifdef _WIN32
+    // A runaway step (a boolean that blows up, a mesh that never ends) must not take the whole PC
+    // down with it: past 60% of the RAM, Kestral's own allocations fail (the step reports an error,
+    // or Kestral closes and the watchdog's recovery copy brings the work back) instead of Windows
+    // running out of memory for everything else.
+    {
+        MEMORYSTATUSEX ms{};
+        ms.dwLength = sizeof ms;
+        if (GlobalMemoryStatusEx(&ms) && ms.ullTotalPhys > 0) {
+            unsigned long long cap = std::max<unsigned long long>(ms.ullTotalPhys * 6 / 10, 4ull << 30);
+            if (HANDLE job = CreateJobObjectW(nullptr, nullptr)) {
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+                li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+                li.ProcessMemoryLimit = (SIZE_T)cap;
+                if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof li) ||
+                    !AssignProcessToJobObject(job, GetCurrentProcess()))
+                    CloseHandle(job);   // not allowed here: run without the cap
+            }
+        }
+    }
+#endif
     kst::App app;
     return app.run(argc, argv);
 }

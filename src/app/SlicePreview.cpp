@@ -408,14 +408,21 @@ void App::drawSliceLayerSlider() {
     ImGui::InvisibleButton("##track", ImVec2(28 * S, bottom - top + 20 * S));
     bool hovered = ImGui::IsItemHovered();
     if (ImGui::IsItemActivated()) {
-        int l = layerAt(io.MousePos.y);
-        slice_.dragSlider = std::abs(l - slice_.layerHi) <= std::abs(l - slice_.layerLo) ? 1 : 2;
+        // The bottom handle moves only when it is grabbed itself; a click anywhere else on the bar
+        // brings the top handle there (Orca).
+        float my = io.MousePos.y;
+        float dLo = std::abs(my - yOf(slice_.layerLo)), dHi = std::abs(my - yOf(slice_.layerHi));
+        slice_.dragSlider = dLo <= 10 * S && dLo < dHi ? 2 : 1;
     }
     int oldHi = slice_.layerHi, oldLo = slice_.layerLo;
     if (ImGui::IsItemActive() && slice_.dragSlider) {
         int l = layerAt(io.MousePos.y);
-        if (slice_.dragSlider == 1) slice_.layerHi = std::max(l, slice_.layerLo);
-        else slice_.layerLo = std::min(l, slice_.layerHi);
+        if (slice_.dragSlider == 1) {
+            slice_.layerHi = l;
+            if (slice_.layerLo > l) slice_.layerLo = l;   // below the bottom handle: it comes along
+        } else {
+            slice_.layerLo = std::min(l, slice_.layerHi);
+        }
     }
     if (!ImGui::IsItemActive()) slice_.dragSlider = 0;
     if (hovered && io.MouseWheel != 0.f) slice_.layerHi = std::clamp(slice_.layerHi + (io.MouseWheel > 0 ? 1 : -1), slice_.layerLo, n - 1);

@@ -31,6 +31,7 @@
 #include <fstream>
 #include <set>
 #include <sstream>
+#include <iterator>
 
 namespace kst {
 
@@ -293,6 +294,11 @@ uint64_t ownSig(const Document& d, const Feature& f) {
         for (int k = 0; k < 3; ++k) { h = hashDbl(h, p.axisO[k]); h = hashDbl(h, p.axisD[k]); }
         h = hashStr(h, p.angleExpr);
         for (auto& t : p.targets) { h = mixU64(h, t.first); h = mixU64(h, t.second); }
+        if (!p.faces.empty()) {
+            h = mixU64(h, 0x70666163);
+            for (auto& t : p.faceTargets) { h = mixU64(h, t.first); h = mixU64(h, t.second); }
+            for (auto& fc : p.faces) { h = mixU64(h, fc.first); h = mixU64(h, fc.second); }
+        }
         std::set<std::string> ns;
         for (auto& e : {p.countExpr, p.spacingExpr, p.countYExpr, p.spacingYExpr, p.angleExpr})
             for (auto& n : peval::names(e)) ns.insert(n);
@@ -398,6 +404,7 @@ uint64_t ownSig(const Document& d, const Feature& f) {
         const SplitParams& sp = *f.split;
         h = mixU64(h, (uint64_t)sp.plane);
         for (int i = 0; i < 3; ++i) { h = hashDbl(h, sp.toolO[i]); h = hashDbl(h, sp.toolN[i]); }
+        h = hashDbl(h, sp.toolR);
         h = hashStr(h, sp.toolName);
         h = mixU64(h, sp.sketchId);
         h = mixU64(h, sp.sketchEnt);
@@ -443,6 +450,18 @@ uint64_t ownSig(const Document& d, const Feature& f) {
         return hashParams(h, d, ns);
     }
     if ((f.type == FeatureType::Sweep || f.type == FeatureType::Loft) && f.multi) {
+        for (const LoftPick& lp : f.multi->picks) {
+            h = mixU64(h, lp.sketchId);
+            h = hashDbl(h, lp.pt.x);
+            h = hashDbl(h, lp.pt.y);
+            if (lp.sketchId) {
+                auto sit = d.sketches.find(lp.sketchId);
+                if (sit != d.sketches.end()) h = mixU64(h, sketchSig(sit->second));
+            }
+            h = mixU64(h, lp.face.feature);
+            h = mixU64(h, lp.face.slot);
+            h = mixU64(h, lp.face.face);
+        }
         for (uint32_t sid : f.multi->sketchIds) {
             h = mixU64(h, sid);
             auto sit = d.sketches.find(sid);
@@ -751,14 +770,22 @@ bool resolveTarget(const Document& snap, const std::vector<App::RecomputeResults
 // says otherwise. Hidden parts are never changed by a join, cut or hole.
 bool targetShown(const Document& snap, const std::vector<App::RecomputeResults::Item>& done, TargetRef t) {
     std::function<bool(uint32_t, uint32_t, int)> shown = [&](uint32_t fid, uint32_t slot, int depth) -> bool {
-        if (const BodyOverride* o = snap.findOverride(fid, slot)) return o->visible;
         const App::RecomputeResults::Item* fr = nullptr;
         for (auto& it : done)
             if (it.featureId == fid) fr = &it;
         std::vector<uint32_t> bids = snap.featureBodies(fid);
-        if (!fr && slot < bids.size()) {
+        if (!fr && slot < bids.size()) {   // the body is there: it already says (its override applied)
             const Body& hb = snap.bodies.at(bids[slot]);
             return hb.visible && snap.isComponentShown(hb.componentId);
+        }
+        if (const BodyOverride* o = snap.findOverride(fid, slot)) {
+            TargetRef sr{0, 0};
+            if (fr && !fr->isImport) {
+                if (slot < fr->instanceRefs.size() && fr->instanceRefs[slot].first) sr = fr->instanceRefs[slot];
+                else if (slot < fr->consumed.size()) sr = fr->consumed[slot];
+                else if (!fr->consumed.empty()) sr = fr->consumed[0];
+            }
+            if (!fr || fr->isImport || (o->fits(sr.first != 0) && o->fitsSource(sr))) return o->visible;
         }
         if (fr && fr->isImport) {
             // A fresh import (every rebuild from a file): hidden when one of its folders is hidden,
@@ -790,6 +817,38 @@ bool targetShown(const Document& snap, const std::vector<App::RecomputeResults::
     return shown(t.first, t.second, 0);
 }
 
+// Every body a step names itself (its chosen targets, tools, sources). A later step that names a body
+// shows that body was there, untouched, when that step was made.
+void namedRefs(const Feature& f, std::vector<TargetRef>& out) {
+    auto add = [&](const std::vector<TargetRef>& v) { out.insert(out.end(), v.begin(), v.end()); };
+    auto one = [&](const TargetRef& r) { if (r.first) out.push_back(r); };
+    if (f.extrude) add(f.extrude->targets);
+    if (f.revolve) add(f.revolve->targets);
+    if (f.modify) add(f.modify->targets);
+    if (f.emboss) add(f.emboss->targets);
+    if (f.snap) add(f.snap->targets);
+    if (f.silhouette) add(f.silhouette->targets);
+    if (f.lip) add(f.lip->targets);
+    if (f.rest) add(f.rest->targets);
+    if (f.boss) add(f.boss->targets);
+    if (f.rib) add(f.rib->targets);
+    if (f.web) add(f.web->targets);
+    if (f.pattern) { add(f.pattern->targets); add(f.pattern->faceTargets); one(f.pattern->pathBody); }
+    if (f.mirror) add(f.mirror->targets);
+    if (f.combine) { one(f.combine->tool); add(f.combine->targets); add(f.combine->tools); }
+    if (f.remove) add(f.remove->targets);
+    if (f.split) add(f.split->targets);
+    if (f.splitFace) add(f.splitFace->targets);
+    if (f.align) add(f.align->targets);
+    if (f.hole) add(f.hole->targets);
+    if (f.multi) add(f.multi->targets);
+    if (f.move) add(f.move->targets);
+    if (f.dovetail) add(f.dovetail->targets);
+    if (f.joint) { one(f.joint->ground); one(f.joint->move); }
+    if (f.asbuilt) { one(f.asbuilt->ground); one(f.asbuilt->move); }
+    if (f.rigid) add(f.rigid->members);
+}
+
 // Bodies alive just before feature `f` (made earlier, not yet replaced) that touch any of the tool
 // shapes: what Fusion's Join / Cut pick automatically when you do not choose bodies yourself.
 std::vector<TargetRef> autoTargets(const Document& snap, const std::vector<App::RecomputeResults::Item>& done,
@@ -797,6 +856,15 @@ std::vector<TargetRef> autoTargets(const Document& snap, const std::vector<App::
     std::vector<TargetRef> out;
     int fi = snap.featureIndex(f.id);
     if (fi < 0) return out;
+    // A body a later step names was left alone by this one when that step was made (it was hidden
+    // then, or out of the way): taking it now would knock that later step out.
+    std::set<TargetRef> laterNamed;
+    {
+        std::vector<TargetRef> v;
+        for (int j = fi + 1; j < (int)snap.timeline.size(); ++j)
+            if (!snap.timeline[j].suppressed) namedRefs(snap.timeline[j], v);
+        laterNamed.insert(v.begin(), v.end());
+    }
     for (int j = 0; j < fi; ++j) {
         const Feature& src = snap.timeline[j];
         if (src.suppressed) continue;
@@ -811,7 +879,9 @@ std::vector<TargetRef> autoTargets(const Document& snap, const std::vector<App::
             // Hidden bodies (eye off, on the body or its folder) are reported, so the caller passes
             // them through untouched (a join or cut never changes a part you hid). They stay in the
             // list, so the step's output slots keep their old numbers.
+            if (laterNamed.count({src.id, k})) continue;
             bool hiddenNow = !targetShown(snap, done, {src.id, k});
+            if (hiddenNow && f.rules >= 3) continue;   // hidden: as if it were not there
             const char* atDbg = std::getenv("KESTRAL_AT");
             bool dbg = atDbg && (uint32_t)std::atoi(atDbg) == f.id;
             if (fresh) {
@@ -1304,6 +1374,7 @@ void computeFeature(const Document& snap, const std::vector<App::RecomputeResult
     // ---- patterns: pure instances of the target part, zero new kernel geometry ---------
     if (f.type == FeatureType::Pattern) {
         const PatternParams& p = *f.pattern;
+        std::vector<glm::mat4> X;   // where each copy goes (world moves); X[0] is the original
         if (p.onPath) {
             std::vector<glm::dvec3> pts;
             bool closed = false;
@@ -1350,56 +1421,40 @@ void computeFeature(const Document& snap, const std::vector<App::RecomputeResult
                 throw std::runtime_error("Two copies land on the same spot");
             glm::dvec3 p0, t0;
             if (!pathAt(pts, closed, 0, p0, t0)) throw std::runtime_error("That path is too short");
-            for (const TargetRef& ref : p.targets) {
-                ResolvedTarget rt;
-                resolve(ref, rt);
-                std::string base = rt.name.empty() ? f.name : rt.name;
-                for (long ix = 0; ix < n; ++ix) {
-                    glm::mat4 x(1.f);
-                    if (ix != 0) {
-                        glm::dvec3 pi, ti;
-                        if (!pathAt(pts, closed, step * ix, pi, ti))
-                            throw std::runtime_error("The path is shorter than the pattern");
-                        if (p.orient == 1)
-                            x = glm::translate(glm::mat4(1.f), glm::vec3(pi)) * turnAlong(t0, ti) *
-                                glm::translate(glm::mat4(1.f), glm::vec3(-p0));
-                        else
-                            x = glm::translate(glm::mat4(1.f), glm::vec3(pi - p0));
-                    }
-                    item.shapes.push_back(nullptr);
-                    item.meshes.push_back(nullptr);
-                    item.names.push_back(ix == 0 ? base : freeBodyName(snap, f.id, item.names, base + ":" + std::to_string(ix)));
-                    item.xforms.push_back(x * rt.xform);
-                    item.instanceRefs.push_back(ref);
+            for (long ix = 0; ix < n; ++ix) {
+                glm::mat4 x(1.f);
+                if (ix != 0) {
+                    glm::dvec3 pi, ti;
+                    if (!pathAt(pts, closed, step * ix, pi, ti))
+                        throw std::runtime_error("The path is shorter than the pattern");
+                    if (p.orient == 1)
+                        x = glm::translate(glm::mat4(1.f), glm::vec3(pi)) * turnAlong(t0, ti) *
+                            glm::translate(glm::mat4(1.f), glm::vec3(-p0));
+                    else
+                        x = glm::translate(glm::mat4(1.f), glm::vec3(pi - p0));
                 }
-                item.consumed.push_back(ref);
+                X.push_back(x);
             }
-            return;
-        }
-        long nx = std::max(1L, std::lround(peval::eval(p.countExpr, snap.params)));
-        double sx = peval::eval(p.spacingExpr, snap.params);
-        long ny = 1;
-        double sy = 0;
-        if (!p.circular) {
-            ny = std::max(1L, std::lround(peval::eval(p.countYExpr, snap.params)));
-            sy = peval::eval(p.spacingYExpr, snap.params);
-        }
-        if (nx * ny > 5000) throw std::runtime_error("That is more than 5000 instances; reduce the count");
-        double total = 360.0, step = 0;
-        if (p.circular) {
-            total = peval::eval(p.angleExpr, snap.params);
-            if (std::abs(total) < 1e-6) throw std::runtime_error("Angle must not be zero");
-            step = nx > 1 ? total / nx : 0.0;
-        }
-        glm::dvec3 axis = p.axis == 0 ? glm::dvec3(1, 0, 0) : p.axis == 1 ? glm::dvec3(0, 1, 0) : glm::dvec3(0, 0, 1);
-        glm::dvec3 axisO(0);
-        if (p.axis == 3 && glm::length(p.axisD) > 1e-9) { axis = glm::normalize(p.axisD); axisO = p.axisO; }
-        for (const TargetRef& ref : p.targets) {
-            ResolvedTarget rt;
-            resolve(ref, rt);
-            std::string base = rt.name.empty() ? f.name : rt.name;
-            long n = 0;
-            for (long iy = 0; iy < ny; ++iy) {
+        } else {
+            long nx = std::max(1L, std::lround(peval::eval(p.countExpr, snap.params)));
+            double sx = peval::eval(p.spacingExpr, snap.params);
+            long ny = 1;
+            double sy = 0;
+            if (!p.circular) {
+                ny = std::max(1L, std::lround(peval::eval(p.countYExpr, snap.params)));
+                sy = peval::eval(p.spacingYExpr, snap.params);
+            }
+            if (nx * ny > 5000) throw std::runtime_error("That is more than 5000 instances; reduce the count");
+            double total = 360.0, step = 0;
+            if (p.circular) {
+                total = peval::eval(p.angleExpr, snap.params);
+                if (std::abs(total) < 1e-6) throw std::runtime_error("Angle must not be zero");
+                step = nx > 1 ? total / nx : 0.0;
+            }
+            glm::dvec3 axis = p.axis == 0 ? glm::dvec3(1, 0, 0) : p.axis == 1 ? glm::dvec3(0, 1, 0) : glm::dvec3(0, 0, 1);
+            glm::dvec3 axisO(0);
+            if (p.axis == 3 && glm::length(p.axisD) > 1e-9) { axis = glm::normalize(p.axisD); axisO = p.axisO; }
+            for (long iy = 0; iy < ny; ++iy)
                 for (long ix = 0; ix < nx; ++ix) {
                     glm::mat4 x(1.f);
                     if (p.circular) {
@@ -1410,17 +1465,47 @@ void computeFeature(const Document& snap, const std::vector<App::RecomputeResult
                     } else if (ix != 0 || iy != 0) {
                         x = glm::translate(glm::mat4(1.f), glm::vec3((float)(sx * ix), (float)(sy * iy), 0.f));
                     }
-                    item.shapes.push_back(nullptr);   // instances share the target part: no new geometry
-                    item.meshes.push_back(nullptr);
-                    item.names.push_back(n == 0 ? base : freeBodyName(snap, f.id, item.names, base + ":" + std::to_string(n)));
-                    item.xforms.push_back(x * rt.xform);   // copies move in world space
-                    item.instanceRefs.push_back(ref);
-                    ++n;
+                    X.push_back(x);
                 }
+        }
+        // Faces (a hole, a pocket, a boss): copied into their own body, which stays one body.
+        for (size_t ti = 0; ti < p.faceTargets.size(); ++ti) {
+            const TargetRef& ref = p.faceTargets[ti];
+            std::vector<uint32_t> fs;
+            for (auto& [i, fc] : p.faces)
+                if (i == ti && std::find(fs.begin(), fs.end(), fc) == fs.end()) fs.push_back(fc);
+            if (fs.empty()) continue;
+            if (std::find(p.targets.begin(), p.targets.end(), ref) != p.targets.end())
+                throw std::runtime_error("Pick a body's faces or the whole body, not both");
+            ResolvedTarget rt;
+            resolve(ref, rt);
+            if (!rt.shape) throw std::runtime_error("Faces can only be copied on a solid body");
+            glm::dmat4 M(rt.xform), Mi = glm::inverse(M);
+            std::vector<glm::dmat4> local;
+            for (size_t k = 1; k < X.size(); ++k) local.push_back(Mi * glm::dmat4(X[k]) * M);
+            ShapePtr out = local.empty() ? rt.shape : kernel::patternFaces(rt.shape, fs, local);
+            item.shapes.push_back(out);
+            item.meshes.push_back(kernel::tessellate(*out));
+            item.names.push_back(rt.name.empty() ? f.name : rt.name);
+            item.xforms.push_back(rt.xform);
+            item.instanceRefs.push_back({0, 0});   // new geometry; its look comes from the consumed body
+            item.consumed.push_back(ref);
+        }
+        // Bodies: copies that share the part (no new geometry).
+        for (const TargetRef& ref : p.targets) {
+            ResolvedTarget rt;
+            resolve(ref, rt);
+            std::string base = rt.name.empty() ? f.name : rt.name;
+            for (size_t k = 0; k < X.size(); ++k) {
+                item.shapes.push_back(nullptr);
+                item.meshes.push_back(nullptr);
+                item.names.push_back(k == 0 ? base : freeBodyName(snap, f.id, item.names, base + ":" + std::to_string(k)));
+                item.xforms.push_back(X[k] * rt.xform);   // copies move in world space
+                item.instanceRefs.push_back(ref);
             }
             item.consumed.push_back(ref);
         }
-        return;
+        return;   // nothing picked yet: no copies, and no error while the dialog waits
     }
 
     // ---- mirror / split / combine / hole ----------------------------------------------
@@ -1495,7 +1580,9 @@ void computeFeature(const Document& snap, const std::vector<App::RecomputeResult
                 lo = glm::dvec3(inv * glm::dvec4(o, 1.0));
                 ln = glm::normalize(glm::transpose(glm::dmat3(xf)) * n);
             }
-            auto pieces = kernel::splitByPlane(rt.shape, lo, ln);
+            // A round face tool: its axis turns with the body like the plane does (rigid moves only).
+            auto pieces = world && !sp.sketchId && sp.toolR > 0 ? kernel::splitByCylinder(rt.shape, lo, ln, sp.toolR)
+                                                                : kernel::splitByPlane(rt.shape, lo, ln);
             int k = 0;
             for (auto& pc : pieces) {
                 item.shapes.push_back(pc);
@@ -2247,12 +2334,32 @@ void computeFeature(const Document& snap, const std::vector<App::RecomputeResult
             }
         } else {
             bool pointed = mp.pointEnd == 1 || mp.pointEnd == 2;
-            if (pointed && mp.sketchIds.empty()) throw std::runtime_error("Loft to a point needs a profile");
-            if (!pointed && mp.sketchIds.size() < 2) throw std::runtime_error("Loft needs at least two profile sketches");
+            const size_t nSections = mp.picks.empty() ? mp.sketchIds.size() : mp.picks.size();
+            if (nSections == 0 && !pointed) return;   // dialog open, nothing picked yet
+            if (pointed && nSections == 0) throw std::runtime_error("Loft to a point needs a profile");
+            if (!pointed && nSections < 2) throw std::runtime_error("Click at least two profiles or flat faces to loft between");
             if (pointed && !mp.railIds.empty()) throw std::runtime_error("A point end does not take rails");
             if (pointed && mp.centerId) throw std::runtime_error("A point end does not take a centerline");
             if (mp.centerId && !mp.railIds.empty()) throw std::runtime_error("A centerline does not take rails");
             std::vector<RegionLoops> sections;
+            if (!mp.picks.empty()) {
+                // Sections clicked in order: a sketch profile, or a flat face of a body.
+                for (const LoftPick& lp : mp.picks) {
+                    if (lp.sketchId) {
+                        auto pit = snap.sketches.find(lp.sketchId);
+                        if (pit == snap.sketches.end()) throw std::runtime_error("A sketch this loft uses is missing");
+                        auto regions = sketchRegionsAt(pit->second, {lp.pt});
+                        if (regions.empty()) throw std::runtime_error("A profile of '" + pit->second.name + "' this loft uses is gone. Edit the loft and pick it again.");
+                        sections.push_back(regions[0]);
+                    } else {
+                        ResolvedTarget rt;
+                        resolve({lp.face.feature, lp.face.slot}, rt);
+                        if (lp.face.faceTotal != 0 && kernel::faceCount(rt.shape) != lp.face.faceTotal)
+                            throw std::runtime_error("A body this loft uses changed shape, so its picked face no longer matches. Edit the loft and pick it again.");
+                        sections.push_back(kernel::faceOutline(rt.shape, rt.xform, lp.face.face));
+                    }
+                }
+            } else
             for (uint32_t sid : mp.sketchIds) {
                 auto pit = snap.sketches.find(sid);
                 if (pit == snap.sketches.end()) throw std::runtime_error("A sketch this feature uses is missing");
@@ -2495,7 +2602,14 @@ void computeFeature(const Document& snap, const std::vector<App::RecomputeResult
                 resolve({fr.feature, fr.slot}, rt);
                 if (fr.faceTotal != 0 && kernel::faceCount(rt.shape) != fr.faceTotal)
                     throw std::runtime_error("The body changed shape, so the picked face no longer matches. Edit the feature and pick it again.");
-                tools.push_back(kernel::extrudeFace(rt.shape, rt.xform, fr.face, reverse ? -dist : dist, x.symmetric));
+                if (std::abs(taper) > 1e-7) {
+                    // A face with a taper: its outline (and holes) extruded along its own normal.
+                    RegionLoops rg = kernel::faceOutline(rt.shape, rt.xform, fr.face);
+                    glm::dvec3 n = rg[0][0].normal;
+                    tools.push_back(kernel::extrudeRegion(rg, reverse ? -n : n, dist, x.symmetric, taper));
+                } else {
+                    tools.push_back(kernel::extrudeFace(rt.shape, rt.xform, fr.face, reverse ? -dist : dist, x.symmetric));
+                }
             }
         } else {
             auto sit = snap.sketches.find(sketchId);
@@ -2692,7 +2806,11 @@ const uint64_t kLogicStamp = [] {
     return h;
 }();
 
+std::mutex gStepMu;
+std::string gStepName;   // the step the background rebuild is on (for the memory watch)
+
 void runRecomputePass(const Document& snap, App::RecomputeResults& out, const CancelToken& cancel, JobSystem* jobs) {
+    struct ClearStep { ~ClearStep() { std::lock_guard<std::mutex> l(gStepMu); gStepName.clear(); } } clearStep;
     uint64_t running = kFnvSeed;
     int total = 0;
     for (int i = 0; i < snap.markerPos && i < (int)snap.timeline.size(); ++i)
@@ -2741,6 +2859,10 @@ void runRecomputePass(const Document& snap, App::RecomputeResults& out, const Ca
         item.chainSig = chain;
         if (std::getenv("KESTRAL_CHAINS")) std::fprintf(stderr, "CHAIN %u %s %016llx\n", f.id, f.name.c_str(), (unsigned long long)chain);
         auto t0 = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> l(gStepMu);
+            gStepName = f.name;
+        }
         std::string err;
         bool ok = false;
         bool fromDisk = false;
@@ -2800,6 +2922,30 @@ void runRecomputePass(const Document& snap, App::RecomputeResults& out, const Ca
                     for (auto& sh : item.shapes) item.meshes.push_back(sh ? kernel::tessellate(*sh) : MeshPtr());
                 }, err);
                 if (!ok) { item = {}; item.featureId = f.id; item.sig = own; item.chainSig = chain; err.clear(); }
+                // A kept result says which bodies it used up back then. If one of them is already
+                // used up by an earlier step now, or a later step names it (it was left alone when
+                // that step was made), the kept result came from a mix-up (a step left out that time):
+                // build it again instead of carrying the mix-up into every later open.
+                if (ok) {
+                    std::vector<TargetRef> ownRefs;
+                    namedRefs(f, ownRefs);
+                    std::vector<TargetRef> later;
+                    for (int j = i + 1; j < (int)snap.timeline.size(); ++j)
+                        if (!snap.timeline[j].suppressed) namedRefs(snap.timeline[j], later);
+                    bool stale = false;
+                    for (const TargetRef& r : item.consumed) {
+                        if (takers.count(r) && !takers[r].empty()) { stale = true; break; }
+                        bool mine = std::find(ownRefs.begin(), ownRefs.end(), r) != ownRefs.end();
+                        if (!mine && std::find(later.begin(), later.end(), r) != later.end()) { stale = true; break; }
+                    }
+                    if (stale) {
+                        item = {};
+                        item.featureId = f.id;
+                        item.sig = own;
+                        item.chainSig = chain;
+                        fromDisk = ok = false;
+                    }
+                }
             }
         }
         kernel::setCopyBeforeUnify(f.rules >= 2);
@@ -2877,6 +3023,11 @@ void runRecomputePass(const Document& snap, App::RecomputeResults& out, const Ca
 }
 
 } // namespace
+
+std::string recomputeStepNow() {
+    std::lock_guard<std::mutex> l(gStepMu);
+    return gStepName;
+}
 
 void App::refreshSignatures() {
     uint64_t running = kFnvSeed;
@@ -2994,6 +3145,12 @@ void App::applyRecomputeResults() {
             cutPreview_ = item.cutPreview;
             markSceneDirty();
         }
+        // A cut or join that picks its bodies itself keeps the ones it took the first time it
+        // worked (made from the dialog, the assistant or an older file): a rebuild never makes it
+        // grab other parts because what is shown, or what came before, is different then.
+        bool autoPick = (f.extrude && f.extrude->op != 0 && f.extrude->targets.empty()) ||
+                        (f.revolve && f.revolve->op != 0 && f.revolve->targets.empty());
+        if (autoPick && f.rules >= 3 && item.ok && !(dlg_.open && dlg_.featureId == f.id)) freezeTargets_.insert(f.id);
         if (freezeTargets_.count(f.id) && !(dlg_.open && dlg_.featureId == f.id)) {
             freezeTargets_.erase(f.id);
             if (item.ok && !item.consumed.empty()) {
@@ -3067,11 +3224,13 @@ void App::applyRecomputeResults() {
         // The body each output came from (for its appearance), looked up before consumption changes.
         std::vector<Body> srcBodies(item.shapes.size());
         std::vector<bool> hasSrc(item.shapes.size(), false);
+        std::vector<TargetRef> srcRefs(item.shapes.size(), TargetRef{0, 0});
         for (size_t k = 0; k < item.shapes.size(); ++k) {
             TargetRef r{0, 0};
             if (k < item.instanceRefs.size() && item.instanceRefs[k].first) r = item.instanceRefs[k];
             else if (k < item.consumed.size()) r = item.consumed[k];
             else if (!item.consumed.empty()) r = item.consumed[0];
+            srcRefs[k] = r;
             if (!r.first) continue;
             std::vector<uint32_t> ids = doc_.featureBodies(r.first);
             if (r.second >= ids.size()) continue;
@@ -3142,7 +3301,13 @@ void App::applyRecomputeResults() {
                 b.visible = src->visible;   // a feature that replaces a hidden body keeps it hidden
                 if (sameTopology) b.faceLooks = src->faceLooks;
             }
-            if (const BodyOverride* o = doc_.findOverride(f.id, (uint32_t)k)) {
+            b.fresh = srcOf(k) == nullptr;
+            b.src = srcRefs[k];
+            const BodyOverride* ov = doc_.findOverride(f.id, (uint32_t)k);
+            // Written for a different output in this slot (a new body then, a cut part now, or a
+            // cut of another part): its name, look and eye belong to that one, not this one.
+            if (ov && (!ov->fits(!b.fresh) || !ov->fitsSource(b.src))) ov = nullptr;
+            if (const BodyOverride* o = ov) {
                 if (!o->name.empty()) b.name = o->name;
                 if (o->hasColor) {
                     b.color = o->color;
@@ -3162,6 +3327,7 @@ void App::applyRecomputeResults() {
                 o.name = b.name;
                 o.color = b.color;
                 o.visible = b.visible;
+                o.made = 1;
                 doc_.setOverride(f.id, (uint32_t)k, o);
             }
             doc_.bodies[bid] = b;
@@ -3175,11 +3341,15 @@ void App::applyRecomputeResults() {
         for (auto it = selection_.begin(); it != selection_.end();)
             it = doc_.bodies.count(*it) ? std::next(it) : selection_.erase(it);
         doc_.gcParts();
+        // Rebuilt geometry is not an edit (opening a design rebuilds it): a design that matched its file
+        // still does afterwards. Edits that started this rebuild already made it dirty.
+        bool wasClean = !dirty_ && doc_.revision == cleanRev_;
         doc_.touch();
-        // Rebuilt geometry is not an edit (opening a design rebuilds it): edits mark dirty_ themselves.
+        if (wasClean) cleanRev_ = doc_.revision;
         markSceneDirty();
         for (auto& item : res.items)
             if (item.ok && !item.warn.empty()) toast(item.warn, ToastKind::Warning);
+        warnStackedCopies();
         // Construction planes are cheap data: derive them from their features directly.
         for (auto& ft : doc_.timeline) {
             if (ft.type == FeatureType::ConstructPlane && ft.cplane) updateConstructPlane(ft);
@@ -3216,6 +3386,79 @@ void App::applyRecomputeResults() {
         deleteFaceError_.clear();
         undo();
         toast("Delete Face did not work: " + why, ToastKind::Warning);
+    }
+}
+
+// Two shown bodies that are the same part in the same place (a left over copy from a step that was
+// tried twice): say so once, naming them, so it is fixed before more steps build on either.
+void App::warnStackedCopies() {
+    struct Key { long long v[7]; bool operator<(const Key& o) const { return std::lexicographical_compare(v, v + 7, o.v, o.v + 7); } };
+    std::map<Key, std::vector<uint32_t>> groups;
+    for (auto& [id, b] : doc_.bodies) {
+        if (!bodyShown(b)) continue;
+        auto pit = doc_.parts.find(b.partId);
+        if (pit == doc_.parts.end() || !pit->second.mesh) continue;
+        Aabb bb = pit->second.mesh->bounds.transformed(b.xform);
+        if (!bb.valid()) continue;
+        Key k;
+        for (int a = 0; a < 3; ++a) { k.v[a] = std::llround(bb.min[a] * 1e3); k.v[3 + a] = std::llround(bb.max[a] * 1e3); }
+        k.v[6] = (long long)pit->second.mesh->indices.size();
+        groups[k].push_back(id);
+    }
+    std::set<std::set<uint32_t>> now;
+    for (auto& [k, ids] : groups) {
+        if (ids.size() < 2) continue;
+        // Same box and mesh: check the volumes too before calling them copies.
+        std::map<long long, std::vector<uint32_t>> byVol;
+        for (uint32_t id : ids) {
+            const Body& b = doc_.bodies.at(id);
+            auto pit = doc_.parts.find(b.partId);
+            if (pit == doc_.parts.end() || !pit->second.shape) continue;
+            byVol[std::llround(kernel::solidVolume(pit->second.shape) * 1e3)].push_back(id);
+        }
+        for (auto& [v, same] : byVol)
+            if (same.size() >= 2) now.insert(std::set<uint32_t>(same.begin(), same.end()));
+    }
+    // Copies that went separate ways (later steps changed one of them): same name, same place.
+    {
+        std::map<std::string, std::vector<uint32_t>> byName;
+        for (auto& [id, b] : doc_.bodies)
+            if (bodyShown(b)) byName[b.name].push_back(id);
+        for (auto& [nm, ids] : byName) {
+            if (ids.size() < 2) continue;
+            for (size_t i = 0; i < ids.size(); ++i)
+                for (size_t j = i + 1; j < ids.size(); ++j) {
+                    const Body& a = doc_.bodies.at(ids[i]);
+                    const Body& b = doc_.bodies.at(ids[j]);
+                    auto pa = doc_.parts.find(a.partId), pb = doc_.parts.find(b.partId);
+                    if (pa == doc_.parts.end() || pb == doc_.parts.end() || !pa->second.mesh || !pb->second.mesh) continue;
+                    Aabb ba = pa->second.mesh->bounds.transformed(a.xform), bbx = pb->second.mesh->bounds.transformed(b.xform);
+                    if (!ba.valid() || !bbx.valid()) continue;
+                    bool same = true;
+                    for (int k = 0; k < 3 && same; ++k)
+                        same = std::abs(ba.min[k] - bbx.min[k]) < 0.5f && std::abs(ba.max[k] - bbx.max[k]) < 0.5f;
+                    if (same) now.insert({ids[i], ids[j]});
+                }
+        }
+    }
+    for (auto& s : now) {
+        std::set<std::string> key;
+        for (uint32_t id : s) key.insert(doc_.bodies.at(id).name);
+        std::string names, steps;
+        for (uint32_t id : s) {
+            const Body& b = doc_.bodies.at(id);
+            names += (names.empty() ? "'" : ", '") + b.name + "'";
+            int fi = doc_.featureIndex(b.featureId);
+            std::string st = fi >= 0 ? doc_.timeline[fi].name : std::string("?");
+            if (steps.find(st) == std::string::npos) steps += (steps.empty() ? "" : ", ") + st;
+        }
+        std::string sig = names + "|" + steps;
+        if (stackedWarned_.count(sig)) continue;
+        stackedWarned_.insert(sig);
+        toast("Two copies of the same part sit in one place: " + names + " (from " + steps +
+              "). One is probably left over from a step that was tried twice. Hide one to check, then remove the extra.",
+              ToastKind::Warning);
+        log::warn("Stacked copies: " + names + " from " + steps);
     }
 }
 
@@ -4268,6 +4511,8 @@ void App::syncBodyOverride(uint32_t bodyId) {
     o.mat = it->second.mat;
     o.faceLooks = it->second.faceLooks;
     o.visible = it->second.visible;
+    o.made = it->second.fresh ? 1 : 0;
+    o.src = it->second.src;
     doc_.setOverride(it->second.featureId, doc_.bodySlot(bodyId), o);
 }
 
@@ -4276,40 +4521,80 @@ void App::syncBodyOverride(uint32_t bodyId) {
 std::string App::autosavePath() const { return platform::appDataDir() + "/autosave/recovery.kst"; }
 
 void App::saveDocumentNow() {
-    if (doc_.path.empty()) {
+    if (doc_.path.empty() || inRecoveryDir(doc_.path)) {
         saveDocumentAs();
         return;
     }
+    syncDirty();
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    {
+        // The design was renamed in the browser: it saves as <new name>.kst beside the old file (which
+        // stays). If that name is taken, ask.
+        fs::path cur = u8path(doc_.path);
+        std::string stem = pathToU8(cur.stem());
+        bool okName = !doc_.name.empty() && doc_.name.find_first_of("<>:\"/\\|?*") == std::string::npos;
+        if (okName && doc_.name != stem) {
+            fs::path np = cur.parent_path() / u8path(doc_.name + ".kst");
+            if (fs::exists(np, ec)) { saveDocumentAs(); return; }
+            doc_.path = pathToU8(np);
+            doc_.version = 0;
+            dirty_ = true;
+        }
+    }
     // Nothing changed since the last save: no new version (an older version opened can still be
-    // saved as the newest).
-    if (!dirty_ && doc_.version > 0 && doc_.version >= latestVersion(doc_.path)) {
-        toast("No changes to save (" + doc_.name + " v" + std::to_string(doc_.version) + ")");
-        saveStepShapes();   // still keeps any step shapes not stored yet (designs saved before fix1068)
-        return;
+    // saved as the newest). Only when the file on disk really is that version.
+    if (!dirty_ && doc_.version > 0 && doc_.version >= latestVersion(doc_.path) && fs::exists(u8path(doc_.path), ec)) {
+        std::string vf = versionsDir(doc_.path) + "/v" + std::to_string(doc_.version) + ".kst";
+        auto readAll = [](const std::string& p) {
+            std::ifstream f(u8path(p), std::ios::binary);
+            return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        };
+        std::string onDisk = readAll(doc_.path);
+        if (!onDisk.empty() && onDisk == readAll(vf)) {
+            toast("No changes to save (" + doc_.name + " v" + std::to_string(doc_.version) + ")");
+            saveStepShapes();   // still keeps any step shapes not stored yet (designs saved before fix1068)
+            return;
+        }
     }
     // Every Ctrl+S is a new version. The file holds the newest; each version is also kept in the
-    // hidden versions folder beside it, so older ones can be opened from the Data panel.
+    // hidden versions folder beside it, so older ones can be opened from the Data panel. The version
+    // copy is written first: if the design file then cannot be written, the work is still on disk.
     int prevVersion = doc_.version;
     doc_.version = std::max(doc_.version, latestVersion(doc_.path)) + 1;
-    if (saveDocument(doc_, doc_.path)) {
-        dirty_ = false;
-        std::error_code ec;
-        std::filesystem::remove(u8path(autosavePath()), ec);
-        std::string vdir = versionsDir(doc_.path);
-        std::filesystem::create_directories(u8path(vdir), ec);
+    std::string data;
+    if (!serializeDocument(doc_, data)) {
+        doc_.version = prevVersion;
+        writeRecoverySync(doc_, asKey_, recRev_);
+        toast("Could not save " + doc_.name + ": the design could not be written out. Your work is in the recovery copy.", ToastKind::Error);
+        return;
+    }
+    std::string vdir = versionsDir(doc_.path);
+    fs::create_directories(u8path(vdir), ec);
 #ifdef _WIN32
-        platform::setHidden(pathToU8(u8path(vdir).parent_path()));
+    platform::setHidden(pathToU8(u8path(vdir).parent_path()));
 #endif
-        std::filesystem::copy_file(u8path(doc_.path), u8path(vdir + "/v" + std::to_string(doc_.version) + ".kst"),
-                                   std::filesystem::copy_options::overwrite_existing, ec);
-        toast("Saved " + doc_.name + "  v" + std::to_string(doc_.version), ToastKind::Success);
+    std::string vfile = vdir + "/v" + std::to_string(doc_.version) + ".kst";
+    bool okVersion = writeFileAtomic(vfile, data);
+    bool okMain = writeFileAtomic(doc_.path, data);
+    if (okMain) {
+        markClean();
+        ownRev_ = doc_.revision;
+        ownAutosaved_ = false;
+        dropRecovery(asKey_);
+        recRev_ = 0;
+        if (okVersion) toast("Saved " + doc_.name + "  v" + std::to_string(doc_.version), ToastKind::Success);
+        else toast("Saved " + doc_.name + ", but its version copy could not be kept in " + vdir, ToastKind::Warning);
         saveStepShapes();
         thumbFromDoc(doc_.path);
         settings_.addRecent(doc_.path);
         settings_.save(settingsPath_);
     } else {
-        doc_.version = prevVersion;
-        toast("Could not write " + doc_.path + " (folder missing or read only?)", ToastKind::Error);
+        if (!okVersion) doc_.version = prevVersion;
+        writeRecoverySync(doc_, asKey_, recRev_);
+        toast("Could not write " + doc_.path + (okVersion ? ". This version was kept in " + vfile : std::string(" (folder missing or read only?)")) +
+                  ". Your work is also in the recovery copy: try Save As.",
+              ToastKind::Error);
     }
 }
 
@@ -4387,10 +4672,21 @@ void App::openDesignVersion(const std::string& designPath, int v) {
     std::string kept;
     if (int t = designTabFor(designPath); t >= 0) {
         if (t != designActive_) switchDesignTab(t);
+        syncDirty();
         if (dirty_) {
-            kept = versionsDir(designPath) + "/unsaved changes.kst";
+            // A new file each time: an earlier set of kept changes is never overwritten.
+            char stamp[32];
+            std::time_t tt = std::time(nullptr);
+            std::strftime(stamp, sizeof stamp, "%Y-%m-%d %H%M%S", std::localtime(&tt));
+            kept = versionsDir(designPath) + "/unsaved changes " + stamp + ".kst";
             if (!saveDocument(doc_, kept)) kept.clear();
+            // Also in the discarded folder of the recovery copies (two places, in case one fails).
+            if (writeRecoverySync(doc_, asKey_, recRev_)) discardRecovery(asKey_);
+        } else {
+            dropRecovery(asKey_);
         }
+        asKey_.clear();
+        recRev_ = 0;
     } else if (docInUse()) {
         newDesignTab();
     }
@@ -4405,7 +4701,11 @@ void App::openDesignVersion(const std::string& designPath, int v) {
     selection_.clear();
     isolated_.clear();
     browserHover_.clear();
-    dirty_ = false;
+    ownRev_ = 0;
+    ownAutosaved_ = false;
+    asKey_.clear();
+    recRev_ = 0;
+    markClean();
     markSceneDirty();
     rebuildScene();
     scheduleRecompute(0);
@@ -4431,13 +4731,37 @@ std::string App::designFolder() const {
 void App::saveDocumentAs() {
     std::string p = platform::saveFileDialog("Save Design", "Kestral design (*.kst)", "*.kst", "kst", doc_.name + ".kst", designFolder());
     if (p.empty()) return;
+    if (inRecoveryDir(p)) {
+        toast("That is Kestral's recovery folder: pick another place for the design.", ToastKind::Warning);
+        return;
+    }
+    if (int t = designTabFor(p); t >= 0 && t != designActive_) {
+        toast(pathToU8(u8path(p).filename()) + " is open in another tab: close it first or pick another name.", ToastKind::Warning);
+        return;
+    }
     settings_.lastDesignDir = pathToU8(u8path(p).parent_path());
+    // Kept to go back to when the save fails, so the design never points at a file it is not in.
+    std::string oldPath = doc_.path, oldName = doc_.name, oldRoot = doc_.components[doc_.rootId].name;
+    int oldVersion = doc_.version;
+    bool samePlace = !oldPath.empty() && u8path(oldPath) == u8path(p);
     doc_.path = p;
     doc_.name = pathToU8(u8path(p).stem());
     doc_.components[doc_.rootId].name = doc_.name;
+    if (!samePlace) {
+        doc_.version = 0;   // a new design file starts its own versions
+        ownAutosaved_ = false;
+        ownRev_ = 0;
+    }
     doc_.touch();
+    dirty_ = true;
     markSceneDirty();
     saveDocumentNow();
+    if (dirty_) {
+        doc_.path = oldPath;
+        doc_.name = oldName;
+        doc_.components[doc_.rootId].name = oldRoot;
+        doc_.version = oldVersion;
+    }
 }
 
 void App::openDocumentDialog() {
@@ -4448,14 +4772,62 @@ void App::openDocumentDialog() {
 }
 
 void App::openDocumentPath(const std::string& path) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    // A recovery copy opened from a file list: it is unsaved work, restored as such (never a design
+    // file of its own).
+    if (inRecoveryDir(path)) {
+        RecoveredWork w;
+        w.file = path;
+        std::string stem = pathToU8(u8path(path).stem());
+        auto endsWith = [&](const std::string& t) { return stem.size() >= t.size() && stem.compare(stem.size() - t.size(), t.size(), t) == 0; };
+        w.legacy = endsWith("recovery") || endsWith("crash");
+        if (!w.legacy) {
+            w.key = stem;
+            std::filesystem::path info0 = u8path(path);
+            info0.replace_extension(".info");
+            std::ifstream info(info0, std::ios::binary);
+            std::getline(info, w.original);
+            std::getline(info, w.name);
+        }
+        for (size_t i = 0; i < recovered_.size(); ++i)
+            if (recovered_[i].file == path) { recovered_.erase(recovered_.begin() + (long)i); break; }
+        restoreWork(w);
+        return;
+    }
+    // A saved version (<folder>/.kestral_versions/<name>/vN.kst) is never written to: it opens as that
+    // version of its design, so Ctrl+S saves the design's next version.
+    {
+        fs::path p = u8path(path);
+        std::string fn = pathToU8(p.stem());
+        fs::path vdir = p.parent_path();
+        if (fn.size() > 1 && fn[0] == 'v' && std::all_of(fn.begin() + 1, fn.end(), ::isdigit) && pathToU8(vdir.parent_path().filename()) == ".kestral_versions") {
+            std::string design = pathToU8(vdir.parent_path().parent_path() / u8path(pathToU8(vdir.filename()) + ".kst"));
+            openDesignVersion(design, std::atoi(fn.c_str() + 1));
+            return;
+        }
+    }
     // Already open in a tab: bring it in front. Otherwise it gets its own tab (like Fusion) when the
     // one in front holds a design.
     if (int t = designTabFor(path); t >= 0) { switchDesignTab(t); return; }
     auto r = loadDocument(path);
+    int fromVersion = 0;
     if (!r.ok) {
+        // A damaged or empty design file: its newest readable version opens instead, and saving
+        // writes the design file again.
         std::string at = r.line > 1 ? " (line " + std::to_string(r.line) + ")" : "";
-        toast("Could not open: " + r.error + at, ToastKind::Error);
-        return;
+        std::string why = r.error + at;
+        for (int v : designVersions(path)) {
+            auto rv = loadDocument(versionsDir(path) + "/v" + std::to_string(v) + ".kst");
+            if (rv.ok) { r = std::move(rv); fromVersion = v; break; }
+        }
+        if (!fromVersion) {
+            toast("Could not open: " + why, ToastKind::Error);
+            return;
+        }
+        toast(pathToU8(u8path(path).filename()) + " could not be read (" + why + "). Opened its newest saved version, v" +
+                  std::to_string(fromVersion) + ". Ctrl+S writes the file again.",
+              ToastKind::Warning);
     }
     if (docInUse()) newDesignTab();
     leaveSketchMode();
@@ -4464,11 +4836,17 @@ void App::openDocumentPath(const std::string& path) {
     doc_.path = path;
     doc_.name = pathToU8(u8path(path).stem());
     doc_.components[doc_.rootId].name = doc_.name;
+    if (fromVersion) doc_.version = fromVersion;
     undo_.clear();
     selection_.clear();
     isolated_.clear();
     browserHover_.clear();
-    dirty_ = false;
+    asKey_.clear();
+    recRev_ = 0;
+    ownRev_ = 0;
+    ownAutosaved_ = false;
+    markClean();
+    if (fromVersion) dirty_ = true;   // the file on disk is not readable: it needs writing
     markSceneDirty();
     rebuildScene();
     float a = vk_.extent.height ? (float)vk_.extent.width / (float)vk_.extent.height : 1.f;
@@ -4476,111 +4854,8 @@ void App::openDocumentPath(const std::string& path) {
     settings_.addRecent(path);
     settings_.save(settingsPath_);
     thumbAfterRebuild_ = path;   // refresh its preview once the geometry is rebuilt
-    toast("Opened " + doc_.name + ". Geometry is rebuilding in the background.", ToastKind::Success);
+    if (!fromVersion) toast("Opened " + doc_.name + ". Geometry is rebuilding in the background.", ToastKind::Success);
     scheduleRecompute(0);
-}
-
-void App::checkRecovery() {
-    namespace fs = std::filesystem;
-    std::error_code ec;
-    std::string newest;
-    fs::file_time_type bestT = fs::file_time_type::min();
-    for (const char* name : {"autosave/recovery.kst", "autosave/crash.kst"}) {
-        std::string p = platform::appDataDir() + "/" + name;
-        if (!fs::exists(u8path(p), ec)) continue;
-        auto t = fs::last_write_time(u8path(p), ec);
-        if (ec) continue;
-        if (t > bestT) { bestT = t; newest = p; }
-    }
-    if (newest.empty()) return;
-    std::string clean = platform::appDataDir() + "/clean_exit";
-    if (fs::exists(u8path(clean), ec)) {
-        auto t = fs::last_write_time(u8path(clean), ec);
-        if (!ec && t >= bestT) return;   // nothing newer than the last clean exit
-    }
-    recoveryFile_ = newest;
-}
-
-void App::updateAutosave() {
-    if (modelTest_ || uiTest_) return;   // a self test must not overwrite the recovery file
-    if (!dirty_) {
-        lastSaveActivity_ = time_;
-        return;
-    }
-    if (settings_.autosaveSec <= 0 || autosaveBusy_) return;
-    if (time_ - lastSaveActivity_ < std::max(5.f, settings_.autosaveSec)) return;
-    lastSaveActivity_ = time_;
-    // Serialize here (a fraction of a millisecond, no geometry), write on a worker.
-    std::string data;
-    if (!serializeDocument(doc_, data)) return;
-    std::string rec = autosavePath();
-    // Mid command (a dialog open) only the recovery copy is written: your file gets finished work.
-    std::string own = settings_.autosaveToFile && !doc_.path.empty() && !dlg_.open && !tdlg_.open ? doc_.path : std::string();
-    uint64_t rev = doc_.revision;
-    autosaveBusy_ = true;
-    JobSystem* jobs = jobs_.get();
-    jobs_->submit("autosave", [this, jobs, data, rec, own, rev] {
-        std::error_code ec;
-        std::filesystem::create_directories(u8path(rec).parent_path(), ec);
-        bool okRec = writeFileAtomic(rec, data);
-        bool okOwn = own.empty() || writeFileAtomic(own, data);
-        jobs->post([this, okRec, okOwn, own, rev] {
-            autosaveBusy_ = false;
-            if (!own.empty() && okOwn && doc_.revision == rev) {
-                dirty_ = false;   // the file on disk now matches what you see
-                lastAutosaveTime_ = time_;
-            }
-            if (!okOwn) toast("Autosave could not write " + own + ". Your work is still in the recovery copy.", ToastKind::Warning);
-            else if (!okRec) log::warn("Recovery autosave failed");
-        });
-    }, [this](const std::string& err) {
-        autosaveBusy_ = false;
-        log::warn("Autosave failed: " + err);
-    });
-}
-
-void App::drawRecoveryPrompt() {
-    if (recoveryFile_.empty()) return;
-    const float S = uiScale_;
-    ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + vp->Size.y * 0.35f),
-                            ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    if (!ImGui::Begin("Recovered work", nullptr,
-                      ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::End();
-        return;
-    }
-    std::error_code ec;
-    auto t = std::filesystem::last_write_time(u8path(recoveryFile_), ec);
-    std::time_t tt = ec ? std::time(nullptr) : std::chrono::system_clock::to_time_t(std::chrono::clock_cast<std::chrono::system_clock>(t));
-    char when[64] = "unknown time";
-    if (!ec) {
-        std::tm tmv{};
-#ifdef _WIN32
-        localtime_s(&tmv, &tt);
-#else
-        localtime_r(&tt, &tmv);
-#endif
-        std::strftime(when, sizeof when, "%H:%M", &tmv);
-    }
-    ImGui::Text("Kestral found autosaved work from %s.\nRestore it?", when);
-    ImGui::Spacing();
-    float bw = 110 * S;
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.29f, 0.63f, 0.36f, 1.f));
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 1));
-    if (ImGui::Button("Restore", ImVec2(bw, 28 * S))) {
-        std::string p = recoveryFile_;
-        recoveryFile_.clear();
-        openDocumentPath(p);
-    }
-    ImGui::PopStyleColor(2);
-    ImGui::SameLine();
-    if (ImGui::Button("Discard", ImVec2(bw, 28 * S))) {
-        std::error_code ec2;
-        std::filesystem::remove(u8path(recoveryFile_), ec2);
-        recoveryFile_.clear();
-    }
-    ImGui::End();
 }
 
 } // namespace kst

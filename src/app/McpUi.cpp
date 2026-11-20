@@ -652,7 +652,7 @@ App::McpCall App::mcpRunUiTool(const std::string& client, const std::string& nam
                 bool act = (int)i == designActive_;
                 t.set("name", act ? doc_.name : designTabs_[i].doc.name);
                 t.set("active", act);
-                t.set("unsaved", act ? dirty_ : designTabs_[i].dirty);
+                t.set("unsaved", tabUnsaved((int)i));
                 tabs.push(t);
             }
             s.set("design_tabs", tabs);
@@ -989,9 +989,14 @@ App::McpCall App::mcpRunUiTool(const std::string& client, const std::string& nam
             else if (act == "show") { glfwShowWindow(window_); hiddenWindow_ = false; }
             else if (act == "hide") { glfwHideWindow(window_); hiddenWindow_ = true; }
             else if (act == "close") {
-                if (dirty_ && !discard) return std::string("Error: the design has unsaved changes. Save it (save_design) or pass discard_unsaved=true.");
-                if (discard) dirty_ = false;
-                for (auto& t : designTabs_) if (discard) t.dirty = false;
+                bool any = false;
+                for (int i = 0; i < (int)designTabs_.size(); ++i) any |= tabUnsaved(i);
+                if (any && !discard) return std::string("Error: a design has unsaved changes. Save it (save_design) or pass discard_unsaved=true.");
+                // Discarded work is kept in the discarded folder of the recovery copies.
+                if (discard)
+                    for (int i = 0; i < (int)designTabs_.size(); ++i)
+                        if (tabUnsaved(i)) discardDesignChanges(i);
+                quitting_ = true;
                 glfwSetWindowShouldClose(window_, GLFW_TRUE);
                 return std::string("Kestral is closing.");
             }

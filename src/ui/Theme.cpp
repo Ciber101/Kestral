@@ -49,11 +49,18 @@ float chroma(const ImVec4& c) { return std::max({c.x, c.y, c.z}) - std::min({c.x
 
 float darkness() { return gDark; }
 
-ImVec4 th(const ImVec4& c) { return flip(c, gDark); }
+// Strong colors (Kestral orange, sketch blue, the axis reds and greens) keep their color in the dark
+// theme: flipping their lightness turned the selection orange into brown. Grays and soft tints flip.
+float flipWeight(const ImVec4& v) {
+    float ch = std::max({v.x, v.y, v.z}) - std::min({v.x, v.y, v.z});
+    return gDark * std::clamp(1.f - (ch - 0.25f) / 0.25f, 0.f, 1.f);
+}
 ImU32 th(ImU32 c) {
     if (gDark <= 0.f) return c;
-    return ImGui::ColorConvertFloat4ToU32(flip(ImGui::ColorConvertU32ToFloat4(c), gDark));
+    ImVec4 v = ImGui::ColorConvertU32ToFloat4(c);
+    return ImGui::ColorConvertFloat4ToU32(flip(v, flipWeight(v)));
 }
+ImVec4 th(const ImVec4& c) { return gDark <= 0.f ? c : flip(c, flipWeight(c)); }
 ImU32 thIcon(ImU32 c) {
     if (gDark <= 0.f) return c;
     ImVec4 v = ImGui::ColorConvertU32ToFloat4(c);

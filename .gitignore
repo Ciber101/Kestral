@@ -16,3 +16,4 @@ tools/KestralExportAll/.vscode/
 src/*.jsonl
 src/*.obj
 bin/Kestral.old*.exe
+*.bak*

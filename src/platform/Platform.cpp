@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <new>
 #include <stdexcept>
 #include <algorithm>
 #include <cmath>
@@ -36,6 +37,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <spawn.h>
+#include <sys/file.h>
 #include <sys/wait.h>
 #include <unistd.h>
 extern char** environ;
@@ -422,6 +424,19 @@ void notifyShutdown() {
 
 void openUrl(const std::string& url) {
     ShellExecuteW(nullptr, L"open", widen(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+bool holdLock(const std::string& path) {
+    HANDLE h = CreateFileW(widen(path).c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    return h != INVALID_HANDLE_VALUE;   // kept open for the life of the process on purpose
+}
+
+bool lockHeld(const std::string& path) {
+    HANDLE h = CreateFileW(widen(path).c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_SHARING_VIOLATION;
+    CloseHandle(h);
+    return false;
 }
 
 void setHidden(const std::string& path) {
@@ -1171,6 +1186,22 @@ void notifyShutdown() {}
 
 void setHidden(const std::string&) {}
 
+bool holdLock(const std::string& path) {
+    int fd = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
+    if (fd < 0) return false;
+    if (::flock(fd, LOCK_EX | LOCK_NB) != 0) { ::close(fd); return false; }
+    return true;   // the descriptor stays open for the life of the process on purpose
+}
+
+bool lockHeld(const std::string& path) {
+    int fd = ::open(path.c_str(), O_RDWR);
+    if (fd < 0) return false;
+    bool held = ::flock(fd, LOCK_EX | LOCK_NB) != 0;
+    if (!held) ::flock(fd, LOCK_UN);
+    ::close(fd);
+    return held;
+}
+
 void revealInExplorer(const std::string& path) {
     std::error_code ec;
     bool dir = std::filesystem::is_directory(path, ec);
@@ -1283,6 +1314,8 @@ bool guarded(const char* what, const std::function<void()>& fn, std::string& err
     try {
         fn();
         return true;
+    } catch (const std::bad_alloc&) {
+        error = "ran out of memory (Kestral stopped it before it could use up the whole PC)";
     } catch (const std::exception& e) {
         error = e.what();
     } catch (...) {

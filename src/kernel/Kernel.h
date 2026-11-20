@@ -59,7 +59,10 @@ bool saveStepResult(const std::string& file, const FeatureCacheData& d);
 uint64_t featuresBuildStamp();
 
 // Display tessellation of a B-rep (faces with per-triangle face ids plus feature edges).
-MeshPtr tessellate(const ShapeHandle& shape, double relDeflection = 0.0005, double angDeflection = 0.1);
+MeshPtr tessellate(const ShapeHandle& shape, double relDeflection = 0.0005, double angDeflection = 0.05, double absLin = 0);
+// A finer display mesh for a close view: chord error linMm, made from a copy of the shape (the live
+// one is never touched from a worker). Null when it would pass maxTris triangles.
+MeshPtr tessellateForView(const ShapePtr& shape, double linMm, size_t maxTris = 2000000);   // 0.05: curved faces sit closer to their exact edges up close
 
 struct ExportItem {
     ShapePtr shape;

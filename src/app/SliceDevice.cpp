@@ -150,7 +150,7 @@ void App::sliceAfterStatus() {
             const print::Preset* mp = print::findPreset(*slice_.setup, "machine", slice_.machine);
             for (auto* p : slice_.printers)
                 if (mp && p->printerModel == mp->printerModel && p->name.find(d) != std::string::npos && !p->user) {
-                    if (p->name != slice_.machine && slice_.machine.find(d) == std::string::npos) { slice_.machine = p->name; slice_.overrides.clear(); sliceLoadSettings(); }
+                    if (p->name != slice_.machine && slice_.machine.find(d) == std::string::npos) { sliceDropMachineChanges(); slice_.machine = p->name; sliceLoadSettings(); }
                     break;
                 }
         }
@@ -794,22 +794,51 @@ void App::drawSliceSendDialog() {
             }
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Filament %d (%s): click to pick its AMS slot", tabFil + 1, sliceFilPreset(tabFil).c_str());
             if (ImGui::BeginPopup("##slots")) {
-                ImGui::TextDisabled("AMS slot for filament %d", tabFil + 1);
-                auto opt = [&](const print::PrintStatus::AmsTray& t, int tid) {
-                    if (!t.loaded) return;
-                    glm::vec3 tc = hexCol(t.color, glm::vec3(0.5f));
+                ImGui::TextDisabled("Slot for filament %d (%s)", tabFil + 1, type.c_str());
+                // Orca's grid: every AMS slot is a button (empty or untagged ones too), then the external spool.
+                const float tw = 74 * S, tH = 48 * S;
+                auto tile = [&](const print::PrintStatus::AmsTray* t, int tid, bool first) {
+                    bool known = t && t->loaded;
+                    glm::vec3 tc = known ? hexCol(t->color, glm::vec3(0.35f)) : glm::vec3(0.22f);
+                    if (!first) ImGui::SameLine(0, 6 * S);
                     ImVec2 q = ImGui::GetCursorScreenPos();
-                    std::string lb = "        " + trayName(tid) + "   " + (t.name.empty() ? t.type : t.name) + "##s" + std::to_string(tid);
-                    if (ImGui::Selectable(lb.c_str(), m == tid)) slice_.ex.amsMap[i] = tid;
-                    float hgt = ImGui::GetTextLineHeight();
-                    ImGui::GetWindowDrawList()->AddRectFilled(q, ImVec2(q.x + hgt * 1.8f, q.y + hgt), sl::u32(tc.r, tc.g, tc.b), 3 * S);
+                    ImGui::PushID(tid);
+                    bool click = ImGui::InvisibleButton("##t", ImVec2(tw, tH));
+                    bool hov = ImGui::IsItemHovered();
+                    ImGui::PopID();
+                    ImDrawList* pd = ImGui::GetWindowDrawList();
+                    ImVec2 q1(q.x + tw, q.y + tH);
+                    pd->AddRectFilled(q, q1, sl::u32(tc.r, tc.g, tc.b), 5 * S);
+                    ImU32 txc = sl::isDark(tc.r, tc.g, tc.b) ? IM_COL32_WHITE : IM_COL32(20, 20, 20, 255);
+                    std::string l1 = tid == 254 ? std::string("Ext") : trayName(tid);
+                    std::string l2 = known ? t->type : std::string("?");
+                    ImVec2 s1 = ImGui::CalcTextSize(l1.c_str()), s2 = ImGui::CalcTextSize(l2.c_str());
+                    pd->AddText(ImVec2(q.x + (tw - s1.x) * 0.5f, q.y + 6 * S), txc, l1.c_str());
+                    pd->AddText(fonts_.bold, ImGui::GetFontSize(), ImVec2(q.x + (tw - s2.x) * 0.5f, q.y + tH - s2.y - 6 * S), txc, l2.c_str());
+                    bool sel = m == tid;
+                    pd->AddRect(q, q1, sel ? sl::orangeU() : hov ? col::Text : col::PanelBorder, 5 * S, 0, sel ? 3 * S : 1 * S);
+                    if (hov) {
+                        if (known) ImGui::SetTooltip("%s  %s%s", trayName(tid).c_str(), t->name.empty() ? t->type.c_str() : t->name.c_str(),
+                                                     !type.empty() && typeOfPreset(t->type) != typeOfPreset(type) && !typeOfPreset(type).empty() ? "\nNot the same type as this filament" : "");
+                        else ImGui::SetTooltip("%s: the printer doesn't say what is here (empty, or a spool with no type set).\nPick it if your filament is in this slot.", trayName(tid).c_str());
+                    }
+                    if (click) { slice_.ex.amsMap[i] = tid; ImGui::CloseCurrentPopup(); }
                 };
-                for (auto& t : st.trays) opt(t, t.ams * 4 + t.slot);
-                if (st.hasExt) opt(st.ext, 254);
-                if (st.trays.empty() && !st.hasExt) {
-                    if (ImGui::Selectable("External spool", m == 254)) slice_.ex.amsMap[i] = 254;
-                    ImGui::TextDisabled(st.ok ? "The printer reports no AMS." : "No status from the printer yet.");
+                std::vector<int> units;
+                for (auto& t : st.trays) if (std::find(units.begin(), units.end(), t.ams) == units.end()) units.push_back(t.ams);
+                if (units.empty() && !st.ok) units.push_back(0);   // no status yet: assume one AMS
+                std::sort(units.begin(), units.end());
+                for (int u : units) {
+                    ImGui::TextDisabled("AMS %d", u + 1);
+                    for (int k = 0; k < 4; ++k) {
+                        const print::PrintStatus::AmsTray* tp = nullptr;
+                        for (auto& t : st.trays) if (t.ams == u && t.slot == k) tp = &t;
+                        tile(tp, u * 4 + k, k == 0);
+                    }
                 }
+                ImGui::TextDisabled("External spool");
+                tile(st.hasExt ? &st.ext : nullptr, 254, true);
+                if (!st.ok) ImGui::TextDisabled("No status from the printer yet.");
                 ImGui::EndPopup();
             }
             ImGui::SetCursorScreenPos(ImVec2(b.x + boxW, b.y));
@@ -817,6 +846,17 @@ void App::drawSliceSendDialog() {
             ImGui::PopID();
         }
         if (!mapped) ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col::Error), "Not all filaments used in slicing are mapped to the printer. Pick a slot for each one.");
+        // A slot with another known type than the filament it prints (PETG sliced, PLA in the slot) is allowed but flagged.
+        for (size_t i = 0; i < n; ++i) {
+            int tabFil = i < slice_.ex.slicedFils.size() ? slice_.ex.slicedFils[i] : 0;
+            std::string want = typeOfPreset(sliceFilPreset(tabFil));
+            int m = slice_.ex.amsMap[i];
+            const print::PrintStatus::AmsTray* tr = nullptr;
+            for (auto& t : st.trays) if (t.ams * 4 + t.slot == m) tr = &t;
+            if (m == 254 && st.hasExt) tr = &st.ext;
+            if (tr && tr->loaded && !want.empty() && !typeOfPreset(tr->type).empty() && typeOfPreset(tr->type) != want)
+                ImGui::TextColored(ImVec4(1.f, 0.75f, 0.3f, 1.f), "Filament %d is %s but %s holds %s.", tabFil + 1, want.c_str(), trayName(m).c_str(), tr->type.c_str());
+        }
         ImGui::Spacing();
         auto onOff = [&](const char* label, bool& v, const char* tip) {
             ImGui::AlignTextToFramePadding();

@@ -41,7 +41,7 @@ void App::drawStartPage() {
     ImGui::PopFont();
     dl->AddText(ImVec2(L.x + 60 * S, L.y + 40 * S), col::TextDim, "Design, simulate, print.");
 
-    bool hasRecovery = !recoveryFile_.empty();
+    bool hasRecovery = !recovered_.empty();
     struct Act { const char* label; const char* sub; Icon icon; int id; };
     Act acts[] = {
         {"New Design", "Start from an empty model", Icon::Extrude, 0},
@@ -68,8 +68,8 @@ void App::drawStartPage() {
         dl->AddText(ImVec2(p0.x + 58 * S, p0.y + 29 * S), a.id == 2 && hasRecovery ? col::Warning : col::TextDim, a.sub);
         if (clicked) {
             if (a.id == 0) { newDocument(); startOpen_ = false; }
-            if (a.id == 1) { openDocumentDialog(); if (!doc_.timeline.empty() || !doc_.bodies.empty()) startOpen_ = false; }
-            if (a.id == 2) startOpen_ = false;   // the Recovered work prompt takes it from here
+            if (a.id == 1) openDataPanel(dataCur_);   // the same window as the folder button in a design
+            if (a.id == 2) recoveryHidden_ = false;   // the Recovered work prompt takes it from here
             if (a.id == 3) { fusionMoveOpen_ = true; }
         }
         y += 62 * S;

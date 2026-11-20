@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 
 namespace kst {
@@ -150,6 +151,44 @@ const std::vector<std::vector<glm::dvec3>>* App::bodyEdges(uint32_t bodyId) {
     return it->second.ready ? &it->second.polys : nullptr;
 }
 
+const std::vector<glm::dvec2>& App::profileTrisView(const sk::Sketch& s, size_t idx, const sk::Profile& p) {
+    // How many pixels one sketch unit takes near the profile right now.
+    auto ppuAt = [&](const glm::dvec2& q, double& out) {
+        ImVec2 a, b;
+        glm::dvec3 w = s.plane.toWorld(q);
+        double h = 1e-3;
+        if (!worldToScreen(w, a) || !worldToScreen(w + s.plane.x * h, b)) return false;
+        ImVec2 c;
+        double px = std::hypot(b.x - a.x, b.y - a.y);
+        if (worldToScreen(w + s.plane.y * h, c)) px = std::max(px, (double)std::hypot(c.x - a.x, c.y - a.y));
+        out = px / h;
+        return out > 0;
+    };
+    double ppu = 0;
+    glm::dvec2 mid = (p.lo + p.hi) * 0.5;
+    // Stored triangles use 0.75 degree pieces: within a third of a pixel up to a radius of about
+    // 14000 pixels. Only beyond that is the shading redone for the view.
+    if (!ppuAt(mid, ppu) || ppu * glm::length(p.hi - p.lo) * 0.5 < 14000.0) return p.tris;
+    ImVec2 ds = ImGui::GetIO().DisplaySize;
+    glm::dmat4 vp = viewProj();
+    auto& c = profViewCache_[{s.id, idx}];
+    if (c.rev == s.rev && c.vp == vp && c.w == ds.x && c.h == ds.y && !c.tris.empty()) return c.tris;
+    auto tolAt = [&](sk::Vec2 q) {
+        ImVec2 sc;
+        if (!worldToScreen(s.plane.toWorld(q), sc)) return 1e30;
+        const float m = 200.f;
+        if (sc.x < -m || sc.y < -m || sc.x > ds.x + m || sc.y > ds.y + m) return 1e30;   // off screen: as stored
+        double u = 0;
+        return ppuAt(q, u) ? 0.3 / u : 1e30;
+    };
+    sk::profileTrisFor(s, p, tolAt, c.tris);
+    c.rev = s.rev;
+    c.vp = vp;
+    c.w = ds.x;
+    c.h = ds.y;
+    return c.tris;
+}
+
 const std::vector<sk::Profile>& App::sketchProfiles(const sk::Sketch& s) {
     ProfCache& c = profCache_[s.id];
     if (c.rev != s.rev) {
@@ -275,7 +314,7 @@ void App::updateHover() {
             // Sliver edges from imported files often sit right on a big edge on screen. Among
             // edges inside the pick radius, the more prominent (longer on screen) one wins,
             // so clicking a long edge never grabs the tiny one lying beside it.
-            float radius = 10.f * S;
+            float radius = (measureMode_ ? 14.f : 10.f) * S;   // measuring aims at edges: a little more reach
             int bestE = -1;
             float bestDist = 0.f, bestLen = 0.f;
             // What the eye actually sees under the cursor: edges behind that surface are skipped, so
@@ -583,10 +622,13 @@ void App::windowSelect(ImVec2 a, ImVec2 b, bool add) {
 // ===================================================================== overlays
 
 void App::drawInteractionOverlay() {
-    if (sk_.active && sk_.tool != "project") return;
+    // In a sketch only the picked and hovered body edges are drawn here: after the sketch's own lines,
+    // so a body edge under a sketch curve (a circle drawn on a cylinder's outline) shows its highlight
+    // on top instead of under the sketch color.
+    const bool sketchOnly = sk_.active && sk_.tool != "project";
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
     const float S = uiScale_;
-    drawHolePlacement(dl);
+    if (!sketchOnly) drawHolePlacement(dl);
 
     auto drawEdge = [&](uint32_t bodyId, uint32_t idx, ImU32 col, float th) {
         auto bit = doc_.bodies.find(bodyId);
@@ -609,13 +651,13 @@ void App::drawInteractionOverlay() {
         if (sit == doc_.sketches.end()) return;
         const auto& profs = sketchProfiles(sit->second);
         if (idx >= profs.size()) return;
-        const auto& p = profs[idx];
+        const auto& tr = profileTrisView(sit->second, idx, profs[idx]);
         ImDrawListFlags old = dl->Flags;
         dl->Flags &= ~ImDrawListFlags_AntiAliasedFill;
-        for (size_t i = 0; i + 2 < p.tris.size(); i += 3) {
+        for (size_t i = 0; i + 2 < tr.size(); i += 3) {
             ImVec2 a, b, c;
-            if (worldToScreen(sit->second.plane.toWorld(p.tris[i]), a) && worldToScreen(sit->second.plane.toWorld(p.tris[i + 1]), b) &&
-                worldToScreen(sit->second.plane.toWorld(p.tris[i + 2]), c))
+            if (worldToScreen(sit->second.plane.toWorld(tr[i]), a) && worldToScreen(sit->second.plane.toWorld(tr[i + 1]), b) &&
+                worldToScreen(sit->second.plane.toWorld(tr[i + 2]), c))
                 dl->AddTriangleFilled(a, b, c, col);
         }
         dl->Flags = old;
@@ -628,7 +670,11 @@ void App::drawInteractionOverlay() {
         for (size_t i = 0; i < profs.size(); ++i) {
             bool sel = selProfiles_.count({sid, (uint32_t)i}) > 0;
             bool hov = hov_.kind == HoverKind::Profile && hov_.body == sid && hov_.index == i;
-            fillProfile(sid, (uint32_t)i, sel ? ui::th(IM_COL32(255, 107, 53, 120)) : hov ? ui::th(IM_COL32(255, 160, 110, 110)) : ui::th(IM_COL32(120, 150, 190, 40)));
+            // A see-through orange over a dark background reads brown: in the dark theme the picked
+            // and hovered profiles are nearly solid so they stay Kestral orange.
+            float dk = ui::darkness();
+            int aSel = (int)(120 + (200 - 120) * dk), aHov = (int)(110 + (160 - 110) * dk);
+            fillProfile(sid, (uint32_t)i, sel ? IM_COL32(255, 107, 53, aSel) : hov ? IM_COL32(255, 150, 90, aHov) : ui::th(IM_COL32(120, 150, 190, 40)));
         }
     }
     auto drawVert = [&](uint32_t bodyId, uint32_t idx, ImU32 col) {
@@ -649,6 +695,7 @@ void App::drawInteractionOverlay() {
         for (auto& e : selEdges_) drawVert(e.first, e.second, kSelCol);
     if (hov_.kind == HoverKind::Edge) drawEdge(hov_.body, hov_.index, kPreCol, 3.5f * S);
     if (hov_.kind == HoverKind::Vertex) drawVert(hov_.body, hov_.index, kPreCol);
+    if (sketchOnly) return;
 
     // Window selection rectangle: solid for window (left to right), dashed for crossing.
     if (winSel_) {
@@ -774,6 +821,70 @@ void App::drawManipulator() {
     dl->AddCircleFilled(b0, 4 * S, col);
     manipHovered_ = hover && viewportHovered_;
 
+    // Extrude: Fusion's taper slider, a short track across the arrow with a knob. Slide the knob to
+    // one side and the sides lean out (the shape grows along the extrude), to the other and they lean
+    // in. Double click the knob for no taper.
+    if (manip_.target == 1 && dlg_.open && !dlg_.isRevolve) {
+        auto taperNow = [&] {
+            try { return dlg_.taper[0] ? peval::eval(dlg_.taper, doc_.params) : 0.0; } catch (const std::runtime_error&) { return 0.0; }
+        };
+        const float half = 36 * S;               // track half length
+        const double degAtEnd = 30.0;            // the knob at the track's end is 30 deg (it can go further)
+        ImVec2 tc(b0.x - dx * 16 * S, b0.y - dy * 16 * S);   // across the arrow, just behind its base (clear of the shaft)
+        ImVec2 px(-dy, dx);                                   // along the track (the arrow's side)
+        double tap = taperNow();
+        float kOff = (float)std::clamp(tap / degAtEnd, -1.0, 1.0) * half;
+        ImVec2 knob(tc.x + px.x * kOff, tc.y + px.y * kOff);
+        ImVec2 e0(tc.x - px.x * half, tc.y - px.y * half), e1(tc.x + px.x * half, tc.y + px.y * half);
+        bool kHover = !manip_.dragging && std::hypot(m.x - knob.x, m.y - knob.y) < 9 * S && viewportHovered_;
+        ImU32 tcol = manip_.taperDrag || kHover ? ui::th(IM_COL32(255, 160, 40, 255)) : ui::th(IM_COL32(60, 120, 230, 255));
+        dl->AddLine(e0, e1, (tcol & 0x00FFFFFF) | 0x90000000u, 2.f * S);
+        dl->AddLine(ImVec2(tc.x - dx * 4 * S, tc.y - dy * 4 * S), ImVec2(tc.x + dx * 4 * S, tc.y + dy * 4 * S), (tcol & 0x00FFFFFF) | 0x90000000u, 1.5f * S);   // the 0 mark
+        dl->AddText(ImVec2(e1.x + px.x * 6 * S - 4 * S, e1.y + px.y * 6 * S - 7 * S), ui::th(IM_COL32(120, 125, 135, 255)), "+");
+        dl->AddText(ImVec2(e0.x - px.x * 6 * S - 3 * S, e0.y - px.y * 6 * S - 7 * S), ui::th(IM_COL32(120, 125, 135, 255)), "-");
+        dl->AddCircleFilled(knob, 6 * S, ui::th(IM_COL32(250, 250, 250, 255)));
+        dl->AddCircle(knob, 6 * S, tcol, 0, 2.f * S);
+        if (kHover) {
+            manipHovered_ = true;
+            ImGui::SetTooltip("Taper: slide to + and the sides lean out, to - and they lean in.\nDouble click for none. Shift: 5 degree steps.");
+            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                dlg_.taper[0] = 0;
+                applyDialogValues();
+            } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !mm_.open) {
+                manip_.taperDrag = true;
+                manip_.taperStart = tap;
+                manip_.taperGrabPx = (m.x - tc.x) * px.x + (m.y - tc.y) * px.y;
+            }
+        }
+        if (manip_.taperDrag) {
+            manipHovered_ = true;
+            if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                manip_.taperDrag = false;
+            } else {
+                float along = (m.x - tc.x) * px.x + (m.y - tc.y) * px.y;
+                double v = manip_.taperStart + (along - manip_.taperGrabPx) / half * degAtEnd;
+                double step = io.KeyShift ? 5.0 : 0.5;
+                v = std::clamp(std::round(v / step) * step, -85.0, 85.0);
+                if (std::abs(v) < 1e-9) v = 0;
+                char buf[32];
+                std::snprintf(buf, sizeof buf, "%g", v);
+                if (std::strcmp(buf, dlg_.taper) != 0 && !(v == 0 && dlg_.taper[0] == 0)) {
+                    if (v == 0) dlg_.taper[0] = 0;
+                    else std::snprintf(dlg_.taper, sizeof dlg_.taper, "%s", buf);
+                    applyDialogValues();
+                }
+                char rd[48];
+                std::snprintf(rd, sizeof rd, "Taper %g deg", v);
+                ImVec2 ts = ImGui::CalcTextSize(rd);
+                ImVec2 p(m.x + 18 * S, m.y + 8 * S);
+                dl->AddRectFilled(ImVec2(p.x - 4 * S, p.y - 2 * S), ImVec2(p.x + ts.x + 4 * S, p.y + ts.y + 2 * S), ui::th(IM_COL32(255, 255, 255, 235)), 3 * S);
+                dl->AddText(p, ui::th(IM_COL32(30, 36, 46, 255)), rd);
+                activity();
+            }
+        }
+        if (manip_.taperDrag || kHover) hover = false;   // the knob wins over the arrow under it
+    }
+
     // Closest point on the arrow's axis to the mouse ray: the dragged value.
     auto axisParam = [&](double& t) {
         glm::dvec3 o, d;
@@ -785,7 +896,7 @@ void App::drawManipulator() {
         t = (b * e - c * dd) / den;
         return std::isfinite(t);
     };
-    if (!manip_.dragging && manipHovered_ && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !mm_.open) {
+    if (!manip_.dragging && !manip_.taperDrag && hover && viewportHovered_ && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !mm_.open) {
         double t;
         if (axisParam(t)) {
             manip_.dragging = true;
@@ -1038,6 +1149,7 @@ void App::drawMoveTriad() {
         }
         if (triad_.ring >= 0) {
             if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                focusFieldBuf_ = triad_.ring == 0 ? tdlg_.v4 : triad_.ring == 1 ? tdlg_.v5 : tdlg_.v6;
                 triad_.ring = -1;
                 return;
             }
@@ -1098,6 +1210,7 @@ void App::drawMoveTriad() {
     }
     if (triad_.dragging) {
         if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            if (triad_.axis >= 0 && triad_.axis < 3) focusFieldBuf_ = bufs[triad_.axis];
             triad_.dragging = false;
             return;
         }

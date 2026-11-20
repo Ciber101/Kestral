@@ -55,6 +55,8 @@ struct Body {
     MatProps mat;
     std::map<uint32_t, FaceLook> faceLooks;   // face index -> its own appearance
     bool visible = true;
+    bool fresh = false;       // made from nothing (not from another body); not saved
+    std::pair<uint32_t, uint32_t> src{0, 0};   // the body this output came from (its step's input); not saved
 };
 
 struct Component {
@@ -250,6 +252,9 @@ struct PatternParams {
     bool flip = false;
     TargetRef pathBody{0, 0};       // edge path: the body that owns the edge
     uint32_t pathEdge = 0;
+    // Faces of a body (a hole, a pocket, a boss): copied into that body itself, not as new bodies.
+    std::vector<TargetRef> faceTargets;
+    std::vector<std::pair<uint32_t, uint32_t>> faces;   // (index into faceTargets, face)
 };
 
 struct MirrorParams {
@@ -276,6 +281,7 @@ struct SplitParams {
     std::vector<TargetRef> targets;
     int plane = 0;                  // 0 XY, 1 XZ, 2 YZ, 3 a picked face, edge or sketch line
     glm::dvec3 toolO{0}, toolN{0, 0, 1};
+    double toolR = 0;               // > 0: the tool is a round face (cylinder) of this radius around toolO / toolN, extended both ways
     std::string toolName;
     uint32_t sketchId = 0, sketchEnt = 0;   // a sketch line: the plane is rebuilt from it
 };
@@ -325,7 +331,15 @@ struct HoleParams {
 };
 
 // Sweep and loft: sketches in order (sweep: profile then path).
+// One loft section picked in the viewport: a sketch profile (the one holding pt) or a flat body face.
+struct LoftPick {
+    uint32_t sketchId = 0;          // > 0: a profile of this sketch
+    sk::Vec2 pt{0, 0};              // a point inside that profile
+    FaceRef face;                   // sketchId == 0: this face
+};
+
 struct MultiSketchParams {
+    std::vector<LoftPick> picks;    // loft: sections clicked in order (used instead of sketchIds when set)
     std::vector<uint32_t> sketchIds;
     int op = 0;                     // 0 new body, 1 join, 2 cut, 3 intersect
     std::vector<TargetRef> targets;
@@ -477,7 +491,9 @@ struct BladeParams {
 // rules it was made with, so opening a design in a newer Kestral never moves anything.
 //   0: before fix1064.  1: hidden parts are never cut, even as chosen targets (fix1064).
 //   2: face merging works on a copy, never on the inputs (fix1066).
-constexpr int kRulesNow = 2;
+//   3: a step that picks its bodies itself skips hidden ones completely: they are not touched and
+//      not passed through as its outputs, as if they were not there (fix1121).
+constexpr int kRulesNow = 3;
 
 struct Feature {
     uint32_t id = 0;
@@ -537,6 +553,13 @@ struct BodyOverride {
     bool visible = true;
     MatProps mat;                       // valid when hasColor
     std::map<uint32_t, FaceLook> faceLooks;
+    // What sat in this output slot when it was written: 1 a brand new body, 0 a body made from
+    // another one (a cut part, a hidden part passed through), -1 unknown (older files). A slot
+    // whose output changes kind (a preview's new body turning into a cut) does not inherit it.
+    int made = -1;
+    TargetRef src{0, 0};                // the body that output came from, when it had one (0: unknown or new)
+    bool fits(bool hasSource) const { return made < 0 || (made == 1) != hasSource; }
+    bool fitsSource(const TargetRef& s) const { return src.first == 0 || src == s; }
 };
 
 // Section analysis. A view cut. The solids do not change.
@@ -653,7 +676,13 @@ public:
     void gcParts();
 
     uint64_t revision = 1;      // bumps on any change that affects drawing
-    void touch() { ++revision; }
+    // Every change gets a revision no other state ever had (a counter shared by all documents), so
+    // "the revision that was saved" identifies exactly that content, also after undo and redo.
+    void touch() { revision = nextRevision(); }
+    static uint64_t nextRevision() {
+        static std::atomic<uint64_t> counter{1000};
+        return ++counter;
+    }
 
 private:
     uint32_t nextId_ = 1;
@@ -669,19 +698,30 @@ private:
 };
 
 // Snapshot undo. Documents are cheap to copy because geometry is shared.
+// Where you were when a state was current: the sketch being edited (0 none) and the timeline marker
+// that finishing it goes back to. Undo and redo bring you back there (like Fusion: undo after Finish
+// Sketch puts you back in the sketch).
+struct UndoCtx {
+    uint32_t sketch = 0;
+    int savedMarker = -1;
+};
+
 class UndoStack {
 public:
-    void push(const Document& before, std::string label);
+    void push(const Document& before, std::string label, UndoCtx ctx = {});
     bool canUndo() const { return !undo_.empty(); }
     bool canRedo() const { return !redo_.empty(); }
-    bool undo(Document& doc);
-    bool redo(Document& doc);
+    // ctx: in, where you are now (kept with the state undo or redo moves away from); out, where the
+    // state brought back was made.
+    bool undo(Document& doc, UndoCtx* ctx = nullptr);
+    bool redo(Document& doc, UndoCtx* ctx = nullptr);
     std::string undoLabel() const { return undo_.empty() ? "" : undo_.back().label; }
     std::string redoLabel() const { return redo_.empty() ? "" : redo_.back().label; }
     void clear() { undo_.clear(); redo_.clear(); }
     void dropLast() { if (!undo_.empty()) undo_.pop_back(); }
 private:
-    struct Entry { Document doc; std::string label; };
+    struct Entry { Document doc; std::string label; UndoCtx ctx; };
+    static void restoreKeepingFile(Document& doc, Document&& from);
     std::vector<Entry> undo_, redo_;
     static constexpr size_t kMax = 200;
 };

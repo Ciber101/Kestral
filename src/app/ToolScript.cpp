@@ -96,7 +96,7 @@ void App::toolScriptStep() {
         out << (ok ? "saved " : "SAVE FAILED ") << toolScriptOut_ << "\n";
         out.close();
         log::info("tool script done, " + std::to_string(fails) + " errors");
-        dirty_ = false;
+        markClean();
         glfwSetWindowShouldClose(window_, GLFW_TRUE);
         idx = (size_t)-1 / 2;
         return;
@@ -116,7 +116,7 @@ void App::toolScriptStep() {
     }
     std::string res;
     if (v["t"].asString() == "_open") {   // developer: open a saved design (it rebuilds from its timeline)
-        dirty_ = false;
+        markClean();
         openDocumentPath(json::Value::parse(args)["path"].asString());
         res = "opened";
     } else if (v["t"].asString() == "_slicer_sweep") {

@@ -2,6 +2,7 @@
 #include "core/Log.h"
 #include "generated/shaders_spv.h"
 
+#include <cstdlib>
 #include <imgui.h>
 #include <imgui_impl_vulkan.h>
 #include <glm/gtc/type_ptr.hpp>
@@ -12,7 +13,7 @@ namespace kst {
 
 namespace {
 
-enum PipeKind { kMesh = 0, kId = 1, kLine = 2, kBg = 3, kGrid = 4, kGlassBack = 5, kGlassFront = 6, kXray = 7 };
+enum PipeKind { kMesh = 0, kId = 1, kLine = 2, kBg = 3, kGrid = 4, kGlassBack = 5, kGlassFront = 6, kXray = 7, kXrayMask = 8 };
 
 struct MeshPC {
     glm::mat4 viewProj;
@@ -144,7 +145,8 @@ bool Renderer::createAttachments() {
     auto msaa = ctx_->msaa;
     bool ok = true;
     ok &= createImage(msaaColor_, ctx_->swapFormat, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT, msaa, VK_IMAGE_ASPECT_COLOR_BIT);
-    ok &= createImage(msaaDepth_, depthFormat_, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT, msaa, VK_IMAGE_ASPECT_DEPTH_BIT);
+    ok &= createImage(msaaDepth_, mainDepthFormat_, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT, msaa,
+                      stencil_ ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_DEPTH_BIT);
     ok &= createImage(idColor_, idFormat_, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
     ok &= createImage(idDepth_, depthFormat_, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
     return ok;
@@ -185,7 +187,7 @@ VkPipeline Renderer::makePipeline(const uint32_t* vs, size_t vsSize, const uint3
         if (kind != kLine) attrs.push_back({8, 1, VK_FORMAT_R32G32B32A32_UINT, 96});
     };
     const bool glass = kind == kGlassBack || kind == kGlassFront || kind == kXray;
-    if (kind == kMesh || kind == kId || glass) {
+    if (kind == kMesh || kind == kId || glass || kind == kXrayMask) {
         bindings.push_back({0, 24, VK_VERTEX_INPUT_RATE_VERTEX});
         attrs.push_back({0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0});
         attrs.push_back({1, 0, VK_FORMAT_R32G32B32_SFLOAT, 12});
@@ -216,7 +218,7 @@ VkPipeline Renderer::makePipeline(const uint32_t* vs, size_t vsSize, const uint3
     if (kind == kGlassFront) rs.cullMode = VK_CULL_MODE_BACK_BIT;
     rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rs.lineWidth = 1.f;
-    if (kind == kMesh || kind == kId || glass) {
+    if (kind == kMesh || kind == kId || glass || kind == kXrayMask) {
         // Push faces slightly back (reverse Z: toward 0) so edges draw cleanly on top.
         rs.depthBiasEnable = VK_TRUE;
         rs.depthBiasConstantFactor = -1.f;
@@ -231,10 +233,26 @@ VkPipeline Renderer::makePipeline(const uint32_t* vs, size_t vsSize, const uint3
     ds.depthWriteEnable = depthWrite ? VK_TRUE : VK_FALSE;
     ds.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;   // reverse Z
     if (kind == kXray) ds.depthCompareOp = VK_COMPARE_OP_LESS;   // only where something in front hides it
+    if (stencil_ && (kind == kXrayMask || kind == kXray)) {
+        // Mask: where the highlighted part is the front surface (same depth as its solid pass), stencil 1.
+        // X-ray: only where the stencil is not 1, so a part never shows its own inside through itself.
+        ds.stencilTestEnable = VK_TRUE;
+        VkStencilOpState so{};
+        so.failOp = VK_STENCIL_OP_KEEP;
+        so.depthFailOp = VK_STENCIL_OP_KEEP;
+        so.passOp = kind == kXrayMask ? VK_STENCIL_OP_REPLACE : VK_STENCIL_OP_KEEP;
+        so.compareOp = kind == kXrayMask ? VK_COMPARE_OP_ALWAYS : VK_COMPARE_OP_NOT_EQUAL;
+        so.compareMask = 1;
+        so.writeMask = kind == kXrayMask ? 1u : 0u;
+        so.reference = 1;
+        ds.front = so;
+        ds.back = so;
+    }
 
     VkPipelineColorBlendAttachmentState cb{};
     cb.colorWriteMask = kind == kId ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT)
                                     : (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT);
+    if (kind == kXrayMask) cb.colorWriteMask = 0;
     if (kind == kGrid) {
         cb.blendEnable = VK_TRUE;
         cb.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
@@ -266,7 +284,8 @@ VkPipeline Renderer::makePipeline(const uint32_t* vs, size_t vsSize, const uint3
     VkPipelineRenderingCreateInfo rci{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     rci.colorAttachmentCount = 1;
     rci.pColorAttachmentFormats = &colorFmt;
-    rci.depthAttachmentFormat = depthFormat_;
+    rci.depthAttachmentFormat = kind == kId ? depthFormat_ : mainDepthFormat_;
+    rci.stencilAttachmentFormat = kind != kId && stencil_ ? mainDepthFormat_ : VK_FORMAT_UNDEFINED;
 
     VkGraphicsPipelineCreateInfo pi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     pi.pNext = &rci;
@@ -349,6 +368,10 @@ bool Renderer::createPipelines(std::string& err) {
     glassBackPipe_ = makePipeline(spv::mesh_vert, sizeof spv::mesh_vert, spv::mesh_frag, sizeof spv::mesh_frag, meshLayout_, kGlassBack, msaa, cf, false);
     glassFrontPipe_ = makePipeline(spv::mesh_vert, sizeof spv::mesh_vert, spv::mesh_frag, sizeof spv::mesh_frag, meshLayout_, kGlassFront, msaa, cf, false);
     xrayPipe_ = makePipeline(spv::mesh_vert, sizeof spv::mesh_vert, spv::mesh_frag, sizeof spv::mesh_frag, meshLayout_, kXray, msaa, cf, false);
+    if (stencil_) {
+        xrayMaskPipe_ = makePipeline(spv::mesh_vert, sizeof spv::mesh_vert, spv::mesh_frag, sizeof spv::mesh_frag, meshLayout_, kXrayMask, msaa, cf, false);
+        if (!xrayMaskPipe_) log::warn("No x-ray mask pipeline: highlighted parts show only their faces through others");
+    }
     if (!xrayPipe_ ||!meshPipe_ || !idPipe_ || !linePipe_ || !bgPipe_ || !gridPipe_ || !glassBackPipe_ || !glassFrontPipe_) {
         err = "Could not create GPU pipelines";
         return false;
@@ -387,6 +410,17 @@ bool Renderer::init(VkContext* ctx, std::string& err) {
         createBuffer(f.sel, 1024, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
         createBuffer(f.mats, sizeof(MaterialGpu) * 64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
         createBuffer(f.faceMats, 4096, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+    }
+    {   // Depth with stencil for the viewport, when the GPU has it at the MSAA level in use.
+        VkFormatProperties fp{};
+        vkGetPhysicalDeviceFormatProperties(ctx_->phys, VK_FORMAT_D32_SFLOAT_S8_UINT, &fp);
+        VkPhysicalDeviceProperties pp{};
+        vkGetPhysicalDeviceProperties(ctx_->phys, &pp);
+        bool fmtOk = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0;
+        bool msOk = (pp.limits.framebufferStencilSampleCounts & ctx_->msaa) != 0;
+        stencil_ = fmtOk && msOk && !std::getenv("KESTRAL_NO_STENCIL");
+        mainDepthFormat_ = stencil_ ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT;
+        log::info(std::string("Viewport depth: ") + (stencil_ ? "D32 + stencil (x-ray shows whole parts)" : "D32 (x-ray: faces only)"));
     }
     if (!createAttachments()) { err = "Could not allocate viewport images"; return false; }
     if (!createPipelines(err)) return false;
@@ -455,7 +489,7 @@ void Renderer::shutdown() {
     destroyBuffer(edgeVbo_);
     uploaded_.clear();
     destroyAttachments();
-    for (VkPipeline p : {meshPipe_, idPipe_, linePipe_, bgPipe_, gridPipe_, glassBackPipe_, glassFrontPipe_, xrayPipe_})
+    for (VkPipeline p : {meshPipe_, idPipe_, linePipe_, bgPipe_, gridPipe_, glassBackPipe_, glassFrontPipe_, xrayPipe_, xrayMaskPipe_})
         if (p) vkDestroyPipeline(dev, p, nullptr);
     for (VkPipelineLayout l : {meshLayout_, bgLayout_, gridLayout_})
         if (l) vkDestroyPipelineLayout(dev, l, nullptr);
@@ -790,9 +824,11 @@ bool Renderer::drawFrame(const FrameParams& fp, ImDrawData* ui) {
                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT,
                  VK_IMAGE_ASPECT_COLOR_BIT);
-    imageBarrier(cmd, msaaDepth_.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+    const VkImageLayout mainDepthLayout = stencil_ ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    imageBarrier(cmd, msaaDepth_.img, VK_IMAGE_LAYOUT_UNDEFINED, mainDepthLayout,
                  kAttachStages, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, kAttachStages,
-                 VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
+                 VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT,
+                 stencil_ ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_DEPTH_BIT);
     {
         bool ms = ctx_->msaa != VK_SAMPLE_COUNT_1_BIT;
         VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
@@ -808,16 +844,19 @@ bool Renderer::drawFrame(const FrameParams& fp, ImDrawData* ui) {
         ca.clearValue.color = {{0.9f, 0.92f, 0.94f, 1.f}};
         VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         da.imageView = msaaDepth_.view;
-        da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+        da.imageLayout = mainDepthLayout;
         da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         da.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         da.clearValue.depthStencil.depth = 0.f;
+        da.clearValue.depthStencil.stencil = 0;
+        VkRenderingAttachmentInfo sa = da;   // the same image's stencil
         VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
         ri.renderArea = full;
         ri.layerCount = 1;
         ri.colorAttachmentCount = 1;
         ri.pColorAttachments = &ca;
         ri.pDepthAttachment = &da;
+        if (stencil_) ri.pStencilAttachment = &sa;
         vkCmdBeginRendering(cmd, &ri);
         vkCmdSetViewport(cmd, 0, 1, &viewport);
         vkCmdSetScissor(cmd, 0, 1, &full);
@@ -878,13 +917,34 @@ bool Renderer::drawFrame(const FrameParams& fp, ImDrawData* ui) {
         }
         // Hovered / selected parts show through whatever hides them (x-ray tint), so a pin that
         // runs through a plate highlights end to end.
-        if (!meshCmds_.empty() && (fp.hoverBody != 0 || anyHighlight_)) {
+        if ((!meshCmds_.empty() || !trans_.empty()) && (fp.hoverBody != 0 || anyHighlight_)) {
             MeshPC xp = pc;
-            xp.params.x = 2.f;
+            const bool whole = stencil_ && xrayMaskPipe_;
+            xp.params.x = whole ? 2.5f : 2.f;   // 2.5: whole parts (the mask keeps their own inside out)
+            if (whole) {
+                bindMeshState(xrayMaskPipe_);
+                vkCmdPushConstants(cmd, meshLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof xp, &xp);
+                if (!meshCmds_.empty()) {
+                    drawMeshes();
+                    stats.drawCalls += ctx_->multiDrawIndirect ? 1 : (uint32_t)meshCmds_.size();
+                }
+                for (const TransDraw& t : trans_) {
+                    vkCmdDrawIndexed(cmd, t.indexCount, 1, t.firstIndex, t.vertexOffset, t.instance);
+                    stats.drawCalls++;
+                }
+            }
             bindMeshState(xrayPipe_);
             vkCmdPushConstants(cmd, meshLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof xp, &xp);
-            drawMeshes();
-            stats.drawCalls += ctx_->multiDrawIndirect ? 1 : (uint32_t)meshCmds_.size();
+            if (!meshCmds_.empty()) {
+                drawMeshes();
+                stats.drawCalls += ctx_->multiDrawIndirect ? 1 : (uint32_t)meshCmds_.size();
+            }
+            // See-through bodies too: a hidden part picked in the browser is drawn as a ghost (a
+            // see-through body), and it must show through the parts in front of it as well.
+            for (const TransDraw& t : trans_) {
+                vkCmdDrawIndexed(cmd, t.indexCount, 1, t.firstIndex, t.vertexOffset, t.instance);
+                stats.drawCalls++;
+            }
         }
         (void)zero;
         vkCmdEndRendering(cmd);

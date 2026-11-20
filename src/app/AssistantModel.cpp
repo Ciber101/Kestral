@@ -1910,6 +1910,34 @@ bool App::aiModelTool(const std::string& name, const std::string& argsJson, std:
             out = "angle_deg=" + numStr(std::acos(c) * 180.0 / kPi);
             return true;
         }
+        if (kind == "align" || kind == "alignment") {
+            // Two picks, possibly on two bodies: body + face/edge, body2 (default: body) + face2/edge2.
+            ShapePtr s1, s2;
+            glm::mat4 x1(1.f), x2(1.f);
+            if (!grabBody(s1, x1)) return true;
+            s2 = s1;
+            x2 = x1;
+            if (a["body2"].isString()) {
+                std::string err;
+                json::Value nm = json::Value::array();
+                nm.push(a["body2"]);
+                auto ids = idsFrom(nm, err);
+                if (ids.empty()) { out = err.empty() ? "body2 not found." : err; return true; }
+                auto bit = doc_.bodies.find(ids[0]);
+                auto pit = doc_.parts.find(bit->second.partId);
+                if (pit == doc_.parts.end() || !pit->second.shape) { out = "body2 has no solid."; return true; }
+                s2 = pit->second.shape;
+                x2 = bit->second.xform;
+            }
+            kernel::AlignMeasure am = kernel::measureAlign(s1, x1, none(a.has("face"), a["face"]), none(a.has("edge"), a["edge"]),
+                                                           s2, x2, none(a.has("face2"), a["face2"]), none(a.has("edge2"), a["edge2"]));
+            if (!am.ok) { out = "Alignment needs a face or edge on each: flat, round, circle edge or straight edge."; return true; }
+            out = "first=" + am.whatA + "; second=" + am.whatB;
+            if (am.tilt >= 0) out += "; tilt_deg=" + numStr(am.tilt);
+            if (am.hasHeight) out += "; height_mm=" + numStr(am.height);
+            if (am.offCenter >= 0) out += "; off_center_mm=" + numStr(am.offCenter);
+            return true;
+        }
         if (kind == "angle" || kind == "radius" || kind == "area" || kind == "loop") {
             ShapePtr shape;
             glm::mat4 xf(1.f);

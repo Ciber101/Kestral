@@ -4,6 +4,7 @@
 #include "app/App.h"
 #include "app/SliceStyle.h"
 #include "core/Json.h"
+#include "core/SaveLoad.h"
 #include "platform/Platform.h"
 #include "print/OrcaOptions.h"
 
@@ -16,6 +17,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <ctime>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 
@@ -737,71 +740,207 @@ void App::drawSliceToolPanels() {
     }
 }
 
-// ===================================================================== save a process preset
+// ===================================================================== save presets (Orca's Save / Save as)
 
-std::string App::sliceSaveProcessPreset(const std::string& name) {
+// Which profile a changed setting belongs to: the same split the slicer uses when it applies the
+// changes (process first, then filament, then printer).
+std::string App::sliceOwnerOf(const std::string& rawKey) const {
+    std::string key = print::normalizeSettingKey(rawKey);
+    if (slice_.processJson.isObject() && slice_.processJson.has(key)) return "process";
+    if ((slice_.filamentJson.isObject() && slice_.filamentJson.has(key)) || key.rfind("filament_", 0) == 0) return "filament";
+    if ((slice_.machineJson.isObject() && slice_.machineJson.has(key)) || key.rfind("machine_", 0) == 0 || key.rfind("printer_", 0) == 0) return "machine";
+    return "process";
+}
+
+int App::sliceUnsavedCount(const std::string& type) const {
+    int n = 0;
+    for (auto& [k, v] : slice_.overrides)
+        if (sliceOwnerOf(k) == type) ++n;
+    return n;
+}
+
+const std::string& App::sliceCurrentPreset(const std::string& type) const {
+    return type == "filament" ? slice_.filament : type == "machine" ? slice_.machine : slice_.process;
+}
+
+void App::sliceOpenSaveDialog(const std::string& type) {
+    slice_.savePresetType = type;
+    slice_.savePresetOpen = true;
+}
+
+// Save: your own profile is saved over itself (no questions, like Orca's save icon on a preset of
+// yours). A built in one cannot be changed, so it asks for a name.
+void App::sliceSaveCurrent(const std::string& type) {
+    const print::Preset* cur = slice_.setup ? print::findPreset(*slice_.setup, type, sliceCurrentPreset(type)) : nullptr;
+    if (cur && cur->user) {
+        std::string err = sliceSavePreset(type, cur->name);
+        if (err.empty()) toast("Saved " + cur->name, ToastKind::Success);
+        else toast(err, ToastKind::Error);
+    } else {
+        sliceOpenSaveDialog(type);
+    }
+}
+
+std::string App::sliceSaveProcessPreset(const std::string& name) { return sliceSavePreset("process", name); }
+
+std::string App::sliceSavePreset(const std::string& type, const std::string& nameIn) {
+    std::string name = nameIn;
+    while (!name.empty() && std::isspace((unsigned char)name.back())) name.pop_back();
+    while (!name.empty() && std::isspace((unsigned char)name.front())) name.erase(name.begin());
     if (name.empty()) return "Give it a name";
     if (!slice_.setup) return "The profiles are not read yet";
-    const print::Preset* cur = print::findPreset(*slice_.setup, "process", slice_.process);
-    if (!cur) return "The process profile is missing";
-    const print::Preset* base = print::systemBase(*slice_.setup, *cur);
+    const print::Preset* cur = print::findPreset(*slice_.setup, type, sliceCurrentPreset(type));
+    if (!cur) return "The current profile is missing";
+    const print::Preset* same = print::findPreset(*slice_.setup, type, name);
+    if (same && !same->user) return "\"" + name + "\" is a built in profile. Pick another name.";
     std::string err;
     json::Value now = json::Value::parse(print::resolvePreset(*slice_.setup, *cur, err));
-    json::Value sys = base ? json::Value::parse(print::resolvePreset(*slice_.setup, *base, err)) : json::Value::object();
     if (!err.empty()) return err;
-    // Only what differs from the built in profile it is based on, plus the changes made here.
+
+    // Start from your own profile's file as it is (keeps what it inherits, its printers, its
+    // filament id), or from nothing on top of a built in one.
     json::Value out = json::Value::object();
-    out.set("type", json::Value("process"));
-    out.set("name", json::Value(name));
-    out.set("inherits", json::Value(base ? base->name : std::string()));
-    out.set("from", json::Value("User"));
-    out.set("is_custom_defined", json::Value("0"));
-    out.set("print_settings_id", json::Value(name));
-    out.set("version", now["version"].isString() ? now["version"] : json::Value("2.0.0.0"));
-    for (auto& [k, v] : now.members()) {
-        if (k == "name" || k == "inherits" || k == "from" || k == "type" || k == "print_settings_id" || k == "version" || k == "compatible_printers" ||
-            k == "compatible_printers_condition" || k == "instantiation" || k == "setting_id")
-            continue;
-        if (!sys.has(k) || sys[k].dump() != v.dump()) out.set(k, v);
+    if (cur->user) {
+        std::ifstream in(u8path(cur->path), std::ios::binary);
+        std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        json::Value raw = json::Value::parse(text);
+        if (!raw.isObject()) return "Could not read " + cur->path;
+        for (auto& [k, v] : raw.members())
+            if (k != "setting_id" && k != "updated_time" && k != "user_id") out.set(k, v);
+    } else {
+        out.set("inherits", json::Value(cur->name));
     }
+    out.set("type", json::Value(type));
+    out.set("name", json::Value(name));
+    out.set("from", json::Value("User"));
+    if (!out.has("is_custom_defined")) out.set("is_custom_defined", json::Value("0"));
+    if (!out.has("version")) out.set("version", now["version"].isString() ? now["version"] : json::Value("2.0.0.0"));
+    if (type == "process") out.set("print_settings_id", json::Value(name));
+    else if (type == "machine") out.set("printer_settings_id", json::Value(name));
+    else {
+        json::Value id = json::Value::array();
+        id.push(json::Value(name));
+        out.set("filament_settings_id", id);
+    }
+    // The changes made in Kestral that belong to this profile. A list setting (one value per
+    // extruder or filament) gets the value in every slot, the way the slicer applies it.
     std::vector<std::string> applied;
-    for (auto& [k, v] : slice_.overrides) {
-        if (!now.has(k)) continue;   // printer or filament settings stay where they are
-        if (now[k].isArray()) {
-            json::Value a = json::Value::array();
-            a.push(json::Value(v));
-            out.set(k, a);
+    for (auto& [rk, v] : slice_.overrides) {
+        if (sliceOwnerOf(rk) != type) continue;
+        std::string k = print::normalizeSettingKey(rk);
+        bool list = now.has(k) ? now[k].isArray() : false;
+        size_t n = list ? std::max<size_t>(now[k].size(), 1) : 1;
+        if (!now.has(k))
+            if (const print::OrcaOptionDef* d = print::orcaOption(k)) {
+                std::string t = d->type;
+                list = !t.empty() && t.back() == 's';   // coFloats, coInts, coStrings...: one per slot
+            }
+        if (list) {
+            json::Value arr = json::Value::array();
+            for (size_t i = 0; i < n; ++i) arr.push(json::Value(v));
+            out.set(k, arr);
         } else {
             out.set(k, json::Value(v));
         }
-        applied.push_back(k);
+        applied.push_back(rk);
     }
-    // Where OrcaSlicer keeps your own process presets (next to the ones you have, else user/default).
-    std::string dir;
-    for (auto& p : slice_.setup->presets)
-        if (p.user && p.type == "process") { dir = pathToU8(u8path(p.path).parent_path()); break; }
-    if (dir.empty()) dir = slice_.setup->configDir + "/user/default/process";
-    std::error_code ec;
-    fs::create_directories(u8path(dir), ec);
-    std::string safe = name;
-    for (auto& ch : safe) if (std::strchr("<>:\"/\\|?*", ch)) ch = '_';
-    std::string file = dir + "/" + safe + ".json";
-    {
-        std::ofstream o(u8path(file), std::ios::binary | std::ios::trunc);
-        o << out.dump();
-        if (!o) return "Could not write " + file;
+
+    // Where: over your profile of that name, else next to your others of this kind, else
+    // OrcaSlicer's user/default folder (OrcaSlicer reads them all, so it sees it too).
+    std::string file, dir;
+    if (same && same->user) file = same->path;
+    else {
+        if (cur->user) dir = pathToU8(u8path(cur->path).parent_path());
+        if (dir.empty())
+            for (auto& p : slice_.setup->presets)
+                if (p.user && p.type == type) { dir = pathToU8(u8path(p.path).parent_path()); break; }
+        if (dir.empty()) dir = slice_.setup->configDir + "/user/default/" + type;
+        std::error_code ec;
+        fs::create_directories(u8path(dir), ec);
+        std::string safe = name;
+        for (auto& ch : safe) if (std::strchr("<>:\"/\\|?*", ch)) ch = '_';
+        file = dir + "/" + safe + ".json";
     }
-    {
-        std::ofstream o(u8path(dir + "/" + safe + ".info"), std::ios::binary | std::ios::trunc);
-        o << "sync_info = \nuser_id = \nsetting_id = \nbase_id = \nupdated_time = " << (long long)std::time(nullptr) << "\n";
+    if (!writeFileAtomic(file, out.dump())) return "Could not write " + file;
+    {   // OrcaSlicer's sync note beside it: the new time marks this copy as the newest.
+        fs::path info = u8path(file);
+        info.replace_extension(".info");
+        std::string keep;
+        std::ifstream in(info, std::ios::binary);
+        std::string line;
+        bool had = false;
+        while (std::getline(in, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.rfind("updated_time", 0) == 0) continue;
+            keep += line + "\n";
+            had = true;
+        }
+        in.close();
+        if (!had) keep = "sync_info = \nuser_id = \nsetting_id = \nbase_id = \n";
+        keep += "updated_time = " + std::to_string((long long)std::time(nullptr)) + "\n";
+        writeFileAtomic(pathToU8(info), keep);
     }
     for (auto& k : applied) slice_.overrides.erase(k);
-    slice_.process = name;
+    if (type == "process") slice_.process = name;
+    else if (type == "filament") { slice_.filament = name; if (!slice_.ex.fils.empty()) slice_.ex.fils[0].preset.clear(); }
+    else slice_.machine = name;
     slice_.choicesLoaded = false;   // read the profiles again (the new one shows in the list)
     slice_.choicesFor.clear();
+    slice_.settingsFor.clear();     // and its values, even when the name stayed the same
     orcaSetupCached(true);
     sliceLoadChoices();
+    sliceRememberTick(true);
     return {};
+}
+
+// Another printer: the unsaved changes to the old printer's settings do not fit it and go; the
+// process and filament changes stay (Orca's "transfer").
+void App::sliceDropMachineChanges() {
+    int n = 0;
+    for (auto it = slice_.overrides.begin(); it != slice_.overrides.end();) {
+        if (sliceOwnerOf(it->first) == "machine") { it = slice_.overrides.erase(it); ++n; }
+        else ++it;
+    }
+    if (n) toast(std::to_string(n) + " unsaved printer setting change" + (n == 1 ? "" : "s") + " dropped (another printer)", ToastKind::Info);
+}
+
+// ===================================================================== remembered between runs
+
+// The printer, process, filament and plate picked in the Slice tab, and the changes not saved into
+// a profile yet, are kept in slice_choices.json next to the settings: Kestral opens the way you left it.
+void App::sliceRememberLoad() {
+    std::ifstream in(u8path(platform::appDataDir() + "/slice_choices.json"), std::ios::binary);
+    if (!in) return;
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    json::Value v = json::Value::parse(text);
+    if (!v.isObject()) return;
+    slice_.machine = v["machine"].asString();
+    slice_.process = v["process"].asString();
+    slice_.filament = v["filament"].asString();
+    slice_.bedType = v["bed"].asString();
+    slice_.overrides.clear();
+    if (v["overrides"].isObject())
+        for (auto& [k, x] : v["overrides"].members())
+            if (x.isString()) slice_.overrides[k] = x.asString();
+    sliceRemembered_ = text;
+}
+
+void App::sliceRememberTick(bool now) {
+    // Only once the profiles are read: before that the choices may be stand ins.
+    if (!slice_.setup || slice_.setup->presets.empty() || slice_.machine.empty()) return;
+    if (!now && time_ - sliceRememberAt_ < 1.0) return;
+    sliceRememberAt_ = time_;
+    json::Value v = json::Value::object();
+    v.set("machine", json::Value(slice_.machine));
+    v.set("process", json::Value(slice_.process));
+    v.set("filament", json::Value(slice_.filament));
+    v.set("bed", json::Value(slice_.bedType));
+    json::Value o = json::Value::object();
+    for (auto& [k, x] : slice_.overrides) o.set(k, json::Value(x));
+    v.set("overrides", o);
+    std::string text = v.dump();
+    if (text == sliceRemembered_) return;
+    if (writeFileAtomic(platform::appDataDir() + "/slice_choices.json", text)) sliceRemembered_ = text;
 }
 
 } // namespace kst

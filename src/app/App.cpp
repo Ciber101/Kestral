@@ -31,7 +31,7 @@ namespace kst {
 
 namespace {
 App* g_app = nullptr;
-const char* kVersion = "0.5.1";
+const char* kVersion = "0.6.0";
 
 void cbCursor(GLFWwindow*, double, double) { if (g_app) g_app->activity(); }
 void cbButton(GLFWwindow*, int, int, int) { if (g_app) g_app->activity(); }
@@ -56,6 +56,12 @@ LRESULT CALLBACK kstWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_ENTERSIZEMOVE: SetTimer(h, kModalTimer, 8, nullptr); break;
     case WM_EXITSIZEMOVE: KillTimer(h, kModalTimer); break;
+    // Windows logs off, restarts or shuts down (an update too): it ends Kestral without asking about
+    // unsaved work, so every unsaved design gets its recovery copy now.
+    case WM_QUERYENDSESSION:
+    case WM_ENDSESSION:
+        if (g_app && (msg == WM_QUERYENDSESSION || wp)) g_app->saveForSessionEnd();
+        break;
     case WM_TIMER:
         if (wp == kModalTimer) {
             if (g_app) g_app->modalFrame();
@@ -270,13 +276,14 @@ int App::run(int argc, char** argv) {
             if (ferr.find("device lost") != std::string::npos) {
                 platform::messageBox("Kestral", "The graphics driver reset. Kestral will save a recovery copy and close the viewport.");
                 emergencySave();
+                abnormalEnd_ = true;
                 break;
             }
         }
     }
     settings_.save(settingsPath_);
-    // Clean exit marker: only autosaves newer than this are offered for recovery.
-    try {
+    // Clean exit marker (read for the old single recovery file only).
+    if (!abnormalEnd_) try {
         std::error_code ec;
         std::filesystem::create_directories(u8path(platform::appDataDir()), ec);
         FILE* f = std::fopen((platform::appDataDir() + "/clean_exit").c_str(), "w");
@@ -294,6 +301,7 @@ bool App::init(std::string& err) {
     if (!modelTest_ && !uiTest_ && toolScript_.empty()) print::applyPendingEngine();
     settingsPath_ = appData + "/settings.ini";
     settings_.load(settingsPath_);
+    if (!modelTest_ && !uiTest_ && toolScript_.empty()) sliceRememberLoad();   // the Slice tab's picks and unsaved changes
     if (!modelTest_ && !uiTest_ && toolScript_.empty()) moveOldDesigns();
     platform::installProcessCrashGuard([this] { emergencySave(); });
     platform::installThreadGuard();
@@ -389,6 +397,7 @@ void App::notifyAssistantDone(const std::string& reply) {
 }
 
 void App::shutdown() {
+    sliceRememberTick(true);
     mcpShutdown();
     platform::notifyShutdown();
     stopWatchdog();
@@ -410,6 +419,15 @@ void App::shutdown() {
         }
     }
     jobs_.reset();   // joins workers first so no callback touches a dead app
+    // A recovery copy written just before a save landed is not needed: drop the copies of designs
+    // that match their files. Unsaved work keeps its copy.
+    if (!abnormalEnd_ && !modelTest_ && !uiTest_) {
+        if (doc_.revision == cleanRev_ && !dirty_) dropRecovery(asKey_);
+        for (int i = 0; i < (int)designTabs_.size(); ++i) {
+            const DesignTab& t = designTabs_[(size_t)i];
+            if (i != designActive_ && !t.dirty && t.doc.revision == t.cleanRev) dropRecovery(t.asKey);
+        }
+    }
     if (ImGui::GetCurrentContext()) {
         renderer_.shutdown();
         ImGui_ImplGlfw_Shutdown();
@@ -425,12 +443,15 @@ void App::shutdown() {
 }
 
 void App::emergencySave() {
-    // Structure only (no kernel calls): safe to run from the crash handler.
+    // Structure only (no kernel calls): safe to run from the crash handler. Every design with unsaved
+    // work, in every tab, gets its recovery copy.
+    static std::atomic<bool> busy{false};
+    if (busy.exchange(true)) return;
     try {
-        std::error_code ec;
-        std::filesystem::create_directories(u8path(platform::appDataDir() + "/autosave"), ec);
-        saveDocument(doc_, platform::appDataDir() + "/autosave/crash.kst");
+        writeAllRecoverySync();
+        log::warn("Emergency save: recovery copies written");
     } catch (...) {}
+    busy = false;
 }
 
 // ===================================================================== UI size
@@ -507,6 +528,7 @@ void App::frame() {
     watchdogBeat("drawing the interface");
     if (cam_.update(dt)) activity();
     updateAutosave();
+    refineMeshesForView();   // curved faces stay on their exact edges when zoomed in close
 
     // Latest GPU pick result becomes the hover target.
     const PickResult& pk = renderer_.lastPick();
@@ -636,7 +658,7 @@ void App::frame() {
     fp.gridMinor = std::pow(10.f, std::floor(std::log10(std::max(hh * 2.f / 25.f, 1e-3f))));
     fp.gridExtent = std::max(cam_.distance * 6.f, hh * aspect * 4.f) + sceneBounds_.diag();
     fp.pick = (viewportHovered_ && drag_ != Drag::Orbit && drag_ != Drag::Pan &&
-               (!sk_.active || sk_.choosingPlane || sk_.tool == "project" || sk_.tool == "sk_intersect" || sk_.tool == "sk_onto_face")) ||
+               (!sk_.active || measureMode_ || sk_.choosingPlane || sk_.tool == "project" || sk_.tool == "sk_intersect" || sk_.tool == "sk_onto_face")) ||
               matDragOverView_;
     fp.pickX = (int)(io.MousePos.x * io.DisplayFramebufferScale.x);
     fp.pickY = (int)(io.MousePos.y * io.DisplayFramebufferScale.y);
@@ -764,6 +786,7 @@ void App::rebuildScene() {
             ri.material = matOf(b.color, gm);
             ri.transparent = true;
             ri.faceTable = 0;
+            ri.flags |= kInstGhost;   // shows whole through the parts in front of it
         }
         auto fit = facesByBody.find(b.id);
         if (fit != facesByBody.end()) {
@@ -1021,6 +1044,7 @@ void App::registerTools() {
         {"MODIFY", {tSkFillet, tSkCham, tTrim, tBreak, tXform, tPat, tOffset, tExtend, tMirrorS, tProject, tInter, tOnto}, 3},
         {"CONSTRAINTS", {cCoin, cHV, cPar, cPerp, cTan, cEq, cCol, cConc, cMid, cFix, cSym}, 4},
         {"DIMENSION", {tDim, tConstr}, 2},
+        {"INSPECT", {measure}, 1},
         {"FINISH", {tFinish}, 1},
     };
     // Utilities
@@ -1125,14 +1149,30 @@ void App::runTool(const std::string& id) {
 // ===================================================================== document ops
 
 void App::pushUndo(const std::string& label) {
-    undo_.push(doc_, label);
+    undo_.push(doc_, label, undoCtxNow());
     dirty_ = true;
 }
+
+UndoCtx App::undoCtxNow() const {
+    UndoCtx c;
+    if (sk_.active) {
+        c.sketch = sk_.sketchId;
+        c.savedMarker = savedMarker_;
+    }
+    return c;
+}
+
+// (Undo and redo change the design too: they mark it dirty below. Any other change shows up as a new
+// revision, which syncDirty() turns into dirty_ every frame.)
 
 void App::undo() {
     if (!undo_.canUndo()) return;
     std::string label = undo_.undoLabel();
-    undo_.undo(doc_);
+    breakCheck_ = BreakCheck{};   // its "undo the delete" would now undo something else
+    UndoCtx ctx = undoCtxNow();
+    undo_.undo(doc_, &ctx);
+    dirty_ = true;
+    goToUndoCtx(ctx);
     sketchAfterHistory();
     selection_.clear();
     selOrder_.clear();
@@ -1146,7 +1186,11 @@ void App::undo() {
 void App::redo() {
     if (!undo_.canRedo()) return;
     std::string label = undo_.redoLabel();
-    undo_.redo(doc_);
+    breakCheck_ = BreakCheck{};
+    UndoCtx ctx = undoCtxNow();
+    undo_.redo(doc_, &ctx);
+    dirty_ = true;
+    goToUndoCtx(ctx);
     sketchAfterHistory();
     selection_.clear();
     selOrder_.clear();
@@ -1248,13 +1292,16 @@ void App::runGround() {
 }
 
 void App::newDocument() {
-    if (docInUse() && !designTabs_.empty()) newDesignTab();   // a new design opens in its own tab
+    if (docInUse()) newDesignTab();   // a new design opens in its own tab: the one in use stays open
     doc_ = Document();
     undo_.clear();
     selection_.clear();
     isolated_.clear();
     doc_.featureFolder.clear();
-    dirty_ = false;
+    asKey_.clear();
+    recRev_ = ownRev_ = 0;
+    ownAutosaved_ = false;
+    markClean();
     markSceneDirty();
 }
 
@@ -1429,6 +1476,13 @@ void App::drawBreakCheck() {
         for (auto& f : doc_.timeline)
             if (f.failed && !breakCheck_.failedBefore.count(f.id)) breakCheck_.broken.push_back(f.name);
         breakCheck_.show = !breakCheck_.broken.empty();
+    }
+    if (breakCheck_.show) {
+        // The delete was undone (or the steps were fixed) some other way: nothing left to offer.
+        bool still = false;
+        for (auto& f : doc_.timeline)
+            if (f.failed && std::find(breakCheck_.broken.begin(), breakCheck_.broken.end(), f.name) != breakCheck_.broken.end()) still = true;
+        if (!still && !recomputeRunning_) breakCheck_.show = false;
     }
     if (!breakCheck_.show) return;
     const float S = uiScale_;

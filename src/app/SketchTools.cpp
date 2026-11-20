@@ -747,10 +747,18 @@ void App::sketchIntersectClick() {
 }
 
 // Projects edges, already in world space, into the sketch. Shared ends become one point.
-int curvesFromGeoms(Sketch& s, const std::vector<kernel::EdgeGeom>& geoms) {
+int curvesFromGeoms(Sketch& s, const std::vector<kernel::EdgeGeom>& geoms, bool reuseFixed = false) {
     const sk::Plane& pl = s.plane;
     glm::dvec3 pn = pl.normal();
     std::map<std::pair<long long, long long>, uint32_t> pts;
+    if (reuseFixed)   // ends land on fixed points already there (projected earlier) instead of doubling them
+        for (auto& [cid, c] : s.cons) {
+            if (c.type != CType::Fix) continue;
+            const Entity* pe = s.find(c.e[0]);
+            if (!pe || pe->type != EntType::Point) continue;
+            Vec2 q = s.pt(c.e[0]);
+            pts.emplace(std::make_pair(std::llround(q.x * 1e5), std::llround(q.y * 1e5)), c.e[0]);
+        }
     auto pointAt = [&](Vec2 q) {
         auto key = std::make_pair(std::llround(q.x * 1e5), std::llround(q.y * 1e5));
         auto it = pts.find(key);
@@ -809,6 +817,213 @@ int App::projectEdgesInto(Sketch& sref, uint32_t bodyId, const std::vector<uint3
         geoms.push_back(std::move(g));
     }
     return curvesFromGeoms(*s, geoms);
+}
+
+// ===================================================================== snapping to body edges
+
+double refClosest(const RefCurve& c, const Vec2& p, Vec2& q) {
+    auto seg = [&](Vec2 a, Vec2 b, Vec2& o) {
+        Vec2 d = b - a;
+        double l2 = glm::dot(d, d), t = l2 > 1e-24 ? std::clamp(glm::dot(p - a, d) / l2, 0.0, 1.0) : 0.0;
+        o = a + d * t;
+        return glm::length(o - p);
+    };
+    switch (c.type) {
+    case 0: return seg(c.a, c.b, q);
+    case 1: {
+        Vec2 v = p - c.c;
+        double l = glm::length(v);
+        q = l > 1e-12 ? c.c + v * (c.r / l) : c.c + Vec2(c.r, 0);
+        return glm::length(q - p);
+    }
+    case 2: {
+        Vec2 v = p - c.c;
+        double rel = std::atan2(v.y, v.x) - c.t0;
+        while (rel < 0) rel += 6.283185307179586;
+        while (rel >= 6.283185307179586) rel -= 6.283185307179586;
+        if (rel <= c.sw) {
+            double t = c.t0 + rel;
+            q = c.c + Vec2(std::cos(t), std::sin(t)) * c.r;
+            return glm::length(q - p);
+        }
+        Vec2 e0 = c.c + Vec2(std::cos(c.t0), std::sin(c.t0)) * c.r, e1 = c.c + Vec2(std::cos(c.t0 + c.sw), std::sin(c.t0 + c.sw)) * c.r;
+        q = glm::length(e0 - p) < glm::length(e1 - p) ? e0 : e1;
+        return glm::length(q - p);
+    }
+    default: {
+        double best = 1e300;
+        for (size_t i = 1; i < c.poly.size(); ++i) {
+            Vec2 o;
+            double d = seg(c.poly[i - 1], c.poly[i], o);
+            if (d < best) { best = d; q = o; }
+        }
+        if (c.poly.size() == 1) { q = c.poly[0]; best = glm::length(q - p); }
+        return best;
+    }
+    }
+}
+
+
+namespace {
+// One body edge flattened onto the sketch plane. pts gets its corners (1) and centers (2).
+bool refFromGeom(const kernel::EdgeGeom& g, const sk::Plane& pl, RefCurve& c, std::vector<std::pair<Vec2, int>>* pts) {
+    if (g.pts.empty()) return false;
+    glm::dvec3 pn = glm::normalize(pl.normal());
+    const double tau = 6.283185307179586;
+    bool flat = (g.type == 1 || g.type == 2) && glm::length(g.normal) > 1e-12 &&
+                std::abs(std::abs(glm::dot(glm::normalize(g.normal), pn)) - 1.0) < 1e-6;
+    auto addPt = [&](Vec2 q, int k) { if (pts) pts->push_back({q, k}); };
+    c.poly.clear();
+    if (g.type == 0) {
+        c.type = 0;
+        c.a = pl.toLocal(g.a);
+        c.b = pl.toLocal(g.b);
+        if (glm::length(c.b - c.a) < 1e-6) return false;   // seen end on
+        c.poly = {c.a, c.b};
+        addPt(c.a, 1);
+        addPt(c.b, 1);
+    } else if (flat && g.type == 1) {
+        c.type = 1;
+        c.c = pl.toLocal(g.center);
+        c.r = g.radius;
+        if (c.r < 1e-9) return false;
+        for (int i = 0; i <= 128; ++i) { double t = tau * i / 128; c.poly.push_back(c.c + Vec2(std::cos(t), std::sin(t)) * c.r); }
+        addPt(c.c, 2);
+    } else if (flat && g.type == 2) {
+        c.type = 2;
+        bool same = glm::dot(g.normal, pn) > 0;
+        Vec2 st = pl.toLocal(same ? g.a : g.b), en = pl.toLocal(same ? g.b : g.a);
+        c.c = pl.toLocal(g.center);
+        c.r = g.radius;
+        if (c.r < 1e-9) return false;
+        c.t0 = std::atan2(st.y - c.c.y, st.x - c.c.x);
+        c.sw = std::atan2(en.y - c.c.y, en.x - c.c.x) - c.t0;
+        while (c.sw <= 1e-12) c.sw += tau;
+        while (c.sw > tau) c.sw -= tau;
+        c.a = st;
+        c.b = en;
+        for (int i = 0; i <= 96; ++i) { double t = c.t0 + c.sw * i / 96; c.poly.push_back(c.c + Vec2(std::cos(t), std::sin(t)) * c.r); }
+        addPt(st, 1);
+        addPt(en, 1);
+        addPt(c.c, 2);
+    } else {
+        c.type = 3;
+        double len = 0;
+        for (auto& w : g.pts) {
+            Vec2 q = pl.toLocal(w);
+            if (!c.poly.empty()) {
+                double d = glm::length(q - c.poly.back());
+                if (d < 1e-9) continue;
+                len += d;
+            }
+            c.poly.push_back(q);
+        }
+        if (c.poly.size() < 2 || len < 1e-6) return false;
+        c.a = c.poly.front();
+        c.b = c.poly.back();
+        addPt(c.a, 1);
+        addPt(c.b, 1);
+        if (g.type == 1 || g.type == 2) addPt(pl.toLocal(g.center), 2);   // a tilted circle: its center still lines up
+    }
+    c.lo = c.hi = c.poly[0];
+    for (auto& q : c.poly) { c.lo = glm::min(c.lo, q); c.hi = glm::max(c.hi, q); }
+    return true;
+}
+} // namespace
+
+void App::sketchRefsUpdate(const Sketch& s) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](const void* p, size_t n) {
+        const unsigned char* c = (const unsigned char*)p;
+        for (size_t i = 0; i < n; ++i) { h ^= c[i]; h *= 1099511628211ull; }
+    };
+    mix(&s.plane.o, sizeof s.plane.o);
+    mix(&s.plane.x, sizeof s.plane.x);
+    mix(&s.plane.y, sizeof s.plane.y);
+    for (auto& [id, b] : doc_.bodies) {
+        if (!bodyShown(b)) continue;
+        auto pit = doc_.parts.find(b.partId);
+        if (pit == doc_.parts.end() || !pit->second.shape) continue;
+        const void* sp = pit->second.shape.get();
+        mix(&id, sizeof id);
+        mix(&sp, sizeof sp);
+        mix(&b.xform, sizeof b.xform);
+    }
+    if (h == sk_.refs.key) return;
+    SketchRefs R;
+    R.key = h;
+    std::vector<std::pair<Vec2, int>> pts;
+    size_t budget = 20000;   // edges; a huge import should not stall the sketch
+    for (auto& [id, b] : doc_.bodies) {
+        if (budget == 0) break;
+        if (!bodyShown(b)) continue;
+        auto pit = doc_.parts.find(b.partId);
+        if (pit == doc_.parts.end() || !pit->second.shape) continue;
+        std::vector<kernel::EdgeGeom> geoms = kernel::allEdgeGeoms(pit->second.shape, b.xform, budget);
+        budget -= std::min(budget, geoms.size());
+        for (size_t i = 0; i < geoms.size(); ++i) {
+            RefCurve c;
+            c.body = id;
+            c.edge = (uint32_t)i;
+            if (refFromGeom(geoms[i], s.plane, c, &pts)) R.curves.push_back(std::move(c));
+        }
+    }
+    std::set<std::pair<long long, long long>> seen;
+    for (auto& [q, k] : pts)
+        if (seen.insert({std::llround(q.x * 1e5), std::llround(q.y * 1e5)}).second) R.pts.push_back({q, k});
+    sk_.refs = std::move(R);
+}
+
+uint32_t App::sketchRefPointInto(Sketch& s, Vec2 pos) {
+    for (auto& [cid, c] : s.cons) {
+        if (c.type != CType::Fix) continue;
+        const Entity* pe = s.find(c.e[0]);
+        if (pe && pe->type == EntType::Point && glm::length(s.pt(c.e[0]) - pos) < 1e-6) return c.e[0];
+    }
+    uint32_t id = s.addPoint(pos);
+    s.addConstraint(CType::Fix, id, 0, 0, pos.x);
+    s.cons.rbegin()->second.value2 = pos.y;
+    return id;
+}
+
+// Brings the body edge into the sketch (once) and returns the sketch curve at pos. 0 if it cannot.
+uint32_t App::sketchRefCurveInto(Sketch& s, const SnapInfo::Ref& ref, Vec2 pos) {
+    auto bit = doc_.bodies.find(ref.body);
+    if (bit == doc_.bodies.end()) return 0;
+    auto pit = doc_.parts.find(bit->second.partId);
+    if (pit == doc_.parts.end() || !pit->second.shape) return 0;
+    kernel::EdgeGeom g;
+    if (!kernel::edgeGeom(pit->second.shape, bit->second.xform, ref.edge, g)) return 0;
+    RefCurve rc;
+    if (!refFromGeom(g, s.plane, rc, nullptr)) return 0;
+    const double eps = 1e-5;
+    auto onRef = [&](Vec2 p) { Vec2 q; return refClosest(rc, p, q) < eps; };
+    // Already there (the sketch face's own edges, or projected by an earlier click)?
+    for (auto& [id, e] : s.ents) {
+        if (e.type == EntType::Point || e.locked) continue;
+        if (e.type == EntType::Line) {
+            Vec2 a = s.pt(e.a), b = s.pt(e.b);
+            if (!onRef(a) || !onRef(b)) continue;
+            if (rc.type == 0) {
+                if ((glm::length(a - rc.a) < eps && glm::length(b - rc.b) < eps) || (glm::length(a - rc.b) < eps && glm::length(b - rc.a) < eps)) return id;
+            } else if (rc.type == 3 && s.distanceTo(e, pos) < 1e-4) return id;
+        } else if (e.type == EntType::Circle && rc.type == 1) {
+            if (glm::length(s.pt(e.c) - rc.c) < eps && std::abs(e.r - rc.r) < eps) return id;
+        } else if (e.type == EntType::Arc && rc.type == 2) {
+            if (glm::length(s.pt(e.c) - rc.c) < eps && glm::length(s.pt(e.a) - rc.a) < eps && glm::length(s.pt(e.b) - rc.b) < eps) return id;
+        }
+    }
+    std::set<uint32_t> before;
+    for (auto& [id, e] : s.ents) before.insert(id);
+    if (curvesFromGeoms(s, {g}, true) <= 0) return 0;
+    uint32_t best = 0;
+    double bd = 1e300;
+    for (auto& [id, e] : s.ents) {
+        if (before.count(id) || e.type == EntType::Point) continue;
+        double d = s.distanceTo(e, pos);
+        if (d < bd) { bd = d; best = id; }
+    }
+    return best;
 }
 
 int App::intersectBodyInto(Sketch& sref, uint32_t bodyId) {

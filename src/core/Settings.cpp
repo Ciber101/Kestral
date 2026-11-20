@@ -1,5 +1,6 @@
 #include "core/Settings.h"
 #include "core/Types.h"
+#include "core/SaveLoad.h"
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
@@ -30,6 +31,7 @@ void Settings::load(const std::string& path) {
             else if (k == "orbitAtPress") orbitAtPress = toBool(v);
             else if (k == "sketchLookAt") sketchLookAt = toBool(v);
             else if (k == "hideUsedSketches") hideUsedSketches = toBool(v);
+            else if (k == "lockWhileAi") lockWhileAi = toBool(v);
             else if (k == "manipSnap") manipSnap = toBool(v);
             else if (k == "navStyle") navStyle = std::stoi(v);
             else if (k == "perspective") perspective = toBool(v);
@@ -120,8 +122,8 @@ void Settings::load(const std::string& path) {
 void Settings::save(const std::string& path) const {
     std::error_code ec;
     std::filesystem::create_directories(u8path(path).parent_path(), ec);
-    std::ofstream f(u8path(path), std::ios::trunc);
-    if (!f) return;
+    // Built in memory, then written in one atomic step: a crash mid write never empties the settings.
+    std::ostringstream f;
     f << "slicerName=" << slicerName << "\n";
     f << "slicerPath=" << slicerPath << "\n";
     f << "reverseZoom=" << reverseZoom << "\n";
@@ -129,6 +131,7 @@ void Settings::save(const std::string& path) const {
     f << "orbitAtPress=" << orbitAtPress << "\n";
     f << "sketchLookAt=" << sketchLookAt << "\n";
     f << "hideUsedSketches=" << hideUsedSketches << "\n";
+    f << "lockWhileAi=" << lockWhileAi << "\n";
     f << "manipSnap=" << manipSnap << "\n";
     f << "navStyle=" << navStyle << "\n";
     f << "perspective=" << perspective << "\n";
@@ -194,7 +197,7 @@ void Settings::save(const std::string& path) const {
         if (p.ctx) f << "ai." << id << ".ctx=" << p.ctx << "\n";
     }
     for (auto& [id, combo] : keys) f << "key." << id << "=" << combo << "\n";
-    f.close();
+    if (!writeFileAtomic(path, f.str())) return;
     // API keys live here: only this user may read the file.
     std::filesystem::permissions(u8path(path), std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
                                  std::filesystem::perm_options::replace, ec);

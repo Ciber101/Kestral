@@ -1,5 +1,6 @@
 #include "kernel/Mechanical.h"
 #include "kernel/ShapeHandle.h"
+#include "kernel/Trsf.h"
 
 #include <BRepAdaptor_Surface.hxx>
 #include <BRepAlgoAPI_Common.hxx>
@@ -625,9 +626,7 @@ ShapePtr cutThread(const ShapePtr& body, const glm::mat4& xform, const ThreadCut
     if (t.length <= 0) throw std::runtime_error("The thread length must be above 0");
     if (t.groove.size() < 3) throw std::runtime_error("The thread profile is empty");
     gp_Trsf tr;
-    tr.SetValues(xform[0][0], xform[1][0], xform[2][0], xform[3][0],
-                 xform[0][1], xform[1][1], xform[2][1], xform[3][1],
-                 xform[0][2], xform[1][2], xform[2][2], xform[3][2]);
+    tr = trsfOfMat(xform);
     TopoDS_Shape acc = body->shape.Moved(TopLoc_Location(tr));
     const double full = solidVol(acc);
     double before = full;

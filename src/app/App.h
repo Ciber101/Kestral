@@ -1,5 +1,6 @@
 #pragma once
 #include "core/Document.h"
+#include "core/Curves.h"
 #include "core/Settings.h"
 #include "jobs/JobSystem.h"
 #include "kernel/Kernel.h"
@@ -22,6 +23,7 @@
 #include "ui/ViewCube.h"
 
 #include <chrono>
+#include <ctime>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -68,6 +70,8 @@ struct ToolGroup {
     std::vector<int> tools;   // indices into App::tools_
     int primary = 2;          // how many big icons show on the toolbar
 };
+
+std::string recomputeStepNow();   // the step the background rebuild is on, "" when idle
 
 class App {
 public:
@@ -156,6 +160,8 @@ private:
     void refreshSignatures();
     void resolveParametricSketches();
     void syncBodyOverride(uint32_t bodyId);
+    void warnStackedCopies();
+    std::set<std::string> stackedWarned_;
     void saveDocumentNow();
     void saveDocumentAs();
     std::string designFolder() const;
@@ -163,7 +169,45 @@ private:
     void openDocumentPath(const std::string& path);
     void checkRecovery();
     void updateAutosave();
-    std::string autosavePath() const;
+    std::string autosavePath() const;   // the old single recovery file (still read, never written)
+
+    // ---- recovery (Recovery.cpp). Every open design with unsaved work has its own recovery copy
+    // (autosave/<key>.kst + .info), written a few seconds after each change, on tab switches, before
+    // close prompts and from the crash, hang and device lost handlers. A copy goes away only when that
+    // work is saved into its design file, or moves to autosave/discarded when you choose Don't Save
+    // or Discard. Whatever is left when Kestral starts is offered back.
+    struct RecoveredWork {
+        std::string file, key, original, name;
+        std::time_t when = 0;
+        bool legacy = false;   // recovery.kst / crash.kst from before per design recovery
+    };
+    std::vector<RecoveredWork> recovered_;
+    std::string instanceTag_;
+    std::string asKey_;            // this design's recovery key ("" until it has unsaved work)
+    uint64_t cleanRev_ = 1;        // doc_.revision that matches the design file (a new Document starts at 1)
+    uint64_t recRev_ = 0;          // doc_.revision in the recovery copy
+    uint64_t ownRev_ = 0;          // doc_.revision autosaved into the design file itself
+    bool ownAutosaved_ = false;    // the design file holds autosaved changes that were not Ctrl+S'd
+    double lastRecoveryWrite_ = -1;
+    std::string recoveryDir() const;
+    bool inRecoveryDir(const std::string& path) const;
+    void syncDirty();              // any change since the save makes the design dirty
+    void markClean();              // the design file now matches what you see
+    std::string newRecoveryKey();
+    bool writeRecoverySync(const Document& d, std::string& key, uint64_t& recRev);
+    void writeAllRecoverySync();   // every design with unsaved work, now
+    void dropRecovery(const std::string& key);
+    void discardRecovery(const std::string& key);
+    void discardDesignChanges(int tab);   // Don't Save: keep a copy in discarded, undo autosaves into the file
+    void restoreRecovered(size_t i);
+    void dismissRecovered(size_t i);
+    void restoreWork(const RecoveredWork& w);
+    bool tabUnsaved(int i);        // that tab has work that is not in its design file
+    bool recoveryHidden_ = false;  // "Later" in the recovery prompt
+    bool abnormalEnd_ = false;     // the main loop stopped without a normal quit (device lost)
+    static bool hasWork(const Document& d);
+    static bool writeRecoveryFiles(const std::string& dir, const std::string& key, const std::string& data,
+                                   const std::string& original, const std::string& name);
 
     // ---- UI (AppUI.cpp)
     void drawUI();
@@ -246,6 +290,9 @@ private:
     bool sketchPattern(bool circular, int nx, int ny, double sx, double sy, double angleDeg, sk::Vec2 pivot);
     void sketchSetDriven(uint32_t constraintId, bool driven);
     uint32_t sketchMakePoint(sk::Sketch& s, const SnapInfo& si);
+    void sketchRefsUpdate(const sk::Sketch& s);
+    uint32_t sketchRefPointInto(sk::Sketch& s, sk::Vec2 pos);
+    uint32_t sketchRefCurveInto(sk::Sketch& s, const SnapInfo::Ref& ref, sk::Vec2 pos);
     uint32_t pickEntityAt(const sk::Sketch& s, int mode, uint32_t exclude = 0) const;
     bool sketchKeys();
     void sketchLookAt();
@@ -277,6 +324,9 @@ private:
         double minValue = -1e300;         // fillet / chamfer: keep the radius positive
         std::vector<double> snaps;        // values where another face's plane is (filled at the grab)
         bool snapped = false;
+        bool taperDrag = false;           // extrude: the taper slider beside the arrow is being dragged
+        float taperGrabPx = 0;            // where along the slider it was grabbed (px from its middle)
+        double taperStart = 0;            // the taper angle at the grab
     };
     std::set<uint32_t> freezeTargets_;
     uint32_t pendingDeleteFace_ = 0;      // a Delete Face just added: taken back out with a message if it fails
@@ -313,6 +363,17 @@ private:
     bool hitPoint(uint32_t bodyId, uint32_t face1, ImVec2 px, glm::dvec3& out) const;
     const std::vector<std::vector<glm::dvec3>>* bodyEdges(uint32_t bodyId);
     const std::vector<sk::Profile>& sketchProfiles(const sk::Sketch& s);
+    // A profile's shading triangles for the view as it is: its stored triangles at normal zoom, curves
+    // resampled to a third of a pixel when zoomed in far (Interaction.cpp).
+    const std::vector<glm::dvec2>& profileTrisView(const sk::Sketch& s, size_t idx, const sk::Profile& p);
+    struct ProfViewCache { uint64_t rev = 0; glm::dmat4 vp{0}; float w = 0, h = 0; std::vector<glm::dvec2> tris; };
+    std::map<std::pair<uint32_t, size_t>, ProfViewCache> profViewCache_;
+    // Display meshes that follow the zoom (ViewMesh.cpp).
+    void refineMeshesForView();
+    bool viewMeshBusy_ = false;
+    glm::dmat4 viewMeshVp_{0};
+    double viewMeshStill_ = 0;
+    std::set<const ShapeHandle*> viewMeshFailed_;
     void clearSelection();
     bool anySelection() const;
     std::vector<uint32_t> selectedBodies() const;
@@ -444,6 +505,8 @@ private:
     void flashItem(const std::string& key);
     void flashStart(const std::string& key);
     bool slicePrewarmed_ = false;
+    float designTabScroll_ = 0, sliceTabScroll_ = 0;   // app bar tab strips, scrolled sideways
+    int designScrollFor_ = -1, sliceScrollFor_ = -1;
     // ---- Illustration (IllustrationUI.cpp): pictures of the design for instructions and posts
     struct IllusUi {
         bool open = false, busy = false, dirty = true, saving = false, selectedOnly = false;
@@ -501,7 +564,13 @@ private:
     // ---- MCP server (McpServer.cpp): other AI apps use the assistant's tools. See app/Mcp.h.
     struct McpServer;
     struct McpCall { std::string text; std::vector<std::shared_ptr<const AiImage>> images; bool error = false; };
-    struct McpStatus { bool running = false; int port = 0; std::string error, client, tool; int calls = 0; double idleSecs = -1; };
+    struct McpStatus { bool running = false; int port = 0; std::string error, client, tool; int calls = 0; double idleSecs = -1;
+                       double changeIdleSecs = -1; bool paused = false; };
+    std::atomic<bool> mcpPaused_{false};   // the user pressed Stop: MCP calls are refused until Let AI continue
+    void mcpStopAi();
+    void mcpResumeAi();
+    bool aiHasControl() const;             // an AI is working through MCP: the design area is locked for the user
+    void drawAiControl();                  // Stop / Let AI continue, and the lock over the design area
     void mcpStart();
     void mcpStop();
     void mcpRestart();
@@ -513,6 +582,9 @@ private:
                        const std::shared_ptr<std::atomic<bool>>& cancel);
     json::Value mcpToolList() const;            // Assistant.cpp: every tool, MCP style
     static bool mcpKnownTool(const std::string& name);
+    // Fixes a call's tool name and arguments where the meaning is clear (aliases, case, singular /
+    // plural, a value where a list goes); returns notes for the model, or the error when it cannot.
+    std::string mcpFixCall(std::string& name, json::Value& args, bool& fatal) const;
     static bool mcpReadOnlyTool(const std::string& name);   // safe for the read-only key
     void mcpAudit(const std::string& client, const std::string& tool, const std::string& args, const McpCall& r, double ms, bool readOnly);
     bool hiddenWindow_ = false;   // --hidden: no window on screen (batch jobs, a server)
@@ -612,6 +684,7 @@ private:
         float ringSign = 1.f;
         glm::dmat4 rot0{1.0};           // the dialog's turn at the grab
     } triad_;
+    char* focusFieldBuf_ = nullptr;     // a dialog field to put the cursor in next frame (the Move arrow or ring just used)
     void drawMoveTriad();
     // Align: the snap a click at the mouse would take (face center or axis, circle center, edge
     // middle or a corner), like Fusion's snap points. cands gets every snap on the hovered item.
@@ -634,12 +707,14 @@ private:
     std::atomic<const char*> wdPhase_{"starting"};
     std::mutex wdSnapMu_;
     std::string wdSnapshot_;          // last serialized document (refreshed every few seconds when dirty)
+    std::string wdSnapKey_, wdSnapPath_, wdSnapName_;   // its recovery key, design file and name
     double wdSnapTime_ = -1;
     void startWatchdog();
     void stopWatchdog();
     void watchdogBeat(const char* phase);
 public:
     void modalFrame();                // a frame from inside Windows' move / resize loop
+    void saveForSessionEnd() { emergencySave(); }   // Windows is logging off or shutting down
 private:
     bool inFrame_ = false;
     bool autosaveBusy_ = false;
@@ -728,6 +803,10 @@ private:
                    const std::vector<uint32_t>& bodies, const std::set<std::pair<uint32_t, uint32_t>>& faces);
     bool pendingSendAfterSetup_ = false;
     int timelineHover_ = -1;
+    float timelineScroll_ = 0;        // the feature strip scrolled sideways (px)
+    int timelineMarkerShown_ = -1;    // marker position last brought into view
+    bool timelineBarDrag_ = false;    // dragging the strip's scroll bar
+    float timelineBarGrab_ = 0;
     bool draggingMarker_ = false;
     std::string lastToolId_;
     bool playing_ = false;
@@ -902,6 +981,7 @@ private:
         bool fil1ColorSet = false;                         // filament 1's color was picked (not the profile's)
         bool savePresetOpen = false, compareOpen = false, searchOpen = false, objAddOpen = false;
         std::string savePresetName;
+        std::string savePresetType = "process";
         bool uniformScale = true;
         bool legendFolded = false;
         uint64_t devSeq = 0, devSeqSeen = 0;            // printer status updates
@@ -976,6 +1056,9 @@ private:
         std::set<std::pair<uint32_t, uint32_t>> selFaces, selEdges, selProfiles;
         std::vector<uint32_t> selOrder;
         int savedMarker = -1;
+        std::string asKey;
+        uint64_t cleanRev = 1, recRev = 0, ownRev = 0;   // a new Document's revision is 1
+        bool ownAutosaved = false;
     };
     std::vector<DesignTab> designTabs_ = std::vector<DesignTab>(1);   // [designActive_] is a placeholder
     int designActive_ = 0;
@@ -1106,7 +1189,19 @@ private:
     bool slicePresetCombo(const char* id, std::string& cur, const std::vector<const print::Preset*>& list, const char* none, float width, bool frameless);
     void drawSliceObjects(float w, float height);
     void drawSavePresetDialog();
+    void syncLoftPicks();
     std::string sliceSaveProcessPreset(const std::string& name);
+    std::string sliceSavePreset(const std::string& type, const std::string& name);   // "process", "filament", "machine"
+    void sliceSaveCurrent(const std::string& type);
+    void sliceOpenSaveDialog(const std::string& type);
+    std::string sliceOwnerOf(const std::string& key) const;
+    int sliceUnsavedCount(const std::string& type) const;
+    const std::string& sliceCurrentPreset(const std::string& type) const;
+    void sliceDropMachineChanges();
+    void sliceRememberLoad();
+    void sliceRememberTick(bool now = false);
+    std::string sliceRemembered_;
+    double sliceRememberAt_ = 0;
     std::string sliceWarningText(const std::string& w) const;
     void sliceAfterStatus();          // printer status arrived: nozzle, AMS filaments
     void drawSlicePlateThumbs();
@@ -1323,6 +1418,7 @@ private:
         bool splitManual = false;                                   // split: the user chose the tool mode themselves
         bool pickWait = false;                                      // path pattern: the next click is the path
         glm::dvec3 axisO{0}, axisD{0, 0, 1};                        // circular pattern: picked edge axis
+        double axisR = 0;                                           // split: radius of a picked round face (0: a plane)
         std::string axisName;
         TargetRef pathBody{0, 0};                                   // path pattern: edge's body
         uint32_t pathEdge = 0;
@@ -1331,12 +1427,16 @@ private:
         uint32_t edgeTotal = 0, faceTotal = 0;
         double v1Val = 0;
         std::vector<uint32_t> sketchIds;                            // sweep / loft sketch list
+        std::vector<LoftPick> loftPicks;                            // loft: profiles and faces clicked, in order
+        std::vector<std::pair<int, SubRef>> loftSel;                // the same as canvas picks (0 profile, 1 face)
         std::vector<uint32_t> railIds;                              // loft guide sketches
         std::vector<std::string> sketchNames;
         int selA = 0, selB = 1;                                     // sweep profile / path indices
         std::vector<TargetRef> tools;                               // combine tool bodies
         bool mirrorWaitPlane = false;   // Mirror from the toolbar: no copy until a plane or face is chosen
         bool mirrorAsked = false;       // moved on to the face pick once already
+        bool patFaces = false;          // pattern: Objects are faces (a hole, a boss) copied within their body
+        std::set<SubRef> patFaceSel;    // pattern: the faces picked to copy (the canvas picks)
         GearParams gear;                                            // gear / thread values being edited
         ThreadParams thread;
         WingParams wing;
@@ -1375,17 +1475,32 @@ private:
     int sectionAxis_ = 2;
     bool sectionFlip_ = false;
     char sectionOff_[64] = "0";
-    struct MeasurePick { uint32_t body = 0; uint32_t face = 0; uint32_t edge = 0; std::string name; };   // face, edge: +1 encoded
+    struct MeasurePick { uint32_t body = 0; uint32_t face = 0; uint32_t edge = 0; std::string name; std::string info;
+                         uint32_t sketch = 0, ent = 0; };   // face, edge: +1 encoded. sketch, ent: a sketch curve (body 0)
     std::vector<MeasurePick> measurePicks_;
     double measureDist_ = -1;
     bool measureBusy_ = false;
+    // What was measured, drawn in the viewport: the closest points (orange) and the centers (blue).
+    bool measureLine_ = false, measureCenterLine_ = false;
+    glm::dvec3 measurePa_{0}, measurePb_{0}, measureCa_{0}, measureCb_{0};
+    std::vector<std::string> measureLines_;   // extra result lines under the main value
+    uint64_t measureGen_ = 0;                 // a click starts a new measurement; late results of an older one are dropped
+    void clearMeasure();
+    UndoCtx undoCtxNow() const;
+    void goToUndoCtx(const UndoCtx& c);
+    void showMeasurePicks();
+    // Sketch curves for the measure tool (MeasureSketch.cpp).
+    bool sketchCurveGeom(uint32_t sid, uint32_t eid, std::vector<glm::dvec3>& poly, std::vector<CurveSeg>* segs, glm::dvec3* normal) const;
+    bool sketchCurveAt(float mx, float my, uint32_t& sid, uint32_t& eid, float& dist);
+    bool sketchPointUnder(float mx, float my, uint32_t& sid, uint32_t& eid, float& dist);
+    bool sketchPointWorld(uint32_t sid, uint32_t eid, glm::dvec3& w) const;
+    void drawSketchCurve(uint32_t sid, uint32_t eid, unsigned int col, float width);
 
     // ---- recompute state
     int recomputeQueuedFrom_ = -1;
     bool recomputeRunning_ = false;
     std::shared_ptr<RecomputeResults> recomputeResults_;
     double lastSaveActivity_ = 0.0;
-    std::string recoveryFile_;
 
     // ---- timing
     double time_ = 0.0;

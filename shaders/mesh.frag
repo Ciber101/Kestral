@@ -95,10 +95,14 @@ void main() {
         for (uint i = 0u; i < xCount; ++i)
             if (selFaces[xStart + i] == face) { xFaceSel = true; break; }
         bool xSel = (xf & 1u) != 0u;
-        // Faces only: a whole body would show its own inside through itself.
-        if (!(xHoverFace || xFaceSel)) discard;
+        // A hidden part picked or hovered in the browser (its ghost) shows whole through the parts in
+        // front of it. Visible parts do too when the renderer has its stencil mask (2.5: the mask keeps
+        // a part's own inside from showing through itself); without it only faces do.
+        bool xGhost = (xf & 4u) != 0u;
+        bool xWhole = pc.params.x > 2.25 && (xHoverBody || xSel);
+        if (!(xHoverFace || xFaceSel || xGhost || xWhole)) discard;
         vec3 xc = (xHoverBody || xHoverFace) ? vec3(1.0, 0.62, 0.38) : vec3(1.0, 0.42, 0.21);
-        float xa = (xHoverFace || xFaceSel) ? 0.45 : 0.28;
+        float xa = (xHoverFace || xFaceSel) ? 0.45 : xGhost ? 0.32 : 0.28;
         outColor = vec4(xc * xa, xa);
         return;
     }

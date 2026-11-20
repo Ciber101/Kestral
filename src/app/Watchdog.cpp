@@ -12,6 +12,10 @@
 #include <cstdio>
 #include <ctime>
 #include <filesystem>
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#endif
 
 namespace kst {
 
@@ -25,12 +29,16 @@ void App::watchdogBeat(const char* phase) {
     wdBeatMs_.store(nowMs());
     wdPhase_.store(phase);
     // Keep a fresh copy of the design for the watchdog (structure only, a fraction of a ms).
-    if (dirty_ && time_ - wdSnapTime_ > 5.0) {
+    if (dirty_ && hasWork(doc_) && time_ - wdSnapTime_ > 5.0) {
         wdSnapTime_ = time_;
         std::string data;
         if (serializeDocument(doc_, data)) {
+            if (asKey_.empty()) asKey_ = newRecoveryKey();
             std::lock_guard<std::mutex> lock(wdSnapMu_);
             wdSnapshot_ = std::move(data);
+            wdSnapKey_ = asKey_;
+            wdSnapPath_ = doc_.path;
+            wdSnapName_ = doc_.name;
         }
     }
 }
@@ -38,14 +46,36 @@ void App::watchdogBeat(const char* phase) {
 void App::startWatchdog() {
     wdBeatMs_.store(nowMs());
     wdStop_.store(false);
-    std::string recPath = platform::appDataDir() + "/autosave/crash.kst";
+    std::string recDir = recoveryDir();
     std::string logDir = platform::appDataDir();
-    watchdog_ = std::thread([this, recPath, logDir] {
+    watchdog_ = std::thread([this, recDir, logDir] {
         int64_t nextAskMs = 0;
         bool savedThisHang = false;
+        double memLogged = 0;   // GB last written to the log
         while (!wdStop_.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             if (wdStop_.load()) break;
+#ifdef _WIN32
+            {
+                // Big memory use goes in the log with what Kestral was doing, so a runaway step can be
+                // named afterwards (Kestral is capped at 60% of the RAM; past that a step fails).
+                PROCESS_MEMORY_COUNTERS_EX pm{};
+                if (K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pm, sizeof pm)) {
+                    double gb = (double)pm.PrivateUsage / (1024.0 * 1024.0 * 1024.0);
+                    if (gb > 6.0 && gb > memLogged + 2.0) {
+                        memLogged = gb;
+                        const char* ph = wdPhase_.load();
+                        std::string step = recomputeStepNow();
+                        char buf[64];
+                        std::snprintf(buf, sizeof buf, "%.1f GB", gb);
+                        log::warn(std::string("Memory use ") + buf + " (main: " + (ph ? ph : "?") +
+                                  (step.empty() ? "" : ", rebuilding: " + step) + ")");
+                    } else if (gb < memLogged - 4.0) {
+                        memLogged = gb;
+                    }
+                }
+            }
+#endif
             int64_t now = nowMs(), stuck = now - wdBeatMs_.load();
             if (platform::inNativeDialog() || stuck < 10000 || (stuck < 60000 && platform::mouseButtonHeld())) {
                 savedThisHang = false;
@@ -56,16 +86,17 @@ void App::startWatchdog() {
             if (!savedThisHang) {
                 savedThisHang = true;
                 log::warn(std::string("Main loop stuck for ") + std::to_string(stuck / 1000) + " s in: " + (phase ? phase : "?"));
-                std::string snap;
+                std::string snap, key, path, name;
                 {
                     std::lock_guard<std::mutex> lock(wdSnapMu_);
                     snap = wdSnapshot_;
+                    key = wdSnapKey_;
+                    path = wdSnapPath_;
+                    name = wdSnapName_;
                 }
-                if (!snap.empty()) {
-                    std::error_code ec;
-                    std::filesystem::create_directories(u8path(recPath).parent_path(), ec);
-                    if (writeFileAtomic(recPath, snap)) log::info("Watchdog saved a recovery copy");
-                }
+                // The design in front, as of a few seconds ago (other tabs' copies are written when
+                // they go to the back).
+                if (!snap.empty() && writeRecoveryFiles(recDir, key, snap, path, name)) log::info("Watchdog saved a recovery copy");
                 nextAskMs = now;
             }
             if (now < nextAskMs) continue;
